@@ -51,6 +51,7 @@ call_meta = {}             # {caller_id: {call_type, started_at, call_id}}
 
 # Ring timeout tracking
 ring_start = {}            # {caller_id: timestamp}
+ring_timers = {}           # {caller_id: Timer}
 
 # Media state tracking
 call_media_state = {}      # {user_id: {muted, video_on}}
@@ -65,6 +66,10 @@ disconnected_users = {}    # {user_id: {timer, session_id, disconnected_at}}
 # Constants
 RING_TIMEOUT_SECONDS = 45
 DISCONNECT_GRACE_SECONDS = 120
+STALE_ACTIVE_LOCK_SECONDS = 180
+
+# Guard shared in-memory call maps against race conditions
+state_lock = threading.RLock()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -141,16 +146,50 @@ def _end_call_session(session_id, reason='normal'):
 
 def _cleanup_call_tracking(user_id, partner_id=None):
     """Remove all in-memory call tracking for a user pair."""
+    timer = ring_timers.pop(user_id, None)
+    if timer:
+        timer.cancel()
+
     active_calls.pop(user_id, None)
     call_meta.pop(user_id, None)
     ring_start.pop(user_id, None)
     call_media_state.pop(user_id, None)
 
     if partner_id:
+        partner_timer = ring_timers.pop(partner_id, None)
+        if partner_timer:
+            partner_timer.cancel()
+
         active_calls.pop(partner_id, None)
         call_meta.pop(partner_id, None)
         ring_start.pop(partner_id, None)
         call_media_state.pop(partner_id, None)
+
+
+def _prune_stale_user_state(user_id):
+    """Best-effort cleanup of stale in-memory locks for a user."""
+    now = time.time()
+
+    # If user points to a non-existent session, clear that stale mapping.
+    session_id = user_call_session.get(user_id)
+    if session_id and session_id not in call_sessions:
+        user_call_session.pop(user_id, None)
+
+    partner_id = active_calls.get(user_id)
+    if partner_id is None:
+        return
+
+    # Active pair without session is stale unless still in ring window.
+    has_valid_session = bool(user_call_session.get(user_id) in call_sessions)
+    started = ring_start.get(user_id) or ring_start.get(partner_id)
+
+    is_stale_ringing = started and (now - started) > RING_TIMEOUT_SECONDS
+    is_stale_active = (not has_valid_session) and (
+        started is None or (now - started) > STALE_ACTIVE_LOCK_SECONDS
+    )
+
+    if is_stale_ringing or is_stale_active:
+        _cleanup_call_tracking(user_id, partner_id)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -235,37 +274,88 @@ def register_call_events(socketio, app):
                     emit('call_error', {'error': 'Not a participant in this negotiation'})
                     return
 
-            # Check if caller is already in a call
-            if caller_id in active_calls:
-                emit('call_error', {'error': 'You are already in a call'})
-                return
+            with state_lock:
+                _prune_stale_user_state(caller_id)
+                _prune_stale_user_state(target_id)
 
-            # Check if target is online
-            target_sid = get_user_sid(target_id)
-            if not target_sid:
-                target_info = _get_user_info(target_id)
-                emit('call_error', {
-                    'error': f'{target_info["name"]} is offline',
-                    'reason': 'offline',
-                })
-                return
+                # Check if caller is already in a call
+                if caller_id in active_calls:
+                    emit('call_error', {'error': 'You are already in a call'})
+                    return
 
-            # Check if target is already in a call
-            if target_id in active_calls:
-                target_info = _get_user_info(target_id)
-                emit('call_error', {
-                    'error': f'{target_info["name"]} is on another call',
-                    'reason': 'busy',
-                })
-                return
+                # Check if target is online
+                target_sid = get_user_sid(target_id)
+                if not target_sid:
+                    target_info = _get_user_info(target_id)
+                    emit('call_error', {
+                        'error': f'{target_info["name"]} is offline',
+                        'reason': 'offline',
+                    })
+                    return
 
-            # Track pending call (caller side only initially)
-            active_calls[caller_id] = target_id
-            ring_start[caller_id] = time.time()
-            call_media_state[caller_id] = {
-                'muted': False,
-                'video_on': call_type == 'video',
-            }
+                # Check if target is already in a call
+                if target_id in active_calls:
+                    target_info = _get_user_info(target_id)
+                    emit('call_error', {
+                        'error': f'{target_info["name"]} is on another call',
+                        'reason': 'busy',
+                    })
+                    return
+
+                # Track pending call (caller side only initially)
+                active_calls[caller_id] = target_id
+                ring_start[caller_id] = time.time()
+                call_media_state[caller_id] = {
+                    'muted': False,
+                    'video_on': call_type == 'video',
+                }
+
+                # Auto-release stale unanswered calls on server side.
+                timer = ring_timers.pop(caller_id, None)
+                if timer:
+                    timer.cancel()
+
+                call_id = data.get('call_id')
+
+                def _ring_timeout_expired():
+                    with app.app_context():
+                        with state_lock:
+                            # Skip if no longer the same pending call.
+                            if active_calls.get(caller_id) != target_id:
+                                return
+                            if user_call_session.get(caller_id) in call_sessions:
+                                return
+
+                            _cleanup_call_tracking(caller_id, target_id)
+
+                        # Best-effort DB update for missed/no-answer calls.
+                        if call_id:
+                            try:
+                                call_log = db.session.get(CallLog, int(call_id))
+                                if call_log and call_log.status in ('initiated', 'ringing'):
+                                    call_log.status = 'missed'
+                                    call_log.ended_at = datetime.utcnow()
+                                    call_log.end_reason = 'no_answer'
+                                    db.session.commit()
+                            except Exception as e:
+                                print(f'[Call] Failed to mark ring-timeout log: {e}', flush=True)
+
+                        caller_sid = get_user_sid(caller_id)
+                        callee_sid = get_user_sid(target_id)
+                        payload = {
+                            'from_id': caller_id,
+                            'reason': 'no_answer',
+                            'call_id': call_id,
+                        }
+                        if caller_sid:
+                            socketio.emit('call_ended', payload, room=caller_sid)
+                        if callee_sid:
+                            socketio.emit('call_ended', payload, room=callee_sid)
+
+                timeout_timer = threading.Timer(RING_TIMEOUT_SECONDS, _ring_timeout_expired)
+                timeout_timer.daemon = True
+                timeout_timer.start()
+                ring_timers[caller_id] = timeout_timer
 
             caller_info = _get_user_info(caller_id)
 
@@ -310,22 +400,29 @@ def register_call_events(socketio, app):
         call_type = data.get('call_type', 'voice')
 
         with app.app_context():
-            # Track both sides as active
-            active_calls[callee_id] = caller_id
-            active_calls[caller_id] = callee_id
-            ring_start.pop(caller_id, None)
+            with state_lock:
+                _prune_stale_user_state(caller_id)
+                _prune_stale_user_state(callee_id)
 
-            # Initialize media state for callee
-            call_media_state[callee_id] = {
-                'muted': False,
-                'video_on': call_type == 'video',
-            }
+                # Track both sides as active
+                active_calls[callee_id] = caller_id
+                active_calls[caller_id] = callee_id
+                ring_start.pop(caller_id, None)
+                timer = ring_timers.pop(caller_id, None)
+                if timer:
+                    timer.cancel()
 
-            # Create persistent session
-            session_id = _create_call_session(
-                caller_id, callee_id, call_type,
-                call_id=data.get('call_id'),
-            )
+                # Initialize media state for callee
+                call_media_state[callee_id] = {
+                    'muted': False,
+                    'video_on': call_type == 'video',
+                }
+
+                # Create persistent session
+                session_id = _create_call_session(
+                    caller_id, callee_id, call_type,
+                    call_id=data.get('call_id'),
+                )
 
             callee_info = _get_user_info(callee_id)
 
@@ -378,7 +475,8 @@ def register_call_events(socketio, app):
         caller_sid = get_user_sid(caller_id)
 
         with app.app_context():
-            _cleanup_call_tracking(caller_id, callee_id)
+            with state_lock:
+                _cleanup_call_tracking(caller_id, callee_id)
 
             callee_info = _get_user_info(callee_id)
 
@@ -424,26 +522,29 @@ def register_call_events(socketio, app):
         reason = data.get('reason', 'normal')
 
         with app.app_context():
-            # End call session if one exists
-            session_id = user_call_session.get(user_id)
+            with state_lock:
+                _prune_stale_user_state(user_id)
 
-            print(f'[Call] === END_CALL ===', flush=True)
-            print(f'[Call]   user_id: {user_id}', flush=True)
-            print(f'[Call]   target_id: {target_id}', flush=True)
-            print(f'[Call]   reason: {reason}', flush=True)
-            print(f'[Call]   session_id: {session_id}', flush=True)
-            print(f'[Call]   active_calls: {active_calls}', flush=True)
+                # End call session if one exists
+                session_id = user_call_session.get(user_id)
 
-            if session_id:
-                _end_call_session(session_id, reason=reason)
+                print(f'[Call] === END_CALL ===', flush=True)
+                print(f'[Call]   user_id: {user_id}', flush=True)
+                print(f'[Call]   target_id: {target_id}', flush=True)
+                print(f'[Call]   reason: {reason}', flush=True)
+                print(f'[Call]   session_id: {session_id}', flush=True)
+                print(f'[Call]   active_calls: {active_calls}', flush=True)
 
-            partner_id = None
-            if target_id:
-                partner_id = int(target_id)
-            elif user_id in active_calls:
-                partner_id = active_calls[user_id]
+                if session_id:
+                    _end_call_session(session_id, reason=reason)
 
-            _cleanup_call_tracking(user_id, partner_id)
+                partner_id = None
+                if target_id:
+                    partner_id = int(target_id)
+                elif user_id in active_calls:
+                    partner_id = active_calls[user_id]
+
+                _cleanup_call_tracking(user_id, partner_id)
 
             print(f'[Call] User {user_id} ended call (reason: {reason})', flush=True)
 
@@ -596,14 +697,15 @@ def register_call_events(socketio, app):
 
 def _handle_user_disconnect(user_id, socketio, app):
     """Called when a user's socket disconnects. Start grace period if in a call."""
-    session_id = user_call_session.get(user_id)
+    with state_lock:
+        _prune_stale_user_state(user_id)
+        session_id = user_call_session.get(user_id)
 
-    if not session_id:
-        # Not in a tracked call session — clean up any pending call state
-        partner_id = active_calls.pop(user_id, None)
-        if partner_id:
-            active_calls.pop(partner_id, None)
-        return
+        if not session_id:
+            # Not in a tracked call session — clean up any pending call state
+            partner_id = active_calls.get(user_id)
+            _cleanup_call_tracking(user_id, partner_id)
+            return
 
     session = call_sessions.get(session_id)
     if not session:
@@ -682,8 +784,9 @@ def _handle_user_reconnect(user_id, socketio, app):
     )
 
     # Restore active_calls tracking
-    active_calls[user_id] = partner_id
-    active_calls[partner_id] = user_id
+    with state_lock:
+        active_calls[user_id] = partner_id
+        active_calls[partner_id] = user_id
 
     elapsed = int(time.time() - dc['disconnected_at'])
     print(f'[Call] User {user_id} reconnected after {elapsed}s — restoring call session', flush=True)

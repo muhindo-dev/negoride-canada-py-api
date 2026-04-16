@@ -113,8 +113,6 @@ def create_call_log(user):
             return error_response("Negotiation not found", status_code=404)
         if not _is_participant(neg, user.id):
             return error_response("You are not a participant in this negotiation", status_code=403)
-        if neg.status not in ('Accepted', 'Started'):
-            return error_response("Negotiation is not in a callable state. Status must be Accepted or Started.")
 
     call_log = CallLog(
         caller_id=user.id,
