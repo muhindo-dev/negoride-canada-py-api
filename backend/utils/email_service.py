@@ -20,6 +20,7 @@ def _send(to_address: str, subject: str, html_body: str) -> bool:
     server = current_app.config.get('MAIL_SERVER', 'smtp.gmail.com')
     port = current_app.config.get('MAIL_PORT', 587)
     use_tls = current_app.config.get('MAIL_USE_TLS', True)
+    use_ssl = current_app.config.get('MAIL_USE_SSL', False)
     from_name = current_app.config.get('MAIL_FROM_NAME', 'NegoRide Canada')
     from_addr = current_app.config.get('MAIL_FROM_ADDRESS', username)
 
@@ -41,11 +42,16 @@ def _send(to_address: str, subject: str, html_body: str) -> bool:
 
     try:
         context = ssl.create_default_context()
-        with smtplib.SMTP(server, port) as smtp:
-            if use_tls:
-                smtp.starttls(context=context)
-            smtp.login(username, password)
-            smtp.sendmail(from_addr, to_address, msg.as_string())
+        if use_ssl:
+            with smtplib.SMTP_SSL(server, port, context=context) as smtp:
+                smtp.login(username, password)
+                smtp.sendmail(from_addr, to_address, msg.as_string())
+        else:
+            with smtplib.SMTP(server, port) as smtp:
+                if use_tls:
+                    smtp.starttls(context=context)
+                smtp.login(username, password)
+                smtp.sendmail(from_addr, to_address, msg.as_string())
         return True
     except Exception as exc:
         logger.error(f'[EmailService] Failed to send email to {to_address}: {exc}')
