@@ -82,6 +82,9 @@ def create(user):
     guidelines_accepted = _to_bool(data.get('community_guidelines_accepted', False))
     guidelines_accepted_at = datetime.utcnow() if guidelines_accepted else None
 
+    if _is_courier(data) and not guidelines_accepted:
+        return error_response("You must accept community guidelines for courier orders")
+
     booking = ScheduledBooking(
         customer_id=user.id,
         service_type=data.get('service_type'),
