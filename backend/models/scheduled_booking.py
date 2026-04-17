@@ -44,6 +44,22 @@ class ScheduledBooking(db.Model):
     status = db.Column(db.String(50), default='pending')
     payment_status = db.Column(db.String(50), default='unpaid')
 
+    # Compliance
+    community_guidelines_accepted = db.Column(db.Boolean, default=False)
+    community_guidelines_accepted_at = db.Column(db.DateTime, nullable=True)
+
+    # Courier chaining (multi-parcel sequencing)
+    courier_batch_id = db.Column(db.String(64), nullable=True, index=True)
+    courier_sequence = db.Column(db.Integer, default=1)
+    courier_total = db.Column(db.Integer, default=1)
+    courier_next_booking_id = db.Column(db.BigInteger, nullable=True)
+
+    # Courier proof of pickup and delivery
+    pickup_proof_image = db.Column(db.Text, nullable=True)
+    pickup_proof_uploaded_at = db.Column(db.DateTime, nullable=True)
+    dropoff_proof_image = db.Column(db.Text, nullable=True)
+    dropoff_proof_uploaded_at = db.Column(db.DateTime, nullable=True)
+
     # Stripe
     stripe_id = db.Column(db.String(255), nullable=True)
     stripe_url = db.Column(db.Text, nullable=True)
@@ -109,6 +125,16 @@ class ScheduledBooking(db.Model):
             'agreed_price': self.agreed_price,
             'status': self.status,
             'payment_status': self.payment_status,
+            'community_guidelines_accepted': self.community_guidelines_accepted,
+            'community_guidelines_accepted_at': my_date_time(self.community_guidelines_accepted_at),
+            'courier_batch_id': self.courier_batch_id,
+            'courier_sequence': self.courier_sequence,
+            'courier_total': self.courier_total,
+            'courier_next_booking_id': self.courier_next_booking_id,
+            'pickup_proof_image': self.pickup_proof_image,
+            'pickup_proof_uploaded_at': my_date_time(self.pickup_proof_uploaded_at),
+            'dropoff_proof_image': self.dropoff_proof_image,
+            'dropoff_proof_uploaded_at': my_date_time(self.dropoff_proof_uploaded_at),
             'stripe_id': self.stripe_id,
             'stripe_url': self.stripe_url,
             'stripe_paid': self.stripe_paid,

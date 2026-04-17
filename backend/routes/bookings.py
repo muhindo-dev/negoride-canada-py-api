@@ -1,4 +1,9 @@
-from flask import Blueprint, request
+import os
+import uuid
+from datetime import datetime
+
+from flask import Blueprint, request, current_app
+from werkzeug.utils import secure_filename
 from backend.models import db
 from backend.models.scheduled_booking import ScheduledBooking
 from backend.models.user import AdminUser
@@ -6,6 +11,33 @@ from backend.utils.auth import jwt_required_with_user
 from backend.utils.response import success_response, error_response
 
 bookings_bp = Blueprint('bookings', __name__)
+
+
+def _is_courier(booking_or_data):
+    service = ''
+    if isinstance(booking_or_data, dict):
+        service = str(booking_or_data.get('service_type', '')).strip().lower()
+    else:
+        service = str(getattr(booking_or_data, 'service_type', '')).strip().lower()
+    return service in ('courier', 'delivery')
+
+
+def _to_bool(value):
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _save_booking_image(booking_id: int, image_file, prefix: str):
+    ext = image_file.filename.rsplit('.', 1)[-1].lower() if '.' in image_file.filename else 'jpg'
+    if ext not in ('jpg', 'jpeg', 'png', 'webp'):
+        return None, "Unsupported image format"
+
+    filename = secure_filename(
+        f"{prefix}_{booking_id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{ext}"
+    )
+    upload_dir = os.path.join(current_app.config['UPLOAD_FOLDER'], 'courier_proofs')
+    os.makedirs(upload_dir, exist_ok=True)
+    image_file.save(os.path.join(upload_dir, filename))
+    return f"courier_proofs/{filename}", None
 
 
 @bookings_bp.route('/api/bookings', methods=['GET'])
@@ -47,6 +79,9 @@ def create(user):
     if luggage > 20:
         return error_response("Maximum 20 pieces of luggage")
 
+    guidelines_accepted = _to_bool(data.get('community_guidelines_accepted', False))
+    guidelines_accepted_at = datetime.utcnow() if guidelines_accepted else None
+
     booking = ScheduledBooking(
         customer_id=user.id,
         service_type=data.get('service_type'),
@@ -69,6 +104,8 @@ def create(user):
         scheduled_at=data.get('scheduled_at'),
         customer_proposed_price=customer_proposed_price,
         status='pending',
+        community_guidelines_accepted=guidelines_accepted,
+        community_guidelines_accepted_at=guidelines_accepted_at,
     )
     db.session.add(booking)
     db.session.commit()
@@ -76,6 +113,83 @@ def create(user):
     # TODO: Notify admin via SMS
 
     return success_response("Booking created", booking.to_dict(), status_code=201)
+
+
+@bookings_bp.route('/api/bookings/courier-batch', methods=['POST'])
+@jwt_required_with_user
+def create_courier_batch(user):
+    """Create chained courier bookings in one batch for multi-parcel delivery."""
+    data = request.get_json(silent=True) or request.form
+    service_type = (data.get('service_type') or '').strip().lower()
+    if service_type not in ('courier', 'delivery'):
+        return error_response("service_type must be courier or delivery")
+
+    if not _to_bool(data.get('community_guidelines_accepted', False)):
+        return error_response("You must accept community guidelines before creating courier batch")
+
+    parcels = data.get('parcels')
+    if not isinstance(parcels, list) or len(parcels) == 0:
+        return error_response("parcels must be a non-empty list")
+
+    if len(parcels) > 150:
+        return error_response("Maximum 150 parcel stops per batch")
+
+    batch_id = uuid.uuid4().hex[:16]
+    now = datetime.utcnow()
+    created = []
+
+    for idx, parcel in enumerate(parcels, start=1):
+        try:
+            customer_price = int(parcel.get('customer_proposed_price', data.get('customer_proposed_price', 0)))
+        except Exception:
+            customer_price = 0
+
+        if customer_price < 50:
+            return error_response(f"Parcel #{idx}: minimum price is $0.50 (50 cents)")
+
+        booking = ScheduledBooking(
+            customer_id=user.id,
+            service_type='courier',
+            automobile_type=data.get('automobile_type', 'Courier'),
+            pickup_lat=parcel.get('pickup_lat') or data.get('pickup_lat'),
+            pickup_lng=parcel.get('pickup_lng') or data.get('pickup_lng'),
+            pickup_place_name=parcel.get('pickup_place_name') or data.get('pickup_place_name'),
+            pickup_address=parcel.get('pickup_address') or data.get('pickup_address'),
+            pickup_description=parcel.get('pickup_description') or data.get('pickup_description'),
+            destination_lat=parcel.get('destination_lat'),
+            destination_lng=parcel.get('destination_lng'),
+            destination_place_name=parcel.get('destination_place_name'),
+            destination_address=parcel.get('destination_address'),
+            destination_description=parcel.get('destination_description'),
+            passengers=1,
+            luggage=int(parcel.get('luggage', data.get('luggage', 1)) or 1),
+            luggage_weight_lbs=int(parcel.get('luggage_weight_lbs', data.get('luggage_weight_lbs', 0)) or 0),
+            luggage_description=parcel.get('luggage_description') or data.get('luggage_description'),
+            message=parcel.get('message') or data.get('message'),
+            scheduled_at=parcel.get('scheduled_at') or data.get('scheduled_at'),
+            customer_proposed_price=customer_price,
+            status='pending',
+            community_guidelines_accepted=True,
+            community_guidelines_accepted_at=now,
+            courier_batch_id=batch_id,
+            courier_sequence=idx,
+            courier_total=len(parcels),
+        )
+        db.session.add(booking)
+        created.append(booking)
+
+    db.session.flush()
+
+    for i in range(len(created) - 1):
+        created[i].courier_next_booking_id = created[i + 1].id
+
+    db.session.commit()
+
+    return success_response("Courier batch created", {
+        'batch_id': batch_id,
+        'total': len(created),
+        'bookings': [b.to_dict() for b in created],
+    }, status_code=201)
 
 
 @bookings_bp.route('/api/bookings/<int:booking_id>', methods=['GET'])
@@ -139,7 +253,7 @@ def accept_price(user, booking_id):
     if not booking:
         return error_response("Booking not found", status_code=404)
 
-    booking.final_price = booking.driver_proposed_price
+    booking.agreed_price = booking.driver_proposed_price
     booking.status = 'price_accepted'
     db.session.commit()
 
@@ -156,7 +270,7 @@ def accept_original_price(user, booking_id):
     if not booking:
         return error_response("Booking not found", status_code=404)
 
-    booking.final_price = booking.customer_proposed_price
+    booking.agreed_price = booking.customer_proposed_price
     booking.status = 'price_accepted'
     db.session.commit()
 
@@ -202,7 +316,23 @@ def start(user, booking_id):
     if booking.status not in ('confirmed',):
         return error_response("Booking must be confirmed and paid before starting")
 
+    if user.id not in (booking.driver_id, 1):
+        return error_response("Only assigned driver or admin can start this booking", status_code=403)
+
+    if _is_courier(booking) and booking.courier_batch_id:
+        previous_incomplete = ScheduledBooking.query.filter(
+            ScheduledBooking.courier_batch_id == booking.courier_batch_id,
+            ScheduledBooking.courier_sequence < booking.courier_sequence,
+            ScheduledBooking.status != 'completed',
+        ).count()
+        if previous_incomplete > 0:
+            return error_response(
+                "Complete earlier courier stops first. Batch deliveries must be completed in order.",
+                status_code=409,
+            )
+
     booking.status = 'in_progress'
+    booking.started_at = datetime.utcnow()
     db.session.commit()
 
     return success_response("Trip started", booking.to_dict())
@@ -216,9 +346,28 @@ def complete(user, booking_id):
     if not booking:
         return error_response("Booking not found", status_code=404)
 
+    if user.id not in (booking.driver_id, 1):
+        return error_response("Only assigned driver or admin can complete this booking", status_code=403)
+
+    if _is_courier(booking):
+        if not booking.pickup_proof_image:
+            return error_response("Pickup proof photo is required before completing courier booking")
+        if not booking.dropoff_proof_image:
+            return error_response("Dropoff proof photo is required before completing courier booking")
+
     data = request.get_json(silent=True) or request.form
     booking.status = 'completed'
+    booking.completed_at = datetime.utcnow()
     booking.driver_notes = data.get('driver_notes')
+
+    # Auto-advance next booking in courier chain so the driver can continue.
+    if _is_courier(booking) and booking.courier_next_booking_id:
+        nxt = ScheduledBooking.query.get(booking.courier_next_booking_id)
+        if nxt and nxt.status == 'pending':
+            nxt.status = 'driver_assigned'
+            nxt.driver_id = booking.driver_id
+            nxt.assigned_at = datetime.utcnow()
+
     db.session.commit()
 
     return success_response("Trip completed", booking.to_dict())
@@ -268,6 +417,78 @@ def mark_paid(user, booking_id):
     booking.payment_status = 'paid'
     booking.stripe_paid = True
     booking.status = 'confirmed'
+    booking.confirmed_at = datetime.utcnow()
     db.session.commit()
 
     return success_response("Marked as paid", booking.to_dict())
+
+
+@bookings_bp.route('/api/bookings/<int:booking_id>/pickup-proof', methods=['POST'])
+@jwt_required_with_user
+def upload_pickup_proof(user, booking_id):
+    booking = ScheduledBooking.query.get(booking_id)
+    if not booking:
+        return error_response("Booking not found", status_code=404)
+
+    if user.id not in (booking.driver_id, 1):
+        return error_response("Only assigned driver or admin can upload pickup proof", status_code=403)
+
+    image_file = request.files.get('photo') or request.files.get('image') or request.files.get('file')
+    if not image_file or not image_file.filename:
+        return error_response("photo file is required")
+
+    saved, err = _save_booking_image(booking.id, image_file, 'pickup')
+    if err:
+        return error_response(err)
+
+    booking.pickup_proof_image = saved
+    booking.pickup_proof_uploaded_at = datetime.utcnow()
+    db.session.commit()
+    return success_response("Pickup proof uploaded", booking.to_dict())
+
+
+@bookings_bp.route('/api/bookings/<int:booking_id>/dropoff-proof', methods=['POST'])
+@jwt_required_with_user
+def upload_dropoff_proof(user, booking_id):
+    booking = ScheduledBooking.query.get(booking_id)
+    if not booking:
+        return error_response("Booking not found", status_code=404)
+
+    if user.id not in (booking.driver_id, 1):
+        return error_response("Only assigned driver or admin can upload dropoff proof", status_code=403)
+
+    image_file = request.files.get('photo') or request.files.get('image') or request.files.get('file')
+    if not image_file or not image_file.filename:
+        return error_response("photo file is required")
+
+    saved, err = _save_booking_image(booking.id, image_file, 'dropoff')
+    if err:
+        return error_response(err)
+
+    booking.dropoff_proof_image = saved
+    booking.dropoff_proof_uploaded_at = datetime.utcnow()
+    db.session.commit()
+    return success_response("Dropoff proof uploaded", booking.to_dict())
+
+
+@bookings_bp.route('/api/bookings/courier-batch/<batch_id>/next', methods=['GET'])
+@jwt_required_with_user
+def courier_batch_next(user, batch_id):
+    """Get next pending stop in a courier batch for progress chaining."""
+    q = ScheduledBooking.query.filter_by(courier_batch_id=batch_id)
+    if user.id != 1:
+        q = q.filter(
+            (ScheduledBooking.customer_id == user.id) | (ScheduledBooking.driver_id == user.id)
+        )
+
+    next_booking = q.filter(ScheduledBooking.status != 'completed').order_by(
+        ScheduledBooking.courier_sequence.asc()
+    ).first()
+
+    if not next_booking:
+        return success_response("Batch completed", {'batch_id': batch_id, 'next_booking': None})
+
+    return success_response("Success", {
+        'batch_id': batch_id,
+        'next_booking': next_booking.to_dict(),
+    })

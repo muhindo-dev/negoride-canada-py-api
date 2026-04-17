@@ -70,6 +70,26 @@ class Negotiation(db.Model):
         except Exception:
             pass
 
+        # Include the latest and second-latest offered prices (in cents)
+        # so clients can render the last two negotiation points consistently.
+        last_offer_price = None
+        second_last_offer_price = None
+        try:
+            from backend.models.negotiation_record import NegotiationRecord
+            rows = (
+                NegotiationRecord.query
+                .filter_by(negotiation_id=self.id)
+                .order_by(NegotiationRecord.created_at.desc(), NegotiationRecord.id.desc())
+                .limit(2)
+                .all()
+            )
+            if len(rows) >= 1:
+                last_offer_price = rows[0].price
+            if len(rows) >= 2:
+                second_last_offer_price = rows[1].price
+        except Exception:
+            pass
+
         return {
             'id': self.id,
             'customer_id': self.customer_id,
@@ -90,6 +110,8 @@ class Negotiation(db.Model):
             'details': self.details,
             'initial_price': self.initial_price,
             'agreed_price': float(self.agreed_price) if self.agreed_price else None,
+            'last_offer_price': last_offer_price,
+            'second_last_offer_price': second_last_offer_price,
             'payment_status': self.payment_status,
             'payment_id': self.payment_id,
             'payment_completed_at': my_date_time(self.payment_completed_at),
