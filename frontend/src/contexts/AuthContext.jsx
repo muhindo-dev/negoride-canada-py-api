@@ -3,6 +3,17 @@ import { authAPI } from '../services/api';
 
 const AuthContext = createContext(null);
 
+function normalizeUserPayload(payload) {
+  if (!payload) return null;
+
+  if (payload.user && typeof payload.user === 'object') {
+    return payload.user;
+  }
+
+  const { token, remember_token, ...user } = payload;
+  return user.id ? user : null;
+}
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -19,9 +30,17 @@ export function AuthProvider({ children }) {
   const login = useCallback(async (email, password) => {
     const { data } = await authAPI.login({ email, password });
     if (data.code === 1) {
-      localStorage.setItem('admin_token', data.data.token);
-      localStorage.setItem('admin_user', JSON.stringify(data.data.user));
-      setUser(data.data.user);
+      const payload = data.data || {};
+      const userData = normalizeUserPayload(payload);
+      const token = payload.token || payload.remember_token;
+
+      if (!token || !userData) {
+        throw new Error('Login response is missing user session data');
+      }
+
+      localStorage.setItem('admin_token', token);
+      localStorage.setItem('admin_user', JSON.stringify(userData));
+      setUser(userData);
       return data;
     }
     throw new Error(data.message || 'Login failed');

@@ -192,6 +192,27 @@ def _prune_stale_user_state(user_id):
         _cleanup_call_tracking(user_id, partner_id)
 
 
+def _has_live_call_lock(user_id):
+    """Return True only when the user appears to be in a genuinely live call/ring."""
+    partner_id = active_calls.get(user_id)
+    if partner_id is None:
+        return False
+
+    # A tracked session is authoritative for active calls.
+    session_id = user_call_session.get(user_id)
+    if session_id and session_id in call_sessions:
+        return True
+
+    # Pending ring calls only track the caller in active_calls. Treat recent
+    # ring windows as live; otherwise aggressively release stale lock state.
+    started = ring_start.get(user_id) or ring_start.get(partner_id)
+    if started and (time.time() - started) <= (RING_TIMEOUT_SECONDS + 5):
+        return True
+
+    _cleanup_call_tracking(user_id, partner_id)
+    return False
+
+
 # ══════════════════════════════════════════════════════════════
 # Register all Socket.IO event handlers
 # ══════════════════════════════════════════════════════════════
@@ -279,7 +300,7 @@ def register_call_events(socketio, app):
                 _prune_stale_user_state(target_id)
 
                 # Check if caller is already in a call
-                if caller_id in active_calls:
+                if _has_live_call_lock(caller_id):
                     emit('call_error', {'error': 'You are already in a call'})
                     return
 
@@ -294,7 +315,7 @@ def register_call_events(socketio, app):
                     return
 
                 # Check if target is already in a call
-                if target_id in active_calls:
+                if _has_live_call_lock(target_id):
                     target_info = _get_user_info(target_id)
                     emit('call_error', {
                         'error': f'{target_info["name"]} is on another call',

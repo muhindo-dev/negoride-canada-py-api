@@ -1,7 +1,31 @@
 #!/bin/bash
 # Comprehensive API Endpoint Test Script
-BASE="http://127.0.0.1:5001"
-TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJmcmVzaCI6ZmFsc2UsImlhdCI6MTc3NjExMDE0NSwianRpIjoiMWM4MGJhMjctZmM5Mi00ZmZmLTg4MjQtZWQwMzBmYjU0ZjgyIiwidHlwZSI6ImFjY2VzcyIsInN1YiI6IjEiLCJuYmYiOjE3NzYxMTAxNDUsImNzcmYiOiI0Y2E2NjE1Ny04MmY3LTQ0ZjMtYmFmNy04ZTBkMzZjYjdkZGQiLCJleHAiOjIwOTE0NzAxNDV9.jNpyavG-qzpuJCk-RlLAt2hnEtiiBGjiKTekIAiRfhk"
+BASE="${BASE:-http://127.0.0.1:5001}"
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@gmail.com}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-Admin123!}"
+
+LOGIN_RESPONSE=$(curl -s -X POST "$BASE/api/users/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}")
+
+TOKEN=$(printf '%s' "$LOGIN_RESPONSE" | python3 -c "
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+    data = payload.get('data') or {}
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    print(data.get('token') or data.get('remember_token') or data.get('access_token') or '')
+except Exception:
+    print('')
+")
+
+if [ -z "$TOKEN" ]; then
+  echo "Failed to authenticate test script."
+  echo "$LOGIN_RESPONSE"
+  exit 1
+fi
+
 AUTH="Authorization: Bearer $TOKEN"
 PASS=0
 FAIL=0
@@ -58,15 +82,51 @@ except Exception as e:
   fi
 }
 
+test_expected_error() {
+  local name="$1"
+  local method="$2"
+  local url="$3"
+  local data="$4"
+  local expected_message="$5"
+
+  if [ "$method" = "GET" ]; then
+    resp=$(curl -s "$BASE$url" -H "$AUTH")
+  else
+    resp=$(curl -s -X "$method" "$BASE$url" -H "$AUTH" -H "Content-Type: application/json" -d "$data")
+  fi
+
+  result=$(printf '%s' "$resp" | python3 -c "
+import sys, json
+try:
+  d = json.load(sys.stdin)
+  msg = str(d.get('message', ''))
+  ok = d.get('code') != 1 and '$expected_message' in msg
+  print('PASS' if ok else 'FAIL: ' + json.dumps(d))
+except Exception as e:
+  print('FAIL: ' + str(e)[:80])
+" 2>/dev/null)
+
+  if [[ "$result" == PASS* ]]; then
+    echo "  PASS  $name"
+    PASS=$((PASS+1))
+  else
+    echo "  FAIL  $name  -> $result"
+    FAIL=$((FAIL+1))
+    ERRORS="$ERRORS\n  $name: $result"
+  fi
+}
+
 echo "================================================================"
 echo "  NegoRide Canada API - Comprehensive Endpoint Tests"
 echo "================================================================"
+echo ""
+echo "Authenticated as $ADMIN_EMAIL"
 echo ""
 
 echo "--- AUTH & PROFILE ---"
 test_endpoint "POST /api/users/login" "POST" "/api/users/login" '{"email":"admin@gmail.com","password":"Admin123!"}'
 test_endpoint "GET  /api/users/me" "GET" "/api/users/me"
-test_endpoint "PUT  /api/profile/update" "PUT" "/api/profile/update" '{"first_name":"Admin"}'
+test_endpoint "POST /api/profile/update" "POST" "/api/profile/update" '{"first_name":"Admin"}'
 
 echo ""
 echo "--- ADMIN DASHBOARD & ANALYTICS ---"
@@ -83,7 +143,7 @@ test_endpoint "GET  /api/admin/users" "GET" "/api/admin/users?per_page=5"
 test_endpoint "GET  /api/admin/users?type=Driver" "GET" "/api/admin/users?user_type=Driver&per_page=3"
 test_endpoint "GET  /api/admin/users?search=admin" "GET" "/api/admin/users?search=admin"
 test_endpoint "GET  /api/admin/users/1 (detail)" "GET" "/api/admin/users/1"
-test_endpoint "GET  /api/admin/users/999 (404)" "GET" "/api/admin/users/999"
+test_expected_error "GET  /api/admin/users/999 (expected missing user)" "GET" "/api/admin/users/999" "" "User not found"
 test_endpoint "POST /api/admin/users/2/update" "POST" "/api/admin/users/2/update" '{"first_name":"TestUpdate"}'
 test_endpoint "POST /api/admin/users/1/reset-password" "POST" "/api/admin/users/1/reset-password" '{"new_password":"Admin123!"}'
 test_endpoint "GET  /api/admin/users/1/wallet" "GET" "/api/admin/users/1/wallet"
@@ -157,17 +217,17 @@ test_endpoint "GET  /api/payout-requests/statistics" "GET" "/api/payout-requests
 
 echo ""
 echo "--- MOBILE: CHAT ---"
-test_endpoint "GET  /api/chat/heads" "GET" "/api/chat/heads"
+test_endpoint "GET  /api/chat-heads" "GET" "/api/chat-heads"
 
 echo ""
 echo "--- MOBILE: LOCATION ---"
-test_endpoint "GET  /api/driver/status" "GET" "/api/driver/status"
+test_endpoint "POST /api/update-online-status" "POST" "/api/update-online-status" '{}'
 
 echo ""
 echo "--- RESOURCES (PUBLIC) ---"
 test_endpoint "GET  /api/route-stages" "GET" "/api/route-stages"
 test_endpoint "GET  /api/drivers" "GET" "/api/drivers"
-test_endpoint "GET  /api/companies" "GET" "/api/companies"
+test_endpoint "GET  /api/saccos" "GET" "/api/saccos"
 
 echo ""
 echo "================================================================"

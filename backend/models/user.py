@@ -56,6 +56,15 @@ class AdminUser(db.Model):
     is_breakdown_approved = db.Column(db.String(255), default='No')
     is_firebrugade_approved = db.Column(db.String(255), default='No')
 
+    # Email verification
+    email_verified_at = db.Column(db.DateTime, nullable=True)
+    email_verification_token = db.Column(db.String(64), nullable=True)
+    verification_token_expires = db.Column(db.DateTime, nullable=True)
+
+    # Password reset
+    password_reset_token = db.Column(db.String(64), nullable=True)
+    password_reset_expires = db.Column(db.DateTime, nullable=True)
+
     # Driver extras
     max_passengers = db.Column(db.Integer, nullable=False, default=4)
     rating = db.Column(db.Numeric(3, 2), nullable=False, default=0.00)
