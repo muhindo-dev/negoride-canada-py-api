@@ -1,0 +1,37 @@
+{% set tz = r.timezone %}{% if show_thanks %}Thanks for riding, {{ first_name }}!
+{{ local_time(r.dropoff_at or t.captured_at, tz) }}
+
+From: {{ r.pickup_address }}{% if r.pickup_at %} ({{ local_time(r.pickup_at, tz, False) }}){% endif %}
+To:   {{ r.dropoff_address }}{% if r.dropoff_at %} ({{ local_time(r.dropoff_at, tz, False) }}){% endif %}
+Duration: {{ human_duration(r.duration_s) or '-' }} · Distance: {{ human_distance(r.distance_m, r.distance_estimated) or '-' }}
+{% if r.driver_first %}Driver: {{ r.driver_first }}{% if r.vehicle %} · {{ r.vehicle }}{% if r.plate %} {{ r.plate }}{% endif %}{% endif %}
+{% endif %}{% if t.negotiation and t.negotiation.saved_cents %}
+You negotiated and saved {{ money(t.negotiation.saved_cents) }} vs. the initial ask of {{ money(t.negotiation.initial_ask_cents) }}.
+{% endif %}
+Rate your trip:
+{% for s in ratings %}  {{ s.stars }} star{{ 's' if s.stars > 1 }}: {{ s.url }}
+{% endfor %}
+Add a tip: {{ tip_url }}
+{% endif %}{% if show_receipt %}
+RECEIPT {{ number }}
+Ride {{ r.ride_ref }}
+{% for l in t.lines %}{{ l.label }}: {{ money(l.amount_cents) }}
+{% endfor %}Subtotal{% if t.tax_inclusive %} (before tax){% endif %}: {{ money(t.subtotal_cents) }}
+{% for x in t.taxes %}{{ x.label }} ({{ t.province }}): {{ money(x.amount_cents) }}
+{% endfor %}{% if t.tip_cents %}Tip (not taxed): {{ money(t.tip_cents) }}
+{% endif %}TOTAL CHARGED: {{ money(t.total_cents) }} CAD
+{{ t.payment_method }}{% if t.authorized_at %} · authorized {{ local_time(t.authorized_at, tz) }}{% endif %}{% if t.captured_at %} · charged {{ local_time(t.captured_at, tz) }}{% endif %}
+{% if t.registration.gst_hst %}GST/HST reg. no. {{ t.registration.gst_hst }}
+{% endif %}{% if t.refunds %}
+Refunds:
+{% for f in t.refunds %}  -{{ money(f.amount_cents) }} {{ f.reason }}
+{% endfor %}Net total: {{ money(t.net_total_cents) }}
+{% endif %}
+Your PDF receipt is attached.
+{% endif %}
+Lost an item? {{ lost_item_url }}
+Report an issue: {{ report_url }}
+Cancellation policy: {{ policy_url }}
+--
+{{ company_legal_name }} · {{ company_address }}
+Support: {{ support_email }}

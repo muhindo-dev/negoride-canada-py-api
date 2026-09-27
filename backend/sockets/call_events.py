@@ -222,6 +222,10 @@ def register_call_events(socketio, app):
 
     # ─── Authentication ──────────────────────────────────
 
+    @socketio.on('connect')
+    def handle_connect():
+        print(f'[Call] Socket connected sid={request.sid}', flush=True)
+
     @socketio.on('authenticate')
     def handle_authenticate(data):
         """Map socket SID to authenticated user_id."""

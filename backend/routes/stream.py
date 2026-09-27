@@ -4,8 +4,8 @@ Keeps one persistent HTTP connection per client.
 Pushes a JSON event only when DB state actually changes — no unnecessary
 network round-trips on the Flutter side.
 
-Auth: same multi-fallback chain as every other endpoint
-  (Bearer token OR token query-param OR user_id query-param).
+Auth: a verified `Authorization: Bearer <token>` JWT, same as every other
+  endpoint (via get_current_user). There is no user_id impersonation fallback.
 
 IMPORTANT: The Flask dev server MUST run with threaded=True so that this
 long-lived connection does not block all other requests.
@@ -13,6 +13,7 @@ long-lived connection does not block all other requests.
 import json
 import time
 import threading
+from datetime import datetime, timedelta
 from flask import Response, stream_with_context, Blueprint, current_app
 
 from backend.models import db
@@ -70,40 +71,33 @@ def stream_events():
                     db.session.expire_all()
 
                     # ── 1) Query negotiations relevant to this user ──────────
-                    if is_driver:
-                        negs = (
-                            Negotiation.query
-                            .filter(
-                                Negotiation.driver_id == user_id,
-                                db.or_(
-                                    Negotiation.is_active == 'Yes',
-                                    Negotiation.status.in_(['Active', 'Accepted', 'Started']),
-                                ),
-                            )
-                            .order_by(Negotiation.id.desc())
-                            .limit(10)
-                            .all()
-                        )
-                    else:
-                        negs = (
-                            Negotiation.query
-                            .filter(
-                                Negotiation.customer_id == user_id,
-                                db.or_(
-                                    Negotiation.is_active == 'Yes',
-                                    Negotiation.status.in_(['Active', 'Accepted', 'Started']),
-                                ),
-                            )
-                            .order_by(Negotiation.id.desc())
-                            .limit(10)
-                            .all()
-                        )
+                    # Active negotiations, PLUS terminal ones (Cancelled/Completed)
+                    # updated in the last 60s so the final state is delivered to the
+                    # peer exactly once — otherwise a cancelled/completed trip simply
+                    # vanishes from the feed and the other party's screen never reacts.
+                    recent_cutoff = datetime.utcnow() - timedelta(seconds=60)
+                    relevant = db.or_(
+                        Negotiation.is_active == 'Yes',
+                        Negotiation.status.in_(['Active', 'Accepted', 'Started']),
+                        db.and_(
+                            Negotiation.status.in_(['Cancelled', 'Canceled', 'Completed']),
+                            Negotiation.updated_at >= recent_cutoff,
+                        ),
+                    )
+                    owner_col = Negotiation.driver_id if is_driver else Negotiation.customer_id
+                    negs = (
+                        Negotiation.query
+                        .filter(owner_col == user_id, relevant)
+                        .order_by(Negotiation.id.desc())
+                        .limit(10)
+                        .all()
+                    )
 
                     something_pushed = False
 
                     # ── Push negotiations if changed ─────────────────────────
                     curr_neg_hash = ','.join(
-                        f'{n.id}:{n.status}:{n.customer_accepted}:{n.customer_driver}:{n.agreed_price}:{n.payment_status}:{n.stripe_paid}:{n.is_active}:{n.updated_at}'
+                        f'{n.id}:{n.trip_stage}:{n.status}:{n.customer_accepted}:{n.customer_driver}:{n.agreed_price}:{n.payment_status}:{n.stripe_paid}:{n.is_active}:{n.updated_at}'
                         for n in negs
                     )
                     if curr_neg_hash != last_neg_hash:

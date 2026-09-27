@@ -1,0 +1,16 @@
+{% extends "_layout.html" %}
+{% block content %}
+<h1 class="ink" style="margin:0 0 12px 0;font-size:22px;color:#111827">Credit note {{ number }}</h1>
+<p class="ink" style="margin:0 0 8px 0;color:#111827">Hi {{ first_name }},</p>
+<p class="ink" style="margin:0 0 18px 0;color:#111827">We refunded <strong>{{ money(t.amount_cents) }}</strong> to your {{ t.payment_method or 'card' }} for ride {{ r.ride_ref }} (receipt {{ receipt_number }}). Refunds usually appear within 5–10 business days.</p>
+<table role="presentation" width="100%" style="font-size:14px;margin:0 0 12px 0">
+  <tr><td class="ink" style="padding:5px 0;color:#111827">Refund before tax</td><td align="right" class="ink" style="color:#111827">{{ money(t.subtotal_cents) }}</td></tr>
+  {% for x in t.taxes %}<tr><td class="muted" style="padding:4px 0;color:#6b7280">{{ x.label }} ({{ t.province }})</td><td align="right" class="muted" style="color:#6b7280">{{ money(x.amount_cents) }}</td></tr>{% endfor %}
+  <tr><td class="ink line" style="padding:8px 0;border-top:2px solid #111827;color:#111827;font-weight:800">Total refunded</td><td align="right" class="ink line" style="padding:8px 0;border-top:2px solid #111827;color:#111827;font-weight:800">{{ money(t.amount_cents) }} CAD</td></tr>
+  <tr><td class="muted" style="padding:4px 0;color:#6b7280">Original total ({{ receipt_number }})</td><td align="right" class="muted" style="color:#6b7280">{{ money(t.original_total_cents) }}</td></tr>
+  <tr><td class="ink" style="padding:4px 0;color:#111827;font-weight:700">New net total</td><td align="right" class="ink" style="color:#111827;font-weight:700">{{ money(t.net_total_cents) }}</td></tr>
+</table>
+{% if t.reason %}<p class="muted" style="margin:0 0 12px 0;color:#6b7280;font-size:13px">Reason: {{ t.reason }}</p>{% endif %}
+<p class="muted" style="margin:0 0 16px 0;color:#6b7280;font-size:13px">📎 The credit note PDF is attached. Your original receipt is unchanged.</p>
+<p style="margin:0"><a class="btn" href="{{ receipt_url }}">View in app</a></p>
+{% endblock %}

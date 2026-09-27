@@ -11,7 +11,7 @@ class Transaction(db.Model):
     user_type = db.Column(db.Enum('customer', 'driver'), nullable=False)
     payment_id = db.Column(db.BigInteger, db.ForeignKey('payments.id'), nullable=True)
     type = db.Column(db.Enum('credit', 'debit'), nullable=False)
-    category = db.Column(db.Enum('ride_payment', 'ride_earning', 'service_fee', 'refund', 'wallet_topup', 'withdrawal', 'bonus', 'penalty'), nullable=False)
+    category = db.Column(db.Enum('ride_payment', 'ride_earning', 'service_fee', 'refund', 'wallet_topup', 'withdrawal', 'bonus', 'penalty', 'rideshare_earning', 'rideshare_fee', 'tip', 'cancellation_fee', 'ride_credit', 'clawback', 'referral_bonus', 'background_check_fee', validate_strings=False), nullable=False)
     amount = db.Column(db.Numeric(10, 2), nullable=False)
     balance_before = db.Column(db.Numeric(10, 2), default=0)
     balance_after = db.Column(db.Numeric(10, 2), default=0)

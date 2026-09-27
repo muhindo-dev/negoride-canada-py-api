@@ -1,0 +1,34 @@
+{% extends "_base.html" %}
+{% set tz = r.timezone %}
+{% block title %}
+<h1>Credit note</h1>
+<div><strong>{{ number }}</strong></div>
+<div class="muted">Issued {{ local_time(issued_at, tz) }}</div>
+<div class="muted">For receipt {{ receipt_number }}</div>
+{% endblock %}
+{% block body %}
+<h2>Trip</h2>
+<table class="kv">
+  <tr><td class="k">Ride ID</td><td>{{ r.ride_ref }}</td></tr>
+  <tr><td class="k">Rider</td><td>{{ r.rider_name }}</td></tr>
+  <tr><td class="k">Driver</td><td>{{ r.driver_name }}{% if r.vehicle %} · {{ r.vehicle }}{% endif %}</td></tr>
+  <tr><td class="k">Route</td><td>{{ r.pickup_address }} → {{ r.dropoff_address }}</td></tr>
+  {% if t.reason %}<tr><td class="k">Reason</td><td>{{ t.reason }}</td></tr>{% endif %}
+  {% if t.refunded_at %}<tr><td class="k">Refunded</td><td>{{ local_time(t.refunded_at, tz) }} to {{ t.payment_method }}</td></tr>{% endif %}
+</table>
+
+<h2>Credit</h2>
+<table class="lines">
+  <tr><td>Refund before tax</td><td class="amt">{{ money(t.subtotal_cents) }}</td></tr>
+  {% for x in t.taxes %}<tr class="tax"><td>{{ x.label }} — {{ t.province_name }}</td><td class="amt">{{ money(x.amount_cents) }}</td></tr>{% endfor %}
+  <tr class="total"><td>Total refunded</td><td class="amt">{{ money(t.amount_cents) }} CAD</td></tr>
+</table>
+
+<h2>Summary</h2>
+<table class="kv">
+  <tr><td class="k">Original receipt total</td><td>{{ money(t.original_total_cents) }} ({{ receipt_number }})</td></tr>
+  {% if t.previously_credited_cents %}<tr><td class="k">Previously credited</td><td>-{{ money(t.previously_credited_cents) }}</td></tr>{% endif %}
+  <tr><td class="k">This credit note</td><td>-{{ money(t.amount_cents) }}</td></tr>
+  <tr><td class="k"><strong>New net total</strong></td><td><strong>{{ money(t.net_total_cents) }} CAD</strong></td></tr>
+</table>
+{% endblock %}

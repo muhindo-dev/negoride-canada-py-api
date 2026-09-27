@@ -85,6 +85,9 @@ def important_contacts(user):
     result = []
     for c in contacts:
         cd = c.to_dict()
+        # v4 (spec §8.1): additive category/province fields
+        cd.setdefault('category', c.user_type)
+        cd.setdefault('province', getattr(c, 'province', None))
         if user_lat and user_lng and c.current_latitude and c.current_longitude:
             cd['distance'] = _haversine(user_lat, user_lng, float(c.current_latitude), float(c.current_longitude))
         else:
@@ -96,11 +99,25 @@ def important_contacts(user):
     if limit:
         result = result[:int(limit)]
 
+    # v4 (spec §8.1): curated help contacts (911, 988, police non-emergency by
+    # province, roadside, NegoRide support). Additive — old clients ignore it.
+    province = (request.args.get('province') or getattr(user, 'province', None) or '').upper()[:2] or None
+    try:
+        from backend.services import safety_service
+        help_list = safety_service.help_contacts(province)
+        support = safety_service.support_contact()
+    except Exception:
+        help_list, support = [], None
+
     return success_response("Success", {
         'contacts': result,
         'user_location': {'latitude': user.current_latitude, 'longitude': user.current_longitude},
         'total_count': len(result),
         'filters_applied': {'service_type': service_type, 'search': search},
+        'help_contacts': help_list,
+        'support': support,
+        'province': province,
+        'emergency_number': '911',
     })
 
 
@@ -137,16 +154,20 @@ def contacts_statistics(user):
 # ---------------------------------------------------------------------------
 
 @resources_bp.route('/api/users', methods=['GET'])
-def search_users():
-    """Search admin users by name (no auth)."""
+@jwt_required_with_user
+def search_users(user):
+    """Search users by name. Requires auth; returns a PII-safe projection so the
+    directory can't be harvested for emails/phones/national IDs."""
     q = request.args.get('q', '')
     users = AdminUser.query.filter(AdminUser.name.ilike(f'%{q}%')).limit(20).all()
-    return success_response("Success", [u.to_dict() for u in users])
+    return success_response("Success", [u.to_public_dict() for u in users])
 
 
 @resources_bp.route('/api/ajax', methods=['GET'])
-def ajax_search():
-    """Dynamic model AJAX search (no auth)."""
+@jwt_required_with_user
+def ajax_search(user):
+    """Dynamic model AJAX search. Requires auth; AdminUser results use the
+    PII-safe projection."""
     model_name = request.args.get('model')
     q = request.args.get('q', '')
     search_by_1 = request.args.get('search_by_1', 'name')
@@ -170,7 +191,8 @@ def ajax_search():
         return error_response("Invalid search column")
 
     items = model_cls.query.filter(col.ilike(f'%{q}%')).limit(20).all()
-    return success_response("Success", [i.to_dict() for i in items])
+    serialize = (lambda i: i.to_public_dict()) if model_cls is AdminUser else (lambda i: i.to_dict())
+    return success_response("Success", [serialize(i) for i in items])
 
 
 # Dynamic model query (match Laravel's /api/api/{model})

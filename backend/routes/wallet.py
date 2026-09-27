@@ -71,14 +71,14 @@ def summary(user):
 
     return success_response("Success", {
         'wallet': {
-            'balance': wallet.wallet_balance,
-            'total_earnings': wallet.total_earnings,
+            'balance': float(wallet.wallet_balance or 0),
+            'total_earnings': float(wallet.total_earnings or 0),
         },
         'statistics': {
-            'total_credits': int(total_credits),
-            'total_debits': int(total_debits),
+            'total_credits': float(total_credits or 0),
+            'total_debits': float(total_debits or 0),
             'total_transactions': total_transactions,
-            'ride_earnings': int(ride_earnings),
+            'ride_earnings': float(ride_earnings or 0),
         },
         'recent_transactions': [t.to_dict() for t in recent],
     })
@@ -121,13 +121,13 @@ def earnings(user):
     elif period == 'year':
         total_earnings = total_earnings.filter(Transaction.created_at >= now - timedelta(days=365))
 
-    total = total_earnings.scalar()
+    total = float(total_earnings.scalar() or 0)
     trip_count = q.count()
-    avg = int(total / trip_count) if trip_count > 0 else 0
+    avg = round(total / trip_count, 2) if trip_count > 0 else 0
 
     return success_response("Success", {
         'period': period,
-        'total_earnings': int(total),
+        'total_earnings': round(total, 2),
         'trip_count': trip_count,
         'average_per_trip': avg,
     })

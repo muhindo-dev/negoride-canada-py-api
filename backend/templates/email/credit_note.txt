@@ -1,0 +1,18 @@
+Credit note {{ number }}
+
+Hi {{ first_name }},
+
+We refunded {{ money(t.amount_cents) }} to your {{ t.payment_method or 'card' }} for ride {{ r.ride_ref }} (receipt {{ receipt_number }}).
+
+Refund before tax: {{ money(t.subtotal_cents) }}
+{% for x in t.taxes %}{{ x.label }} ({{ t.province }}): {{ money(x.amount_cents) }}
+{% endfor %}TOTAL REFUNDED: {{ money(t.amount_cents) }} CAD
+Original total: {{ money(t.original_total_cents) }}
+New net total: {{ money(t.net_total_cents) }}
+{% if t.reason %}Reason: {{ t.reason }}
+{% endif %}
+The credit note PDF is attached. Your original receipt is unchanged.
+View in app: {{ receipt_url }}
+--
+{{ company_legal_name }} · {{ company_address }}
+Support: {{ support_email }}

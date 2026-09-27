@@ -1,0 +1,7 @@
+{% extends "_layout.html" %}
+{% block content %}
+<h1 class="ink" style="margin:0 0 12px 0;font-size:22px;color:#111827">{{ title }}</h1>
+<p class="ink" style="margin:0 0 8px 0;color:#111827">Hi {{ first_name }},</p>
+<p class="ink" style="margin:0 0 20px 0;color:#111827">{{ body }}</p>
+{% if cta_url %}<p style="margin:0 0 8px 0"><a class="btn" href="{{ cta_url }}">{{ cta_label }}</a></p>{% endif %}
+{% endblock %}

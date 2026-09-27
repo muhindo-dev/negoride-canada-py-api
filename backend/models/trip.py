@@ -30,6 +30,25 @@ class Trip(db.Model):
     start_address = db.Column(db.Text, nullable=True)
     end_address = db.Column(db.Text, nullable=True)
 
+    # ── v4 lifecycle (spec §4.2, §18) ──
+    trip_stage = db.Column(db.String(40), nullable=True, index=True)
+    stage_changed_at = db.Column(db.DateTime, nullable=True)
+    departure_at = db.Column(db.DateTime, nullable=True)
+    booking_mode = db.Column(db.String(20), nullable=False, default='instant')
+    allow_seat_negotiation = db.Column(db.Boolean, nullable=False, default=True)
+    price_per_seat_cents = db.Column(db.BigInteger, nullable=True)
+    min_seat_price_cents = db.Column(db.BigInteger, nullable=True)
+    pets_ok = db.Column(db.Boolean, nullable=False, default=False)
+    luggage_size = db.Column(db.String(20), nullable=True)
+    boarding_at = db.Column(db.DateTime, nullable=True)
+    started_at = db.Column(db.DateTime, nullable=True)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    closed_at = db.Column(db.DateTime, nullable=True)
+    cancelled_at = db.Column(db.DateTime, nullable=True)
+    cancel_reason_code = db.Column(db.String(40), nullable=True)
+    published_at = db.Column(db.DateTime, nullable=True)
+    pickup_province = db.Column(db.String(4), nullable=True)
+
     # Relationships
     bookings = db.relationship('TripBooking', backref='trip', lazy=True)
     notes = db.relationship('TripNote', backref='trip', lazy=True)
@@ -41,6 +60,15 @@ class Trip(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            'trip_stage': self.trip_stage,
+            'stage_changed_at': my_date_time(self.stage_changed_at),
+            'departure_at': my_date_time(self.departure_at),
+            'booking_mode': self.booking_mode,
+            'allow_seat_negotiation': bool(self.allow_seat_negotiation),
+            'price_per_seat_cents': self.price_per_seat_cents,
+            'min_seat_price_cents': self.min_seat_price_cents,
+            'pets_ok': bool(self.pets_ok),
+            'luggage_size': self.luggage_size,
             'driver_id': self.driver_id,
             'customer_id': self.customer_id,
             'driver_name': self.driver.name if self.driver else None,

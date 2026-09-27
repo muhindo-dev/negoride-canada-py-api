@@ -46,6 +46,39 @@ class Negotiation(db.Model):
     stripe_price_id = db.Column(db.String(255), nullable=True)
     stripe_paid = db.Column(db.String(10), default='No')
 
+    # ── v4 lifecycle (spec §4) ──
+    trip_stage = db.Column(db.String(40), nullable=True, index=True)
+    stage_changed_at = db.Column(db.DateTime, nullable=True)
+    agreed_price_cents = db.Column(db.BigInteger, nullable=True)
+    ride_pin = db.Column(db.String(8), nullable=True)
+    confirmed_at = db.Column(db.DateTime, nullable=True)
+    en_route_at = db.Column(db.DateTime, nullable=True)
+    arriving_at = db.Column(db.DateTime, nullable=True)
+    driver_arrived_at = db.Column(db.DateTime, nullable=True)
+    started_at = db.Column(db.DateTime, nullable=True)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    closed_at = db.Column(db.DateTime, nullable=True)
+    cancelled_at = db.Column(db.DateTime, nullable=True)
+    cancelled_by = db.Column(db.String(20), nullable=True)
+    cancel_reason = db.Column(db.Text, nullable=True)
+    cancel_reason_code = db.Column(db.String(40), nullable=True)
+    awaiting_payment_since = db.Column(db.DateTime, nullable=True)
+    eta_seconds = db.Column(db.Integer, nullable=True)
+    eta_distance_m = db.Column(db.Integer, nullable=True)
+    eta_target = db.Column(db.String(10), nullable=True)
+    eta_updated_at = db.Column(db.DateTime, nullable=True)
+    initial_eta_at = db.Column(db.DateTime, nullable=True)
+    disputed_at = db.Column(db.DateTime, nullable=True)
+    dispute_reason = db.Column(db.Text, nullable=True)
+    request_mode = db.Column(db.String(20), nullable=True)
+    service_type = db.Column(db.String(40), nullable=True)
+    tip_cents = db.Column(db.BigInteger, nullable=True)
+    final_fare_cents = db.Column(db.BigInteger, nullable=True)
+    waiting_fee_cents = db.Column(db.BigInteger, nullable=True)
+    distance_m = db.Column(db.Integer, nullable=True)
+    duration_s = db.Column(db.Integer, nullable=True)
+    pickup_province = db.Column(db.String(4), nullable=True)
+
     # Timestamps
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -92,6 +125,23 @@ class Negotiation(db.Model):
 
         return {
             'id': self.id,
+            # v4 (ride_pin is deliberately NOT exposed here — customer-only via /api/rides)
+            'trip_stage': self.trip_stage,
+            'stage_changed_at': my_date_time(self.stage_changed_at),
+            'agreed_price_cents': self.agreed_price_cents,
+            'confirmed_at': my_date_time(self.confirmed_at),
+            'en_route_at': my_date_time(self.en_route_at),
+            'driver_arrived_at': my_date_time(self.driver_arrived_at),
+            'started_at': my_date_time(self.started_at),
+            'completed_at': my_date_time(self.completed_at),
+            'cancelled_at': my_date_time(self.cancelled_at),
+            'cancelled_by': self.cancelled_by,
+            'cancel_reason_code': self.cancel_reason_code,
+            'eta_seconds': self.eta_seconds,
+            'eta_distance_m': self.eta_distance_m,
+            'eta_target': self.eta_target,
+            'request_mode': self.request_mode,
+            'service_type': self.service_type,
             'customer_id': self.customer_id,
             'customer_name': self.customer_name,
             'driver_id': self.driver_id,

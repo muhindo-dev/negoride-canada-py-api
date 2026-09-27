@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ number }}</title>
+<style>
+  @page { size: Letter; margin: 16mm 16mm 20mm 16mm;
+          @bottom-center { content: "{{ (t.company or {}).legal_name or 'NegoRide Canada' }} · {{ number }} · page " counter(page) " of " counter(pages);
+                           font-family: Helvetica, Arial, sans-serif; font-size: 8pt; color: #6b7280; } }
+  * { box-sizing: border-box; }
+  body { font-family: Helvetica, Arial, sans-serif; font-size: 10pt; color: #111827; line-height: 1.4; margin: 0; }
+  .brand { display: inline-block; background: #EF9B11; color: #111; font-weight: 800; border-radius: 6px; padding: 4px 9px; font-size: 13pt; }
+  .muted { color: #6b7280; }
+  h1 { font-size: 18pt; margin: 0 0 2mm 0; }
+  h2 { font-size: 11pt; margin: 6mm 0 2mm 0; text-transform: uppercase; letter-spacing: .04em; color: #374151; }
+  table { width: 100%; border-collapse: collapse; }
+  .head td { vertical-align: top; }
+  .kv td { padding: 1.2mm 0; vertical-align: top; }
+  .kv td.k { width: 38%; color: #6b7280; }
+  .lines td { padding: 1.8mm 0; border-bottom: 0.3pt solid #e5e7eb; }
+  .lines td.amt { text-align: right; white-space: nowrap; }
+  .lines tr.sub td { font-weight: bold; border-top: 0.8pt solid #9ca3af; }
+  .lines tr.tax td { color: #4b5563; }
+  .lines tr.total td { font-size: 13pt; font-weight: 800; border-top: 1.4pt solid #111827; border-bottom: none; padding-top: 3mm; }
+  .box { border: 0.6pt solid #e5e7eb; border-radius: 4px; padding: 3mm 4mm; }
+  .note { font-size: 8.5pt; color: #6b7280; }
+  .pill { display: inline-block; border: 0.6pt solid #16a34a; color: #166534; border-radius: 10px; padding: 0.5mm 3mm; font-size: 8.5pt; font-weight: bold; }
+  .right { text-align: right; }
+</style>
+</head>
+<body>
+<table class="head"><tr>
+  <td><span class="brand">NegoRide</span> <span class="muted">Canada</span><br>
+    <div style="margin-top:3mm"><strong>{{ (t.company or {}).legal_name }}</strong><br>
+    <span class="muted">{{ (t.company or {}).address }}</span><br>
+    {% if t.registration and t.registration.gst_hst %}<span class="muted">GST/HST reg. no. {{ t.registration.gst_hst }}</span><br>{% endif %}
+    {% if t.registration and t.registration.qst and t.province == 'QC' %}<span class="muted">QST reg. no. {{ t.registration.qst }}</span><br>{% endif %}
+    </div></td>
+  <td class="right">{% block title %}{% endblock %}</td>
+</tr></table>
+{% block body %}{% endblock %}
+<p class="note" style="margin-top:8mm">Questions about this document? {{ (t.company or {}).support_email }}{% if (t.company or {}).support_phone %} · {{ t.company.support_phone }}{% endif %} · {{ web_base }}
+{% if policy_url %}<br>Cancellation &amp; refund policy: {{ policy_url }}{% endif %}
+<br>All amounts in Canadian dollars (CAD). Times shown in {{ r.timezone or 'UTC' }}.</p>
+</body>
+</html>

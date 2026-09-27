@@ -1,7 +1,32 @@
 import bcrypt
 from datetime import datetime
+from flask import request, has_request_context
 from backend.models import db
 from backend.utils.helpers import my_date_time, my_date
+
+
+def resolve_media_url(path):
+    """Turn a stored image reference into a URL the current client can load.
+
+    Images in our own storage (bare filenames, `images/…` relative paths, or
+    stale absolute URLs pointing at an old backend host) are rebuilt against the
+    host the client actually used to reach this API — so the same record works
+    from the emulator (10.0.2.2), a LAN device, or production without change.
+    Genuinely external images (e.g. seed avatars on other domains) are returned
+    untouched.
+    """
+    if not path:
+        return path
+    s = str(path)
+    if s.startswith('http') and '/storage/' not in s and '/uploads/' not in s:
+        return s  # external image on another domain — leave as-is
+    filename = s.split('/')[-1]
+    if has_request_context():
+        base = request.host_url.rstrip('/')
+    else:
+        from backend.config import Config
+        base = (Config.APP_URL or '').rstrip('/')
+    return f"{base}/storage/images/{filename}" if base else f"/storage/images/{filename}"
 
 
 class AdminUser(db.Model):
@@ -72,6 +97,30 @@ class AdminUser(db.Model):
     current_longitude = db.Column(db.Numeric(11, 8), nullable=True)
     last_location_update = db.Column(db.DateTime, nullable=True)
 
+    # ── v4 identity / account status (spec §11, §15, §17) ──
+    account_status = db.Column(db.String(20), nullable=True)
+    status_reason = db.Column(db.String(500), nullable=True)
+    status_reason_code = db.Column(db.String(40), nullable=True)
+    status_changed_by = db.Column(db.Integer, nullable=True)
+    status_changed_at = db.Column(db.DateTime, nullable=True)
+    suspended_until = db.Column(db.DateTime, nullable=True)
+    pending_account_status = db.Column(db.String(20), nullable=True)
+    token_version = db.Column(db.Integer, nullable=False, default=0)
+    phone_e164 = db.Column(db.String(20), nullable=True)
+    phone_verified_at = db.Column(db.DateTime, nullable=True)
+    phone_line_type = db.Column(db.String(30), nullable=True)
+    rating_count = db.Column(db.Integer, nullable=False, default=0)
+    rating_avg_raw = db.Column(db.Numeric(4, 3), nullable=True)
+    marketing_opt_in = db.Column(db.Boolean, nullable=False, default=False)
+    marketing_opt_in_at = db.Column(db.DateTime, nullable=True)
+    admin_roles = db.Column(db.String(255), nullable=True)
+    preferred_language = db.Column(db.String(5), nullable=True)
+    timezone = db.Column(db.String(60), nullable=True)
+    province = db.Column(db.String(2), nullable=True)
+    legal_name = db.Column(db.String(200), nullable=True)
+    pending_status_meta = db.Column(db.JSON, nullable=True)
+    sms_opt_out_at = db.Column(db.DateTime, nullable=True)
+
     # Relationships
     wallet = db.relationship('UserWallet', backref='user', uselist=False, lazy=True)
     payout_account = db.relationship('PayoutAccount', backref='user', uselist=False, lazy=True)
@@ -87,6 +136,50 @@ class AdminUser(db.Model):
     @property
     def is_online(self):
         return self.ready_for_trip
+
+    # Real (per-service) approval columns. A user is an APPROVED driver only if an
+    # admin has approved at least one service. "Pending Driver" applicants have the
+    # is_<svc> applied flags set but none of these, so they are NOT approved.
+    _APPROVED_SERVICE_COLUMNS = (
+        'is_car_approved', 'is_boda_approved', 'is_ambulance_approved',
+        'is_delivery_approved', 'is_breakdown_approved',
+    )
+
+    def is_approved_driver(self):
+        """True only after admin approval of the driver application."""
+        if self.user_type == 'Driver':
+            return True
+        return any(
+            getattr(self, col, None) == 'Yes'
+            for col in self._APPROVED_SERVICE_COLUMNS
+        )
+
+    # ── v4 account status helpers (spec §15) ──
+    ACCOUNT_STATUSES = ('active', 'suspended', 'deactivated', 'banned', 'pending_review')
+
+    def effective_account_status(self):
+        """account_status, falling back to the legacy integer `status`.
+        A temporary suspension whose end date has passed reads as active."""
+        st = self.account_status
+        if not st:
+            st = 'active' if self.status in (1, '1', None) else 'deactivated'
+        if st == 'suspended' and self.suspended_until and self.suspended_until <= datetime.utcnow():
+            return 'active'
+        return st
+
+    def is_account_active(self):
+        return self.effective_account_status() == 'active'
+
+    def get_admin_roles(self):
+        """Admin roles (spec §19.14). Legacy Admin/Super Admin users are super admins."""
+        roles = [r.strip() for r in (self.admin_roles or '').split(',') if r.strip()]
+        if not roles and self.user_type in ('Admin', 'Super Admin'):
+            roles = ['super_admin']
+        return roles
+
+    def has_admin_role(self, *roles):
+        mine = self.get_admin_roles()
+        return 'super_admin' in mine or any(r in mine for r in roles)
 
     def set_password(self, password):
         self.password = bcrypt.hashpw(
@@ -109,7 +202,7 @@ class AdminUser(db.Model):
             'last_name': self.last_name,
             'email': self.email,
             'phone_number': self.phone_number,
-            'avatar': self.avatar,
+            'avatar': resolve_media_url(self.avatar),
             'country_name': self.country_name,
             'country_code': self.country_code,
             'country_short_name': self.country_short_name,
@@ -148,6 +241,39 @@ class AdminUser(db.Model):
             'current_latitude': str(self.current_latitude) if self.current_latitude else None,
             'current_longitude': str(self.current_longitude) if self.current_longitude else None,
             'last_location_update': my_date_time(self.last_location_update),
+            'account_status': self.effective_account_status(),
+            'suspended_until': my_date_time(self.suspended_until),
+            'status_reason_code': self.status_reason_code,
+            'phone_e164': self.phone_e164,
+            'phone_verified': bool(self.phone_verified_at),
+            'phone_verified_at': my_date_time(self.phone_verified_at),
+            'email_verified': bool(self.email_verified_at),
+            'rating_count': self.rating_count or 0,
+            'marketing_opt_in': bool(self.marketing_opt_in),
+            'preferred_language': self.preferred_language,
+            'province': self.province,
+            'admin_roles': self.get_admin_roles(),
             'created_at': my_date_time(self.created_at),
             'updated_at': my_date_time(self.updated_at),
         }
+
+    # Personally-identifying fields that must not be harvestable by enumerating
+    # the user directory via bulk search/listing endpoints.
+    _SENSITIVE_PUBLIC_KEYS = (
+        'email', 'phone_number', 'nin', 'date_of_birth',
+        'driving_license_number', 'driving_license_issue_date',
+        'driving_license_validity', 'driving_license_issue_authority',
+        'driving_license_photo',
+    )
+
+    def to_public_dict(self):
+        """A reduced projection safe to return in bulk search/listing responses.
+
+        Excludes PII (email, phone, national ID, driving-licence details, DOB).
+        Use this instead of to_dict() anywhere a caller can enumerate arbitrary
+        users; use the full to_dict() only for the user's own record or admins.
+        """
+        data = self.to_dict()
+        for key in self._SENSITIVE_PUBLIC_KEYS:
+            data.pop(key, None)
+        return data

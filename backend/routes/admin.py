@@ -17,7 +17,7 @@ from backend.models.chat_head import ChatHead
 from backend.models.chat_message import ChatMessage
 from backend.models.company import Company
 from backend.models.route_stage import RouteStage
-from backend.utils.auth import admin_required, jwt_required_with_user
+from backend.utils.auth import admin_required
 from backend.utils.response import success_response, error_response
 
 admin_bp = Blueprint('admin', __name__)
@@ -195,7 +195,7 @@ def user_growth(user):
 # ═══════════════════════════════════════════════════════════════════════════
 
 @admin_bp.route('/api/admin/users', methods=['GET'])
-@jwt_required_with_user
+@admin_required
 def users_index(user):
     """List all users with search, filter, and pagination."""
     page = int(request.args.get('page', 1))
@@ -211,6 +211,12 @@ def users_index(user):
         q = q.filter_by(user_type=user_type)
     if status is not None:
         q = q.filter_by(status=int(status))
+    account_status = request.args.get('account_status')
+    if account_status == 'active':
+        q = q.filter(or_(AdminUser.account_status == 'active',
+                         db.and_(AdminUser.account_status.is_(None), AdminUser.status == 1)))
+    elif account_status:
+        q = q.filter(AdminUser.account_status == account_status)
     if search:
         search_term = f'%{search}%'
         q = q.filter(or_(
@@ -234,7 +240,7 @@ def users_index(user):
 
 
 @admin_bp.route('/api/admin/users/<int:user_id>', methods=['GET'])
-@jwt_required_with_user
+@admin_required
 def users_show(user, user_id):
     """Get detailed user info including wallet and activity."""
     target = AdminUser.query.get(user_id)
@@ -270,6 +276,12 @@ def users_update(user, user_id):
         return error_response("User not found", status_code=404)
 
     data = request.get_json(silent=True) or request.form
+    # Only super admins may grant or remove admin rights (spec §19.14).
+    new_type = data.get('user_type')
+    if new_type is not None and new_type != target.user_type and \
+            ('Admin' in str(new_type) or target.user_type in ('Admin', 'Super Admin')) and \
+            not user.has_admin_role('super_admin'):
+        return error_response("Only a super admin can change admin rights", status_code=403)
     updatable = [
         'first_name', 'last_name', 'name', 'email', 'phone_number',
         'user_type', 'date_of_birth', 'sex', 'current_address',
@@ -287,11 +299,16 @@ def users_update(user, user_id):
     for field in updatable:
         if field in data and data[field] is not None:
             setattr(target, field, data[field])
-    if 'status' in data:
-        target.status = int(data['status'])
-
     target.updated_at = datetime.utcnow()
     db.session.commit()
+    if 'status' in data:
+        # v4: account status changes go through account_service (revokes tokens,
+        # disconnects sockets, audits, respects active rides).
+        from backend.services import account_service
+        want = 'active' if int(data['status']) == 1 else 'deactivated'
+        if target.effective_account_status() != want:
+            account_service.set_status(target, want, actor=user, reason_code='admin_legacy_update',
+                                       reason_text='Changed from the legacy admin user editor')
     return success_response("User updated", target.to_dict())
 
 
@@ -382,9 +399,10 @@ def toggle_status(user, user_id):
     target = AdminUser.query.get(user_id)
     if not target:
         return error_response("User not found", status_code=404)
-    target.status = 0 if target.status == 1 else 1
-    target.updated_at = datetime.utcnow()
-    db.session.commit()
+    from backend.services import account_service
+    want = 'active' if not target.is_account_active() else 'deactivated'
+    account_service.set_status(target, want, actor=user, reason_code='admin_legacy_toggle',
+                               reason_text='Toggled from the legacy admin users page')
     return success_response("Status updated", target.to_dict())
 
 
@@ -397,9 +415,14 @@ def users_delete(user, user_id):
         return error_response("User not found", status_code=404)
     if target.id == user.id:
         return error_response("Cannot delete yourself")
+    from backend.services.audit import audit
     target.deleted_at = datetime.utcnow()
     target.status = 0
+    target.account_status = 'deactivated'
+    target.token_version = (target.token_version or 0) + 1   # revoke every session
+    target.ready_for_trip = 'No'
     target.updated_at = datetime.utcnow()
+    audit('user.soft_delete', user, 'user', target.id)
     db.session.commit()
     return success_response("User deleted")
 
@@ -990,10 +1013,45 @@ def payout_approve(user, payout_id):
 @admin_bp.route('/api/admin/payout-requests/<int:payout_id>/complete', methods=['POST'])
 @admin_required
 def payout_complete(user, payout_id):
-    """Admin marks payout as completed."""
+    """Admin completes a payout: transfers the net amount to the driver's Stripe
+    Connect account (money actually leaves the platform balance)."""
+    import os
+    import stripe
+    stripe.api_key = os.environ.get('STRIPE_SECRET_KEY', '')
+
     payout = PayoutRequest.query.get(payout_id)
     if not payout:
         return error_response("Payout request not found", status_code=404)
+    if payout.status == 'completed':
+        return success_response("Payout already completed", payout.to_dict())
+    if payout.status not in ('pending', 'processing'):
+        return error_response(f"Cannot complete a {payout.status} payout")
+
+    account = PayoutAccount.query.filter_by(user_id=payout.user_id).first()
+    if not account or not account.stripe_account_id or not account.payouts_enabled:
+        return error_response(
+            "Driver has no active Stripe payout account — cannot transfer funds."
+        )
+
+    # Funds were already reserved (wallet debited) at request time. Now move the
+    # net amount from the platform balance to the driver's connected account;
+    # Stripe then pays it out to their bank per their payout schedule.
+    net_cents = int(round(float(payout.net_amount or payout.amount) * 100))
+    try:
+        transfer = stripe.Transfer.create(
+            amount=net_cents,
+            currency=(payout.currency or 'cad').lower(),
+            destination=account.stripe_account_id,
+            description=f'NegoRide payout #{payout.id}',
+            metadata={'payout_id': str(payout.id), 'user_id': str(payout.user_id)},
+        )
+    except stripe.error.StripeError as e:
+        payout.status = 'processing'
+        payout.failure_reason = str(e)
+        db.session.commit()
+        return error_response(f"Stripe transfer failed: {str(e)}")
+
+    payout.stripe_transfer_id = transfer.id
     payout.status = 'completed'
     payout.processed_at = datetime.utcnow()
     db.session.commit()
@@ -1003,14 +1061,22 @@ def payout_complete(user, payout_id):
 @admin_bp.route('/api/admin/payout-requests/<int:payout_id>/reject', methods=['POST'])
 @admin_required
 def payout_reject(user, payout_id):
-    """Admin rejects a payout request."""
+    """Admin rejects a payout request and refunds the reserved funds."""
+    from backend.services import wallet_service
     payout = PayoutRequest.query.get(payout_id)
     if not payout:
         return error_response("Payout request not found", status_code=404)
+    if payout.status in ('completed', 'failed', 'cancelled'):
+        return error_response(f"Cannot reject a {payout.status} payout")
     data = request.get_json(silent=True) or request.form
     payout.status = 'failed'
     payout.failure_reason = data.get('reason', 'Rejected by admin')
     payout.failed_at = datetime.utcnow()
+    # Return the reserved funds to the driver's wallet (idempotent on refund-<id>).
+    wallet_service.refund_to_wallet(
+        payout.user_id, payout.amount, f'refund-{payout.id}',
+        f'Refund for rejected withdrawal #{payout.id}',
+    )
     db.session.commit()
     return success_response("Payout rejected", payout.to_dict())
 

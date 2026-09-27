@@ -16,3 +16,6 @@ backend/uploads/documents/*
 vps-credentials.txt
 negoride_db_dump.sql
 .env.production
+
+# Private (encrypted) object storage: receipts, recordings, documents
+private_storage/

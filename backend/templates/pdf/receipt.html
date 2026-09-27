@@ -1,0 +1,54 @@
+{% extends "_base.html" %}
+{% set tz = r.timezone %}
+{% block title %}
+<h1>Receipt</h1>
+<div><strong>{{ number }}</strong></div>
+<div class="muted">Issued {{ local_time(issued_at, tz) }}</div>
+<div style="margin-top:2mm"><span class="pill">PAID</span></div>
+{% endblock %}
+{% block body %}
+<h2>Trip</h2>
+<table class="kv">
+  <tr><td class="k">Ride ID</td><td>{{ r.ride_ref }}</td></tr>
+  <tr><td class="k">Rider</td><td>{{ r.rider_name }}</td></tr>
+  <tr><td class="k">Driver</td><td>{{ r.driver_name }}{% if r.vehicle %} · {{ r.vehicle }}{% endif %}{% if r.plate %} · {{ r.plate }}{% endif %}</td></tr>
+  <tr><td class="k">Pickup</td><td>{{ r.pickup_address }}{% if r.pickup_at %}<br><span class="muted">{{ local_time(r.pickup_at, tz) }}</span>{% endif %}</td></tr>
+  <tr><td class="k">Drop-off</td><td>{{ r.dropoff_address }}{% if r.dropoff_at %}<br><span class="muted">{{ local_time(r.dropoff_at, tz) }}</span>{% endif %}</td></tr>
+  <tr><td class="k">Distance · Duration</td><td>{{ human_distance(r.distance_m, r.distance_estimated) or '—' }} · {{ human_duration(r.duration_s) or '—' }}</td></tr>
+  {% if r.seats %}<tr><td class="k">Seats</td><td>{{ r.seats }}</td></tr>{% endif %}
+</table>
+
+<h2>Charges</h2>
+<table class="lines">
+  {% for l in t.lines %}
+  <tr><td>{{ l.label }}</td><td class="amt">{{ money(l.amount_cents) }}</td></tr>
+  {% endfor %}
+  <tr class="sub"><td>Subtotal{% if t.tax_inclusive %} (before tax){% endif %}</td><td class="amt">{{ money(t.subtotal_cents) }}</td></tr>
+  {% for x in t.taxes %}
+  <tr class="tax"><td>{{ x.label }} — {{ t.province_name }}</td><td class="amt">{{ money(x.amount_cents) }}</td></tr>
+  {% endfor %}
+  {% if not t.taxes %}<tr class="tax"><td>Sales tax</td><td class="amt">{{ money(0) }}</td></tr>{% endif %}
+  {% if t.tip_cents %}<tr><td>Tip (100% to driver, not taxable)</td><td class="amt">{{ money(t.tip_cents) }}</td></tr>{% endif %}
+  <tr class="total"><td>Total charged</td><td class="amt">{{ money(t.total_cents) }} CAD</td></tr>
+</table>
+{% if t.tax_inclusive %}<p class="note">Fares are tax-inclusive; the tax shown is included in the total.</p>{% endif %}
+
+<h2>Payment</h2>
+<table class="kv">
+  <tr><td class="k">Payment method</td><td>{{ t.payment_method }}</td></tr>
+  {% if t.authorized_at %}<tr><td class="k">Authorized</td><td>{{ local_time(t.authorized_at, tz) }}</td></tr>{% endif %}
+  {% if t.captured_at %}<tr><td class="k">Charged</td><td>{{ local_time(t.captured_at, tz) }}</td></tr>{% endif %}
+</table>
+
+{% if t.refunds %}
+<h2>Refunds</h2>
+<table class="lines">
+  {% for f in t.refunds %}<tr><td>{{ local_time(f.at, tz) }}{% if f.reason %} — {{ f.reason }}{% endif %}</td><td class="amt">-{{ money(f.amount_cents) }}</td></tr>{% endfor %}
+  <tr class="total"><td>Net total</td><td class="amt">{{ money(t.net_total_cents) }} CAD</td></tr>
+</table>
+{% endif %}
+{% if t.negotiation and t.negotiation.saved_cents %}
+<p class="box" style="margin-top:6mm">You negotiated and saved <strong>{{ money(t.negotiation.saved_cents) }}</strong> vs. the initial ask of {{ money(t.negotiation.initial_ask_cents) }}.</p>
+{% endif %}
+<p class="note">Receipt numbers are sequential and never reused. Refunds and adjustments are issued as separate credit notes (NR-CN-…); this receipt is never modified.</p>
+{% endblock %}

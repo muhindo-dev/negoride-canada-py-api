@@ -1,7 +1,7 @@
 /* NegoRide Canada Admin - Design System
    Bold / Modern / Square - per GUIDELINES_DESIGN.md */
 
-:root {
+.legacy-scope {
   --primary: #040404;
   --accent: #EF9B11;
   --accent-hover: #d88a0e;
@@ -34,10 +34,9 @@
   --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html, body, #root { height: 100%; }
+.legacy-scope *, .legacy-scope *::before, .legacy-scope *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-body {
+.legacy-scope {
   font-family: var(--font);
   background: var(--bg);
   color: var(--text);
@@ -46,8 +45,8 @@ body {
   line-height: 1.5;
 }
 
-a { color: var(--accent); text-decoration: none; }
-a:hover { color: var(--accent-hover); }
+.legacy-scope a { color: var(--accent); text-decoration: none; }
+.legacy-scope a:hover { color: var(--accent-hover); }
 
 .page-loader {
   display: flex; align-items: center; justify-content: center;
@@ -560,6 +559,16 @@ a:hover { color: var(--accent-hover); }
   background: var(--bg); color: var(--text);
 }
 .form-group input:focus, .form-group textarea:focus { border-color: var(--accent); outline: none; }
+/* Login/icon inputs live inside BOTH .form-group and .input-wrapper. The
+   generic `.form-group input` rule above has equal specificity but comes later,
+   so it was overriding the icon-aware padding and making text render under the
+   icon. Re-assert the icon-aware padding/border here so it wins. */
+.input-wrapper input {
+  padding: 12px 14px 12px 58px;
+  border: 1.5px solid var(--primary);
+  font-size: 14px;
+}
+.input-wrapper--with-action input { padding-right: 52px; }
 .form-actions { display: flex; gap: 8px; margin-top: 16px; }
 
 /* ── Chat Bubbles ── */

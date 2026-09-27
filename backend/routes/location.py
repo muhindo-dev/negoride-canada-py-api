@@ -9,20 +9,43 @@ from backend.utils.response import success_response, error_response
 location_bp = Blueprint('location', __name__)
 
 
+def _online_block_reason(user):
+    """v4: expired documents, pending suspensions etc. (account_service) block going online."""
+    try:
+        from backend.services import account_service
+    except ImportError:
+        return None
+    ok, reason = account_service.can_go_online(user)
+    return None if ok else reason
+
+
 @location_bp.route('/api/go-on-off', methods=['POST'])
 @jwt_required_with_user
 def go_on_off(user):
     """Toggle driver online/offline. Updates GPS and last_location_update."""
     data = request.get_json(silent=True) or request.form
-    lati = data.get('lati')
-    long_ = data.get('long')
+    # Standard field names are latitude/longitude; lati/long kept as aliases.
+    lati = data.get('latitude', data.get('lati'))
+    long_ = data.get('longitude', data.get('long'))
     status = data.get('status')
 
     if not all([lati, long_, status]):
-        return error_response("lati, long, and status are required")
+        return error_response("latitude, longitude, and status are required")
 
     if status not in ('online', 'offline'):
         return error_response("Status must be 'online' or 'offline'")
+
+    # SECURITY: only an APPROVED driver may go online. Applicants awaiting review
+    # must not be able to receive/serve trips.
+    if status == 'online' and not user.is_approved_driver():
+        return error_response(
+            "Your driver application is still under review. "
+            "You can go online once it has been approved."
+        )
+    if status == 'online':
+        reason = _online_block_reason(user)
+        if reason:
+            return error_response(reason, data={'error_code': 'cannot_go_online'})
 
     # ready_for_trip is the real DB column (varchar 'Yes'/'No')
     user.current_latitude = lati
@@ -53,6 +76,16 @@ def update_online_status(user):
     if status:
         if status not in ('online', 'offline'):
             return error_response("Status must be 'online' or 'offline'")
+        # SECURITY: only an APPROVED driver may go online (see go_on_off).
+        if status == 'online' and not user.is_approved_driver():
+            return error_response(
+                "Your driver application is still under review. "
+                "You can go online once it has been approved."
+            )
+        if status == 'online':
+            reason = _online_block_reason(user)
+            if reason:
+                return error_response(reason, data={'error_code': 'cannot_go_online'})
         user.ready_for_trip = 'Yes' if status == 'online' else 'No'
         if lat or lng:
             user.last_location_update = datetime.utcnow()
@@ -70,8 +103,8 @@ def update_online_status(user):
 def refresh_status(user):
     """Get driver status + active trip info."""
     data = request.get_json(silent=True) or request.form
-    lati = data.get('lati')
-    long_ = data.get('long')
+    lati = data.get('latitude', data.get('lati'))
+    long_ = data.get('longitude', data.get('long'))
 
     if lati:
         user.current_latitude = lati
@@ -98,22 +131,20 @@ def refresh_status(user):
 def update_location(user):
     """Update user's GPS coordinates."""
     data = request.get_json(silent=True) or request.form
-    lat = data.get('latitude')
-    lng = data.get('longitude')
+    lat = data.get('latitude', data.get('lati'))
+    lng = data.get('longitude', data.get('long'))
 
     if lat is None or lng is None:
         return error_response("latitude and longitude are required")
 
-    lat = float(lat)
-    lng = float(lng)
-    if lat < -90 or lat > 90:
-        return error_response("Invalid latitude")
-    if lng < -180 or lng > 180:
-        return error_response("Invalid longitude")
-
-    user.current_latitude = str(lat)
-    user.current_longitude = str(lng)
-    db.session.commit()
+    # v4: one pipeline for every position (breadcrumbs, live map, ETA, arrival
+    # detection, safety checks) — see services/tracking.py
+    from backend.services import tracking
+    try:
+        tracking.ingest(user, data)
+    except tracking.LocationError as e:
+        db.session.rollback()
+        return error_response(str(e))
 
     return success_response("Success", {
         'latitude': user.current_latitude,

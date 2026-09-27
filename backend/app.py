@@ -14,24 +14,86 @@ jwt = JWTManager()
 socketio = SocketIO()
 
 
+# (module, blueprint) pairs for v4 feature areas. Missing modules are skipped so
+# a feature can be removed without editing this file.
+V4_FEATURE_BLUEPRINTS = [
+    ('backend.routes.safety', 'safety_bp'),
+    ('backend.routes.admin_safety', 'admin_safety_bp'),
+    ('backend.routes.tracking_share', 'tracking_share_bp'),
+    ('backend.routes.recordings', 'recordings_bp'),
+    ('backend.routes.verify', 'verify_bp'),
+    ('backend.routes.legal', 'legal_bp'),
+    ('backend.routes.onboarding', 'onboarding_bp'),
+    ('backend.routes.account', 'account_bp'),
+    ('backend.routes.support', 'support_bp'),
+    ('backend.routes.admin_identity', 'admin_identity_bp'),
+    ('backend.routes.receipts', 'receipts_bp'),
+    ('backend.routes.admin_finance', 'admin_finance_bp'),
+    ('backend.routes.ratings', 'ratings_bp'),
+    ('backend.routes.rideshare_v4', 'rideshare_v4_bp'),
+    ('backend.routes.carhire_v4', 'carhire_v4_bp'),
+    ('backend.routes.admin_experience', 'admin_experience_bp'),
+    ('backend.routes.docs', 'docs_bp'),
+]
+
+
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
+    # JSON: serialise Decimal as a NUMBER, not a string. Flask's default provider
+    # renders Decimal via str() (e.g. "0.90"), which breaks mobile clients that do
+    # numeric math / `.toStringAsFixed()` on money fields. Money columns are
+    # Numeric(10,2) -> Decimal, so this makes every balance/amount a real number.
+    from decimal import Decimal as _Decimal
+    from flask.json.provider import DefaultJSONProvider
+
+    class _NumberSafeJSONProvider(DefaultJSONProvider):
+        @staticmethod
+        def default(o):
+            if isinstance(o, _Decimal):
+                return float(o)
+            return DefaultJSONProvider.default(o)
+
+    app.json = _NumberSafeJSONProvider(app)
+
+    # Guard: a LIVE Stripe key outside production means any test payment creates
+    # a REAL charge. Warn loudly so it isn't discovered by an accidental charge.
+    if (app.config.get('STRIPE_SECRET_KEY', '').startswith('sk_live_')
+            and os.getenv('FLASK_ENV', '').lower() != 'production'):
+        import sys
+        print('\n⚠️  WARNING: a LIVE Stripe secret key (sk_live_…) is configured '
+              'while FLASK_ENV is not "production". Real charges can occur — use '
+              'a sk_test_… key for local/dev.\n', file=sys.stderr, flush=True)
+
     # Initialize extensions
     db.init_app(app)
     jwt.init_app(app)
-    CORS(app, resources={r"/api/*": {"origins": "*"}, r"/socket.io/*": {"origins": "*"}})
+
+    # CORS applies only to browser clients (the React admin SPA). The mobile app
+    # is not subject to it, and auth here is header-based (no cookies), so there
+    # is no CSRF vector. Still, allow production to restrict origins via env:
+    #   CORS_ORIGINS="https://admin.example.com,https://foo.example.com"
+    _cors_env = os.getenv('CORS_ORIGINS', '*').strip()
+    cors_origins = '*' if _cors_env in ('', '*') else [o.strip() for o in _cors_env.split(',') if o.strip()]
+    app.config['_CORS_ORIGINS'] = cors_origins
+    CORS(app, resources={r"/api/*": {"origins": cors_origins}, r"/socket.io/*": {"origins": cors_origins}})
 
     # Initialize Socket.IO for real-time call signaling
+    # With Redis available, Socket.IO uses it as a message queue so background
+    # workers (RQ) can emit realtime events to connected clients.
+    from backend import jobs as _jobs
+    _mq = _jobs.redis_url() if (_jobs.mode() == 'rq') else None
     socketio.init_app(
         app,
-        cors_allowed_origins="*",
+        message_queue=_mq,
+        cors_allowed_origins=cors_origins,
         async_mode='threading',  # Compatible with Flask debug mode
         ping_timeout=60,
         ping_interval=25,
-        logger=False,
-        engineio_logger=False,
+        logger=True,
+        engineio_logger=True,
+        path='/socket.io',
     )
 
     # Ensure upload directory exists
@@ -53,6 +115,10 @@ def create_app():
     from backend.routes.admin import admin_bp
     from backend.routes.stream import stream_bp
     from backend.routes.calls import calls_bp
+    from backend.routes.rides import rides_bp
+    from backend.routes.notifications import notifications_bp
+    from backend.routes.admin_v4 import admin_v4_bp
+    from backend.routes.payment_pages import payment_pages_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(profile_bp)
@@ -69,10 +135,34 @@ def create_app():
     app.register_blueprint(admin_bp)
     app.register_blueprint(stream_bp)
     app.register_blueprint(calls_bp)
+    app.register_blueprint(rides_bp)
+    app.register_blueprint(notifications_bp)
+    app.register_blueprint(admin_v4_bp)
+    app.register_blueprint(payment_pages_bp)
+
+    # v4 feature blueprints (registered when present)
+    import importlib
+    for _mod, _bp in V4_FEATURE_BLUEPRINTS:
+        try:
+            app.register_blueprint(getattr(importlib.import_module(_mod), _bp))
+        except ModuleNotFoundError as _e:
+            if _e.name != _mod:
+                raise
 
     # Register Socket.IO call signaling events
     from backend.sockets.call_events import register_call_events
     register_call_events(socketio, app)
+
+    # v4 realtime namespace (/rt): JWT-authenticated rooms user:/ride:/admin:
+    from backend.sockets.realtime_events import register_realtime_events
+    register_realtime_events(socketio, app)
+
+    # Periodic scheduler inside the API process (single-box dev). Production
+    # runs it in worker.py instead. Under the reloader only the child runs it.
+    _reloading = os.getenv('SERVER_RELOAD', '1') == '1' and os.getenv('FLASK_ENV', '') != 'production'
+    if os.getenv('RUN_SCHEDULER', '0') == '1' and (not _reloading or os.getenv('WERKZEUG_RUN_MAIN') == 'true'):
+        from backend.jobs import scheduler as _scheduler
+        _scheduler.start_in_background()
 
     from backend.utils.response import error_response
 
@@ -87,6 +177,32 @@ def create_app():
         if request.path.startswith('/api/'):
             return error_response("Method not allowed for this endpoint.", status_code=405)
         return _error
+
+    @app.errorhandler(Exception)
+    def handle_unexpected(error):
+        """Never leak a stack trace / SQL to a client.
+
+        API paths always get the standard {code, message} envelope; other paths
+        keep Flask's default handling (SPA/static). HTTP errors keep their
+        status code; unexpected errors become a clean 500 after rolling back any
+        half-open transaction so the failure can't poison the shared session.
+        """
+        from werkzeug.exceptions import HTTPException
+        from backend.models import db
+
+        if isinstance(error, HTTPException):
+            if request.path.startswith('/api/'):
+                return error_response(error.description or error.name,
+                                      status_code=error.code or 500)
+            return error
+
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        app.logger.exception(
+            'Unhandled exception on %s %s', request.method, request.path)
+        return error_response('Internal server error.', status_code=500)
 
     # Serve uploaded files
     @app.route('/uploads/<path:filename>')

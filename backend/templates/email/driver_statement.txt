@@ -1,0 +1,17 @@
+Your weekly statement — {{ period_label }} ({{ number }})
+
+Hi {{ first_name }}, here is what you earned with NegoRide last week.
+
+Ride fares ({{ t.trip_count }} trips): {{ money(t.gross_fares_cents) }}
+Platform commission ({{ t.commission_pct }}%): -{{ money(t.commission_cents) }}
+Tips: {{ money(t.tips_cents) }}
+Cancellation / no-show fees: {{ money(t.cancellation_fees_cents) }}
+Bonuses: {{ money(t.bonuses_cents) }}
+Other fees and adjustments: -{{ money(t.fees_cents) }}
+NET EARNINGS: {{ money(t.net_cents) }}
+Payouts sent: {{ money(t.payouts_cents) }}
+
+The detailed PDF statement is attached.
+--
+{{ company_legal_name }} · {{ company_address }}
+Support: {{ support_email }}

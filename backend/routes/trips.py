@@ -31,6 +31,37 @@ def _str(val):
     return str(val).strip()
 
 
+def _v4_error(e):
+    db.session.rollback()
+    return error_response(e.message, data={'error_code': e.code, **getattr(e, 'data', {})},
+                          status_code=e.status if e.status != 409 else 400)
+
+
+def _parse_departure(text, user):
+    """Legacy clients send local wall-clock time without a zone. Interpret it in
+    the user's time zone (device registration) or Toronto, store UTC (spec §2.10)."""
+    if not text:
+        return None
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    raw = str(text).strip().replace('T', ' ').replace('Z', '')
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d'):
+        try:
+            local = _dt.strptime(raw[:26], fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        return None
+    if str(text).endswith('Z'):
+        return local
+    try:
+        tz = ZoneInfo(user.timezone or 'America/Toronto')
+    except Exception:
+        tz = ZoneInfo('America/Toronto')
+    return local.replace(tzinfo=tz).astimezone(ZoneInfo('UTC')).replace(tzinfo=None)
+
+
 def _trip_notes_add_impl(user):
     """Shared implementation for adding a trip note."""
     data = request.get_json(silent=True) or request.form or {}
@@ -142,8 +173,21 @@ def list_bookings(user):
 @trips_bp.route('/api/trips-create', methods=['POST'])
 @jwt_required_with_user
 def create(user):
-    """Create a new trip."""
+    """Create (publish) a rideshare trip. Approved drivers only."""
+    from backend.services import trip_state_machine as TSM
     data = request.get_json(silent=True) or request.form
+
+    if not user.is_approved_driver() and user.user_type not in ('Admin', 'Super Admin'):
+        return error_response("Only approved drivers can publish trips.")
+
+    price = _int(data.get('price'))
+    per_seat_cents = _int(data.get('price_per_seat_cents')) or ((price or 0) * 100 or None)
+    min_cents = _int(data.get('min_seat_price_cents'))
+    if min_cents and per_seat_cents and min_cents > per_seat_cents:
+        return error_response("Minimum seat price cannot exceed the seat price.")
+    booking_mode = (data.get('booking_mode') or 'instant').strip().lower()
+    if booking_mode not in ('instant', 'request'):
+        return error_response("booking_mode must be 'instant' or 'request'")
 
     trip = Trip(
         driver_id=user.id,
@@ -161,13 +205,23 @@ def create(user):
         end_time=_str(data.get('end_time')),
         vehicel_reg_number=_str(data.get('vehicel_reg_number')),
         car_model=_str(data.get('car_model')),
-        price=_int(data.get('price')),
+        price=price,
         slots=_int(data.get('slots')) or 1,
         details=_str(data.get('details')),
         status='Active',
+        departure_at=_parse_departure(data.get('departure_at') or data.get('scheduled_start_time')
+                                      or data.get('date'), user),
+        booking_mode=booking_mode,
+        allow_seat_negotiation=str(data.get('allow_seat_negotiation', '1')).lower() in ('1', 'true', 'yes'),
+        price_per_seat_cents=per_seat_cents,
+        min_seat_price_cents=min_cents,
+        pets_ok=str(data.get('pets_ok', '0')).lower() in ('1', 'true', 'yes'),
+        luggage_size=_str(data.get('luggage_size')),
     )
 
     db.session.add(trip)
+    db.session.flush()
+    TSM.record_creation('rideshare_trip', trip, actor=user, actor_type='driver')
     db.session.commit()
 
     return success_response("Trip created", trip.to_dict(), status_code=201)
@@ -176,7 +230,9 @@ def create(user):
 @trips_bp.route('/api/trips-update', methods=['POST'])
 @jwt_required_with_user
 def update(user):
-    """Update a trip."""
+    """Update a trip. Status changes go through the state machine."""
+    from backend.services import trip_state_machine as TSM
+    from backend.services.ride_actions import cancel as cancel_ride
     data = request.get_json(silent=True) or request.form
     trip_id = data.get('trip_id')
 
@@ -184,12 +240,13 @@ def update(user):
     if not trip:
         return error_response("Trip not found", status_code=404)
 
-    if trip.driver_id != user.id and user.user_type not in ('Admin', 'Super Admin'):
+    is_admin = user.user_type in ('Admin', 'Super Admin')
+    if trip.driver_id != user.id and not is_admin:
         return error_response("Unauthorized", status_code=403)
 
     updatable_str = ['start_name', 'end_name', 'start_gps', 'end_pgs', 'start_address',
                      'end_address', 'scheduled_start_time', 'scheduled_end_time',
-                     'vehicel_reg_number', 'car_model', 'status', 'details']
+                     'vehicel_reg_number', 'car_model', 'details']
     updatable_int = ['start_stage_id', 'end_stage_id', 'price', 'slots']
 
     for field in updatable_str:
@@ -200,9 +257,34 @@ def update(user):
             val = _int(data[field])
             if val is not None:
                 setattr(trip, field, val)
+    if 'price' in data and _int(data['price']):
+        trip.price_per_seat_cents = _int(data['price']) * 100
+    if 'scheduled_start_time' in data:
+        trip.departure_at = _parse_departure(data.get('scheduled_start_time'), user)
+    if 'slots' in data:
+        from backend.services.rideshare_service import seats_taken
+        if (trip.slots or 0) < seats_taken(trip.id):
+            db.session.rollback()
+            return error_response("You can't reduce seats below the number already booked.")
 
-    db.session.commit()
-    return success_response("Trip updated", trip.to_dict())
+    new_status = (data.get('status') or '').strip()
+    try:
+        stage = TSM.ensure_stage('rideshare_trip', trip)
+        target = {'active': 'PUBLISHED', 'scheduled': 'PUBLISHED', 'ongoing': 'IN_PROGRESS',
+                  'started': 'IN_PROGRESS', 'completed': 'COMPLETED'}.get(new_status.lower())
+        if new_status.lower() in ('canceled', 'cancelled'):
+            db.session.commit()
+            cancel_ride('rideshare_trip', trip.id, actor=user, actor_type='admin' if is_admin and trip.driver_id != user.id else None,
+                        reason_code='driver_cancelled_trip', legacy=True)
+        elif target and target != stage:
+            db.session.commit()
+            TSM.walk_to('rideshare_trip', trip.id, target, actor=user,
+                        actor_type='admin' if is_admin and trip.driver_id != user.id else None, legacy=True)
+        else:
+            db.session.commit()
+    except TSM.TransitionError as e:
+        return _v4_error(e)
+    return success_response("Trip updated", Trip.query.get(trip.id).to_dict())
 
 
 import math
@@ -267,7 +349,7 @@ def get_drivers(user):
     except ValueError:
         return error_response("Invalid GPS coordinates.")
 
-    field_key, _ = _AUTOMOBILE_MAP[automobile]
+    field_key, approved_key = _AUTOMOBILE_MAP[automobile]
 
     # Base query: active drivers who are online, excluding the requesting user
     query = AdminUser.query.filter(
@@ -276,16 +358,19 @@ def get_drivers(user):
         AdminUser.ready_for_trip == 'Yes',
     )
 
-    # For car/special car: any Driver who is online (in Canada all drivers have cars)
-    if automobile in ('car', 'special car', 'special car hire'):
-        query = query.filter(
-            db.or_(
-                AdminUser.user_type.ilike('%driver%'),
-                AdminUser.is_car == 'Yes',
-            )
-        )
+    # SECURITY: only drivers APPROVED for this service may be discovered/matched.
+    # A "Pending Driver" (applied but not yet reviewed) has is_<svc> == 'Yes' but
+    # is_<svc>_approved == 'No', so gating on the approved flag excludes them.
+    approved_col = getattr(AdminUser, approved_key, None)
+    if approved_col is not None:
+        query = query.filter(approved_col == 'Yes')
     else:
-        query = query.filter(getattr(AdminUser, field_key) == 'Yes')
+        # No dedicated approval column for this service: require an approved
+        # driver account and the applied capability flag as a safe fallback.
+        query = query.filter(
+            AdminUser.user_type == 'Driver',
+            getattr(AdminUser, field_key) == 'Yes',
+        )
 
     drivers = query.order_by(AdminUser.updated_at.desc()).limit(1000).all()
 
@@ -364,46 +449,45 @@ def driver_bookings(user):
 @trips_bp.route('/api/trips-bookings-create', methods=['POST'])
 @jwt_required_with_user
 def create_booking(user):
-    """Create a trip booking."""
+    """Book seats on a trip (seat inventory is locked — spec §18.1)."""
+    from backend.services import rideshare_service as RS
     data = request.get_json(silent=True) or request.form
-
-    trip = Trip.query.get(data.get('trip_id'))
-    if not trip:
-        return error_response("Trip not found", status_code=404)
-
-    booking = TripBooking(
-        trip_id=trip.id,
-        customer_id=user.id,
-        driver_id=trip.driver_id or 0,
-        start_stage_id=data.get('start_stage_id') or trip.start_stage_id or 0,
-        end_stage_id=data.get('end_stage_id') or trip.end_stage_id or 0,
-        slot_count=data.get('slot_count') or data.get('seats', 1),
-        price=data.get('price', trip.price),
-        customer_note=data.get('customer_note'),
-        status='Pending',
-    )
-
-    db.session.add(booking)
-    db.session.commit()
-
+    try:
+        booking = RS.create_booking(
+            user, data.get('trip_id'), seats=data.get('slot_count') or data.get('seats', 1),
+            offered_price_per_seat_cents=data.get('offered_price_per_seat_cents'),
+            pickup={'lat': data.get('pickup_lat'), 'lng': data.get('pickup_lng'),
+                    'address': data.get('pickup_address')} if data.get('pickup_lat') else None,
+            note=data.get('customer_note'))
+    except RS.BookingError as e:
+        db.session.rollback()
+        return error_response(e.message, data={'error_code': e.code}, status_code=e.status)
     return success_response("Booking created", booking.to_dict(), status_code=201)
 
 
 @trips_bp.route('/api/trips-bookings-update', methods=['POST'])
 @jwt_required_with_user
 def update_booking(user):
-    """Update a trip booking."""
+    """Update notes / seat count on a trip booking (status changes: see
+    /api/trips-booking-status-update). Party-restricted."""
     data = request.get_json(silent=True) or request.form
     booking_id = data.get('booking_id')
 
     booking = TripBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
+    trip = Trip.query.get(booking.trip_id)
+    is_driver = trip and trip.driver_id == user.id
+    is_customer = booking.customer_id == user.id
+    if not (is_driver or is_customer or user.user_type in ('Admin', 'Super Admin')):
+        return error_response("Unauthorized", status_code=403)
 
-    for field in ['status', 'slot_count', 'price', 'driver_notes', 'customer_note']:
-        if field in data and data[field] is not None:
-            setattr(booking, field, data[field])
-
+    if 'status' in data and data['status'] and data['status'] != booking.status:
+        return update_booking_status(user)
+    if is_driver and data.get('driver_notes') is not None:
+        booking.driver_notes = data['driver_notes']
+    if is_customer and data.get('customer_note') is not None:
+        booking.customer_note = data['customer_note']
     db.session.commit()
     return success_response("Booking updated", booking.to_dict())
 
@@ -411,19 +495,54 @@ def update_booking(user):
 @trips_bp.route('/api/trips-booking-status-update', methods=['POST'])
 @jwt_required_with_user
 def update_booking_status(user):
-    """Update trip booking status."""
+    """Legacy status update (Pending / Reserved / Completed / Canceled) mapped
+    onto the seat-booking state machine."""
+    from backend.services import trip_state_machine as TSM
+    from backend.services.ride_actions import cancel as cancel_ride
     data = request.get_json(silent=True) or request.form
     booking_id = data.get('booking_id')
-    new_status = data.get('status')
+    new_status = (data.get('status') or '').strip()
 
     booking = TripBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
+    trip = Trip.query.get(booking.trip_id)
+    is_admin = user.user_type in ('Admin', 'Super Admin')
+    role = 'driver' if (trip and trip.driver_id == user.id) else (
+        'customer' if booking.customer_id == user.id else ('admin' if is_admin else None))
+    if role is None:
+        return error_response("Unauthorized", status_code=403)
 
-    booking.status = new_status
-    db.session.commit()
+    try:
+        stage = TSM.ensure_stage('rideshare_booking', booking)
+        low = new_status.lower()
+        if low in ('canceled', 'cancelled'):
+            cancel_ride('rideshare_booking', booking.id, actor=user,
+                        actor_type='admin' if role == 'admin' else None,
+                        reason='customer_cancel' if role == 'admin' else None, legacy=True)
+        elif role == 'customer':
+            return error_response("Only the driver can change this booking's status.", status_code=403)
+        elif low in ('reserved', 'confirmed'):
+            if stage != 'CONFIRMED':
+                if not TSM.payment_secured('rideshare_booking', booking):
+                    return error_response("Reserved can only be set after payment.")
+                TSM.walk_to('rideshare_booking', booking.id, 'CONFIRMED', actor=user,
+                            actor_type='admin' if role == 'admin' else None, legacy=True)
+        elif low in ('completed',):
+            TSM.walk_to('rideshare_booking', booking.id, 'DROPPED_OFF', actor=user,
+                        actor_type='admin' if role == 'admin' else None, legacy=True)
+        elif low in ('ongoing', 'started'):
+            TSM.walk_to('rideshare_booking', booking.id, 'CHECKED_IN', actor=user,
+                        actor_type='admin' if role == 'admin' else None, legacy=True)
+        elif low == 'pending':
+            if stage not in ('REQUESTED', 'PENDING_PAYMENT'):
+                return error_response("This booking can no longer be set back to Pending.")
+        else:
+            return error_response("Unknown status.")
+    except TSM.TransitionError as e:
+        return _v4_error(e)
 
-    return success_response("Booking status updated", booking.to_dict())
+    return success_response("Booking status updated", TripBooking.query.get(booking.id).to_dict())
 
 
 @trips_bp.route('/api/get-available-trips', methods=['POST'])

@@ -1,0 +1,11 @@
+{{ title }}
+
+Hi {{ first_name }},
+
+{{ body }}
+{% if cta_url %}
+{{ cta_label }}: {{ cta_url }}
+{% endif %}
+--
+{{ company_legal_name }} · {{ company_address }}
+Support: {{ support_email }}

@@ -80,9 +80,44 @@ def update_email(user):
 @profile_bp.route('/api/profile/update-phone', methods=['POST'])
 @jwt_required_with_user
 def update_phone(user):
-    """Update user phone number."""
+    """Update user phone number.
+
+    v4 (spec §11.2 #3): send `verification_token` from
+    /api/verify/phone/check with purpose=change_phone. The new number becomes the
+    verified phone and the OLD number receives an SMS ("your number was changed").
+    v4 clients must verify; v3 clients keep the legacy unverified update.
+    """
+    from backend.services import phone_verification as PV
+    from backend.utils.client_info import is_v4_client
     data = request.get_json(silent=True) or request.form
-    phone_number = data.get('phone_number')
+    phone_number = data.get('phone_number') or data.get('phone')
+    token = data.get('verification_token')
+
+    if token or is_v4_client(data):
+        try:
+            row = PV.consume(token, 'change_phone', phone=phone_number, user=user)
+        except PV.VerifyError as e:
+            db.session.rollback()
+            return error_response(e.message, data=e.payload(), status_code=e.status)
+        if PV.find_verified_owner(row.phone, exclude_id=user.id) or \
+                AdminUser.query.filter(AdminUser.phone_number == row.phone, AdminUser.id != user.id).first():
+            db.session.rollback()
+            return error_response("Phone number already in use", data={'error_code': 'phone_in_use'}, status_code=409)
+        old = user.phone_e164 if user.phone_verified_at else None
+        if not old:
+            from backend.utils.phone import safe_normalize
+            old = safe_normalize(user.phone_number)
+        PV.apply_to_user(user, row, set_legacy_phone=True)
+        user.updated_at = datetime.utcnow()
+        from backend.services.audit import audit
+        audit('user.phone_changed', user, 'user', user.id, before={'phone': old}, after={'phone': row.phone},
+              actor_type='user')
+        if old and old != row.phone:
+            from backend import jobs
+            jobs.enqueue_after_commit('backend.services.account_service.sms_phone_changed', old,
+                                      user.preferred_language or 'en')
+        db.session.commit()
+        return success_response("Phone number updated", user.to_dict())
 
     if not phone_number:
         return error_response("Phone number is required")
@@ -132,7 +167,16 @@ def delete_account(user):
     if not user.check_password(password):
         return error_response("Invalid password")
 
+    # v4: re-verify the phone before deleting (spec §11.2 #7)
+    from backend.services import phone_verification as PV
+    blocked = PV.require_sensitive_action(user, data.get('verification_token'), data)
+    if blocked is not None:
+        return blocked
+
     user.status = '0'
+    user.account_status = 'deactivated'
+    user.status_reason_code = 'self_deleted'
+    user.token_version = int(user.token_version or 0) + 1
     user.deleted_at = datetime.utcnow()
     user.updated_at = datetime.utcnow()
     db.session.commit()
@@ -177,6 +221,15 @@ def become_driver(user):
         user.driving_license_photo = f"images/{filename}"
 
     user.updated_at = datetime.utcnow()
+    # v4: mirror the legacy form into a driver application so the admin
+    # onboarding queue sees v3 applicants too (spec §14).
+    try:
+        from backend.services import onboarding_service
+        with db.session.begin_nested():
+            onboarding_service.from_legacy_become_driver(user, data)
+    except Exception:  # never fail the legacy flow
+        import logging
+        logging.getLogger('negoride.onboarding').exception('become-driver mirror failed')
     db.session.commit()
 
     return success_response("Driver registration submitted. Waiting for approval.", user.to_dict())

@@ -1,0 +1,23 @@
+html, body, #root { min-height: 100%; }
+body { -webkit-font-smoothing: antialiased; }
+
+@keyframes sosPulse {
+  from { background-color: #c92a2a; }
+  to { background-color: #e03131; }
+}
+
+.leaflet-container { font: inherit; background: var(--mantine-color-default); }
+
+.md-preview { line-height: 1.6; font-size: 14px; }
+.md-preview h1 { font-size: 1.5em; margin: 0.6em 0 0.4em; }
+.md-preview h2 { font-size: 1.25em; margin: 0.8em 0 0.4em; }
+.md-preview h3 { font-size: 1.1em; margin: 0.8em 0 0.3em; }
+.md-preview p, .md-preview ul, .md-preview ol { margin: 0.4em 0; }
+.md-preview ul, .md-preview ol { padding-left: 1.4em; }
+.md-preview code { font-size: 0.9em; }
+
+.doc-zoom { overflow: auto; max-height: 75vh; background: var(--mantine-color-default-hover); border-radius: 8px; }
+.doc-zoom img { transform-origin: top left; display: block; }
+
+/* dark map without a tile key: invert the OSM raster */
+.osm-dark { filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9); }

@@ -80,6 +80,26 @@ class ScheduledBooking(db.Model):
     driver_notes = db.Column(db.Text, nullable=True)
     admin_notes = db.Column(db.Text, nullable=True)
 
+    # ── v4 lifecycle (spec §4) ──
+    trip_stage = db.Column(db.String(40), nullable=True, index=True)
+    stage_changed_at = db.Column(db.DateTime, nullable=True)
+    ride_pin = db.Column(db.String(8), nullable=True)
+    en_route_at = db.Column(db.DateTime, nullable=True)
+    arriving_at = db.Column(db.DateTime, nullable=True)
+    driver_arrived_at = db.Column(db.DateTime, nullable=True)
+    closed_at = db.Column(db.DateTime, nullable=True)
+    awaiting_payment_since = db.Column(db.DateTime, nullable=True)
+    cancel_reason_code = db.Column(db.String(40), nullable=True)
+    eta_seconds = db.Column(db.Integer, nullable=True)
+    eta_distance_m = db.Column(db.Integer, nullable=True)
+    eta_target = db.Column(db.String(10), nullable=True)
+    eta_updated_at = db.Column(db.DateTime, nullable=True)
+    initial_eta_at = db.Column(db.DateTime, nullable=True)
+    disputed_at = db.Column(db.DateTime, nullable=True)
+    dispute_reason = db.Column(db.Text, nullable=True)
+    pickup_province = db.Column(db.String(4), nullable=True)
+    tip_cents = db.Column(db.BigInteger, nullable=True)
+
     # Timestamps
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -97,6 +117,12 @@ class ScheduledBooking(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            'trip_stage': self.trip_stage,
+            'stage_changed_at': my_date_time(self.stage_changed_at),
+            'en_route_at': my_date_time(self.en_route_at),
+            'driver_arrived_at': my_date_time(self.driver_arrived_at),
+            'eta_seconds': self.eta_seconds,
+            'eta_distance_m': self.eta_distance_m,
             'customer_id': self.customer_id,
             'driver_id': self.driver_id,
             'customer_name': self.customer.name if self.customer else None,

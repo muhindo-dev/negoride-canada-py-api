@@ -1,0 +1,45 @@
+{% extends "_base.html" %}
+{% block title %}
+<h1>Earnings statement</h1>
+<div><strong>{{ number }}</strong></div>
+<div class="muted">{{ period_label }}</div>
+{% endblock %}
+{% block body %}
+<table class="kv">
+  <tr><td class="k">Driver</td><td>{{ driver_name }} (ID {{ driver_id }})</td></tr>
+  <tr><td class="k">Period</td><td>{{ t.period_start }} to {{ t.period_end_inclusive }} (UTC)</td></tr>
+</table>
+
+<h2>Summary</h2>
+<table class="lines">
+  <tr><td>Ride fares ({{ t.trip_count }} trip{{ 's' if t.trip_count != 1 }})</td><td class="amt">{{ money(t.gross_fares_cents) }}</td></tr>
+  <tr><td>Tips (100% yours)</td><td class="amt">{{ money(t.tips_cents) }}</td></tr>
+  <tr><td>Cancellation / no-show fees (your share)</td><td class="amt">{{ money(t.cancellation_fees_cents) }}</td></tr>
+  <tr><td>Bonuses</td><td class="amt">{{ money(t.bonuses_cents) }}</td></tr>
+  <tr class="sub"><td>Gross earnings</td><td class="amt">{{ money(t.gross_cents) }}</td></tr>
+  <tr><td>Platform commission ({{ t.commission_pct }}% of fares)</td><td class="amt">-{{ money(t.commission_cents) }}</td></tr>
+  <tr><td>Other fees and adjustments</td><td class="amt">-{{ money(t.fees_cents) }}</td></tr>
+  <tr class="total"><td>Net earnings</td><td class="amt">{{ money(t.net_cents) }} CAD</td></tr>
+</table>
+<table class="kv" style="margin-top:3mm">
+  <tr><td class="k">Payouts sent this week</td><td>{{ money(t.payouts_cents) }}</td></tr>
+  {% if t.payouts_pending_cents %}<tr><td class="k">Payouts pending</td><td>{{ money(t.payouts_pending_cents) }}</td></tr>{% endif %}
+</table>
+
+{% if t.trips %}
+<h2>Trips</h2>
+<table class="lines">
+  <tr><td class="muted">Date</td><td class="muted">Receipt</td><td class="muted">Ride</td><td class="amt muted">Fare</td><td class="amt muted">Commission</td><td class="amt muted">Net</td></tr>
+  {% for x in t.trips %}
+  <tr><td>{{ x.date }}</td><td>{{ x.receipt_number }}</td><td>{{ x.ride_ref }}</td><td class="amt">{{ money(x.fare_cents) }}</td><td class="amt">-{{ money(x.commission_cents) }}</td><td class="amt">{{ money(x.fare_cents - x.commission_cents) }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if t.adjustments %}
+<h2>Other items</h2>
+<table class="lines">
+  {% for a in t.adjustments %}<tr><td>{{ a.date }}</td><td>{{ a.description }}</td><td class="amt">{{ money(a.amount_cents) }}</td></tr>{% endfor %}
+</table>
+{% endif %}
+<p class="note">This statement summarizes your NegoRide activity for your records. It is not a tax slip; please consult your accountant about GST/HST registration once your revenue exceeds the small-supplier threshold.</p>
+{% endblock %}

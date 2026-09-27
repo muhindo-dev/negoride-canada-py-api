@@ -20,3 +20,18 @@ from backend.models.trip_note import TripNote
 from backend.models.company import Company
 from backend.models.route_stage import RouteStage
 from backend.models.call_log import CallLog
+
+# ── v4 models ──────────────────────────────────────────────────────────────
+from backend.models.platform import (  # noqa: E402,F401
+    AppSetting, AuditLog, WebhookEvent, IdempotencyKey, TripEvent, AnalyticsEvent)
+from backend.models.notification import (  # noqa: E402,F401
+    Notification, NotificationDelivery, NotificationPreference, DeviceToken)
+from backend.models.money import (  # noqa: E402,F401
+    RidePayment, Refund, DocumentSequence, Receipt, CreditNote, TaxRate, DriverStrike)
+from backend.models.safety import (  # noqa: E402,F401
+    SafetyIncident, SafetyIncidentLocation, TrustedContact, SafetyReport, SafetySettings,
+    SafetyCheck, HelpContact, RideLocation, RideShareLink, Recording, RecordingChunk)
+from backend.models.identity import (  # noqa: E402,F401
+    PhoneVerification, UserDevice, LegalDocument, LegalAcceptance, DriverApplication,
+    DriverDocument, BackgroundCheck, SupportTicket, SupportTicketMessage)
+from backend.models.experience import RideRating, FavouriteDriver, Referral  # noqa: E402,F401

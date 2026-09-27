@@ -1,0 +1,17 @@
+{% extends "_layout.html" %}
+{% block content %}
+<h1 class="ink" style="margin:0 0 6px 0;font-size:22px;color:#111827">Your weekly statement</h1>
+<p class="muted" style="margin:0 0 18px 0;color:#6b7280;font-size:14px">{{ period_label }} · {{ number }}</p>
+<p class="ink" style="margin:0 0 16px 0;color:#111827">Hi {{ first_name }}, here is what you earned with NegoRide last week. Keep this statement for your tax records.</p>
+<table role="presentation" width="100%" style="font-size:14px;margin:0 0 14px 0">
+  <tr><td class="ink" style="padding:5px 0;color:#111827">Ride fares ({{ t.trip_count }} trip{{ 's' if t.trip_count != 1 }})</td><td align="right" class="ink" style="color:#111827">{{ money(t.gross_fares_cents) }}</td></tr>
+  <tr><td class="ink" style="padding:5px 0;color:#111827">Platform commission ({{ t.commission_pct }}%)</td><td align="right" class="ink" style="color:#111827">-{{ money(t.commission_cents) }}</td></tr>
+  {% if t.tips_cents %}<tr><td class="ink" style="padding:5px 0;color:#111827">Tips</td><td align="right" class="ink" style="color:#111827">{{ money(t.tips_cents) }}</td></tr>{% endif %}
+  {% if t.cancellation_fees_cents %}<tr><td class="ink" style="padding:5px 0;color:#111827">Cancellation / no-show fees (your share)</td><td align="right" class="ink" style="color:#111827">{{ money(t.cancellation_fees_cents) }}</td></tr>{% endif %}
+  {% if t.bonuses_cents %}<tr><td class="ink" style="padding:5px 0;color:#111827">Bonuses</td><td align="right" class="ink" style="color:#111827">{{ money(t.bonuses_cents) }}</td></tr>{% endif %}
+  {% if t.fees_cents %}<tr><td class="ink" style="padding:5px 0;color:#111827">Other fees and adjustments</td><td align="right" class="ink" style="color:#111827">-{{ money(t.fees_cents) }}</td></tr>{% endif %}
+  <tr><td class="ink line" style="padding:9px 0;border-top:2px solid #111827;color:#111827;font-size:16px;font-weight:800">Net earnings</td><td align="right" class="ink line" style="padding:9px 0;border-top:2px solid #111827;color:#111827;font-size:16px;font-weight:800">{{ money(t.net_cents) }}</td></tr>
+  <tr><td class="muted" style="padding:5px 0;color:#6b7280">Payouts sent to your bank</td><td align="right" class="muted" style="color:#6b7280">{{ money(t.payouts_cents) }}</td></tr>
+</table>
+<p class="muted" style="margin:0;color:#6b7280;font-size:13px">📎 The detailed PDF statement is attached.</p>
+{% endblock %}

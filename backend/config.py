@@ -8,7 +8,11 @@ load_dotenv()
 class Config:
     SECRET_KEY = os.getenv('SECRET_KEY', 'negoride-default-secret-key-2026')
     JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'negoride-default-jwt-key-2026')
-    JWT_ACCESS_TOKEN_EXPIRES = timedelta(seconds=int(os.getenv('JWT_ACCESS_TOKEN_EXPIRES', 315360000)))
+    # Access-token lifetime. Default 30 days (a reasonable mobile session for an
+    # app without a refresh-token flow) instead of the previous ~10 years, so a
+    # leaked token is not valid forever. Override via env if needed.
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(
+        seconds=int(os.getenv('JWT_ACCESS_TOKEN_EXPIRES', 30 * 24 * 60 * 60)))
 
     # MySQL via MAMP socket (Unix) or TCP/IP (Windows/TCP)
     DB_USER = os.getenv('DB_USERNAME', 'root')
@@ -36,7 +40,12 @@ class Config:
 
     # Stripe
     STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY', '')
-    STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY', '')
+    # Accept either name — the .env historically used STRIPE_PUBLIC_KEY while the
+    # code expected STRIPE_PUBLISHABLE_KEY, which left the value silently empty.
+    STRIPE_PUBLISHABLE_KEY = (
+        os.getenv('STRIPE_PUBLISHABLE_KEY')
+        or os.getenv('STRIPE_PUBLIC_KEY', '')
+    )
     STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET', '')
     SERVICE_FEE_PERCENTAGE = int(os.getenv('SERVICE_FEE_PERCENTAGE', 10))
 

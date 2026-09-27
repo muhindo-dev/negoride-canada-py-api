@@ -39,6 +39,29 @@ class TripBooking(db.Model):
     customer_text = db.Column(db.Text, nullable=True)
     driver_text = db.Column(db.Text, nullable=True)
 
+    # ── v4 lifecycle (spec §4.2, §18) ──
+    trip_stage = db.Column(db.String(40), nullable=True, index=True)
+    stage_changed_at = db.Column(db.DateTime, nullable=True)
+    ride_pin = db.Column(db.String(8), nullable=True)
+    price_per_seat_cents = db.Column(db.BigInteger, nullable=True)
+    offered_price_per_seat_cents = db.Column(db.BigInteger, nullable=True)
+    total_cents = db.Column(db.BigInteger, nullable=True)
+    request_status = db.Column(db.String(20), nullable=True)
+    request_expires_at = db.Column(db.DateTime, nullable=True)
+    pickup_order = db.Column(db.Integer, nullable=True)
+    pickup_lat = db.Column(db.Numeric(10, 7), nullable=True)
+    pickup_lng = db.Column(db.Numeric(10, 7), nullable=True)
+    pickup_address = db.Column(db.String(500), nullable=True)
+    confirmed_at = db.Column(db.DateTime, nullable=True)
+    driver_arrived_at = db.Column(db.DateTime, nullable=True)
+    checked_in_at = db.Column(db.DateTime, nullable=True)
+    dropped_off_at = db.Column(db.DateTime, nullable=True)
+    closed_at = db.Column(db.DateTime, nullable=True)
+    cancelled_at = db.Column(db.DateTime, nullable=True)
+    cancel_reason_code = db.Column(db.String(40), nullable=True)
+    awaiting_payment_since = db.Column(db.DateTime, nullable=True)
+    disputed_at = db.Column(db.DateTime, nullable=True)
+
     # Relationships
     customer = db.relationship('AdminUser', backref='trip_bookings',
                                foreign_keys=[customer_id],
@@ -48,6 +71,19 @@ class TripBooking(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            'trip_stage': self.trip_stage,
+            'stage_changed_at': my_date_time(self.stage_changed_at),
+            'price_per_seat_cents': self.price_per_seat_cents,
+            'offered_price_per_seat_cents': self.offered_price_per_seat_cents,
+            'total_cents': self.total_cents,
+            'request_status': self.request_status,
+            'request_expires_at': my_date_time(self.request_expires_at),
+            'pickup_order': self.pickup_order,
+            'pickup_lat': float(self.pickup_lat) if self.pickup_lat is not None else None,
+            'pickup_lng': float(self.pickup_lng) if self.pickup_lng is not None else None,
+            'pickup_address': self.pickup_address,
+            'checked_in_at': my_date_time(self.checked_in_at),
+            'dropped_off_at': my_date_time(self.dropped_off_at),
             'trip_id': self.trip_id,
             'customer_id': self.customer_id,
             'driver_id': self.driver_id,

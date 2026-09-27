@@ -21,6 +21,23 @@ def _is_paid(negotiation: Negotiation) -> bool:
     return negotiation.stripe_paid == 'Yes' or status in ('paid', 'completed')
 
 
+def _v4_error(e):
+    """TransitionError → the legacy {code:0,message} envelope."""
+    db.session.rollback()
+    return error_response(e.message, data={'error_code': e.code, **getattr(e, 'data', {})},
+                          status_code=e.status if e.status != 409 else 400)
+
+
+def _record_created(negotiation, user, data):
+    """v4: opening stage + event (spec §4). The driver is notified after commit."""
+    from backend.services import trip_state_machine as TSM
+    negotiation.service_type = (data.get('service_type') or data.get('automobile') or 'car')[:40]
+    negotiation.request_mode = (data.get('request_mode') or 'direct')[:20]
+    negotiation.agreed_price_cents = None
+    TSM.record_creation('carhire', negotiation, actor=user, actor_type='customer',
+                        meta={'initial_price_cents': negotiation.initial_price})
+
+
 # ---------------------------------------------------------------------------
 # Legacy endpoints (ApiChatController)
 # ---------------------------------------------------------------------------
@@ -116,6 +133,7 @@ def create_legacy(user):
         message_body=data.get('message_body'),
     )
     db.session.add(record)
+    _record_created(negotiation, user, data)
     db.session.commit()
 
     return success_response("Negotiation created", negotiation.to_dict(), status_code=201)
@@ -138,6 +156,10 @@ def create(user):
     driver = AdminUser.query.get(driver_id)
     if not driver:
         return error_response("Driver not found", status_code=404)
+
+    # SECURITY: cannot start a trip with an unapproved (still-under-review) driver.
+    if not driver.is_approved_driver():
+        return error_response("This driver is not available for trips.")
 
     initial_price = int(data.get('initial_price', 0))
     if initial_price < 50:
@@ -175,6 +197,7 @@ def create(user):
         message_body=data.get('message_body'),
     )
     db.session.add(record)
+    _record_created(negotiation, user, data)
     db.session.commit()
 
     return success_response("Negotiation created", negotiation.to_dict(), status_code=201)
@@ -273,7 +296,40 @@ def records_post(user):
         longitude=data.get('longitude'),
     )
     db.session.add(record)
+
+    # v4: a counter-offer moves REQUESTED → NEGOTIATING and pings the other party.
+    from backend.services import trip_state_machine as TSM
+    from backend.services.notify import notify
+    from backend.services import realtime
+    from backend.utils.money import fmt
+    stage = TSM.ensure_stage('carhire', negotiation)
+    is_offer = (record.message_type or 'Negotiation') == 'Negotiation' and price_cents > 0
+    if is_offer and stage in ('PRICE_AGREED', 'AWAITING_PAYMENT', 'CONFIRMED', 'DRIVER_EN_ROUTE',
+                              'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'IN_PROGRESS', 'COMPLETED', 'CLOSED'):
+        db.session.rollback()
+        return error_response("The price is already agreed — offers can no longer change.",
+                              data={'error_code': 'price_locked'})
+    if TSM.is_terminal('carhire', stage):
+        db.session.rollback()
+        return error_response("This negotiation has ended.", data={'error_code': 'ended'})
+    negotiation.updated_at = datetime.utcnow()
+    if is_offer and stage == 'REQUESTED':
+        try:
+            TSM.transition('carhire', negotiation.id, 'NEGOTIATING', actor=user, commit=False, ride=negotiation,
+                           meta={'price_cents': price_cents})
+        except TSM.TransitionError:
+            pass
+    db.session.flush()
+    if is_offer:
+        other = negotiation.driver_id if user.id == negotiation.customer_id else negotiation.customer_id
+        notify('negotiation.counter_offer', [other], {
+            'ride_type': 'carhire', 'ride_id': negotiation.id, 'price': fmt(price_cents),
+            'from_name': (user.first_name or (user.name or '').split(' ')[0] or 'NegoRide user')})
     db.session.commit()
+    realtime.to_ride('carhire', negotiation.id, 'negotiation.updated',
+                     {'negotiation_id': negotiation.id, 'record': record.to_dict()})
+    for uid in (negotiation.customer_id, negotiation.driver_id):
+        realtime.to_user(uid, 'negotiation.updated', {'negotiation_id': negotiation.id, 'record': record.to_dict()})
 
     return success_response("Record added", record.to_dict(), status_code=201)
 
@@ -284,9 +340,14 @@ def accept(user):
     """Accept / start negotiation based on message_type.
 
     Flutter sends:
-      message_type='Accept'   → both parties accepted, status → 'Accepted'
-      message_type='Started'  → driver starts the trip, status → 'Started'
+      message_type='Accept'   → price agreed (v4: REQUESTED/NEGOTIATING → PRICE_AGREED)
+      message_type='Started'  → driver starts the trip (v4: walks CONFIRMED →
+                                EN_ROUTE → ARRIVED → IN_PROGRESS, payment required)
+
+    All stage/status changes go through the trip state machine, so v3 and v4
+    apps produce the same trip_events.
     """
+    from backend.services import trip_state_machine as TSM
     data = request.get_json(silent=True) or request.form
     negotiation_id = data.get('negotiation_id')
 
@@ -298,71 +359,58 @@ def accept(user):
         return error_response("Forbidden", status_code=403)
 
     message_type = data.get('message_type', '')
+    stage = TSM.ensure_stage('carhire', negotiation)
 
-    # NOTE: Do NOT blindly overwrite customer_accepted / customer_driver
-    # from the request payload.  The role-based logic below is the sole
-    # authority for these flags — the Flutter client sends legacy values
-    # ("Yes") that would conflict with the canonical "Accepted" value.
+    try:
+        if message_type == 'Started':
+            if user.id != negotiation.driver_id:
+                return error_response("Only the assigned driver can start this trip", status_code=403)
+            if stage == 'IN_PROGRESS':
+                return success_response("Negotiation updated", negotiation.to_dict())
+            TSM.walk_to('carhire', negotiation.id, 'IN_PROGRESS', actor=user, legacy=True)
 
-    # ── Determine status based on message_type ───────────────────────────
-    if message_type == 'Started':
-        if user.id != negotiation.driver_id:
-            return error_response("Only the assigned driver can start this trip", status_code=403)
-
-        # Driver can start even before payment — payment can be completed during trip
-        # Validate: can only start if Accepted
-        if negotiation.status not in ('Accepted', 'Active', 'Started'):
-            return error_response(
-                f"Cannot start trip — current status is '{negotiation.status}'"
-            )
-        negotiation.status = 'Started'
-        negotiation.is_active = 'Yes'
-
-    elif message_type == 'Accept':
-        # Keep compatibility with existing Flutter calls while enforcing role intent.
-        # A customer creating a negotiation has already implicitly accepted price discovery.
-        if user.id == negotiation.driver_id:
-            negotiation.customer_driver = 'Accepted'
-            # When driver accepts, the customer implicitly agreed (they proposed the price).
-            # Normalize any legacy values ('Yes', '', 'Pending', 'No') to 'Accepted'.
-            if negotiation.customer_accepted != 'Accepted':
-                negotiation.customer_accepted = 'Accepted'
-        elif user.id == negotiation.customer_id:
-            negotiation.customer_accepted = 'Accepted'
-        else:
-            return error_response("Forbidden", status_code=403)
-
-        if (negotiation.customer_accepted == 'Accepted'
-                and negotiation.customer_driver == 'Accepted'):
-            negotiation.status = 'Accepted'
-            negotiation.is_active = 'Yes'
-
-        # Set agreed_price from the last negotiation record's price (cents)
-        if not negotiation.agreed_price:
+        elif message_type == 'Accept':
+            if stage in ('PRICE_AGREED', 'AWAITING_PAYMENT', 'CONFIRMED'):
+                return success_response("Negotiation updated", negotiation.to_dict())  # idempotent accept
+            # Agreed price = the price of the offer on the table (the last record).
             last_record = (
                 NegotiationRecord.query
                 .filter_by(negotiation_id=negotiation.id)
+                .filter(NegotiationRecord.price > 0)
                 .order_by(NegotiationRecord.id.desc())
                 .first()
             )
-            if last_record and last_record.price:
-                negotiation.agreed_price = last_record.price  # cents
+            record_count = NegotiationRecord.query.filter_by(negotiation_id=negotiation.id).count()
+            # You cannot "accept" your own offer (the other party must agree to it).
+            if last_record and last_record.last_negotiator_id == user.id and record_count > 1:
+                return error_response("Waiting for the other party to respond to your offer.",
+                                      data={'error_code': 'own_offer'})
+            agreed = (last_record.price if last_record and last_record.price else None) or negotiation.initial_price
+            negotiation.agreed_price = agreed            # legacy column (stores cents)
+            negotiation.agreed_price_cents = agreed
+            negotiation.customer_accepted = 'Accepted'
+            negotiation.customer_driver = 'Accepted'
+            negotiation.updated_at = datetime.utcnow()
+            TSM.transition('carhire', negotiation.id, 'PRICE_AGREED', actor=user, ride=negotiation,
+                           meta={'agreed_price_cents': agreed})
+        else:
+            if (negotiation.customer_accepted == 'Accepted'
+                    and negotiation.customer_driver == 'Accepted'
+                    and stage in ('REQUESTED', 'NEGOTIATING')):
+                TSM.transition('carhire', negotiation.id, 'PRICE_AGREED', actor=user, ride=negotiation)
+    except TSM.TransitionError as e:
+        return _v4_error(e)
 
-    else:
-        # Fallback: if both accepted, auto-set Accepted
-        if (negotiation.customer_accepted == 'Accepted'
-                and negotiation.customer_driver == 'Accepted'
-                and negotiation.status == 'Active'):
-            negotiation.status = 'Accepted'
-
-    db.session.commit()
+    negotiation = Negotiation.query.get(negotiation.id)
     return success_response("Negotiation updated", negotiation.to_dict())
 
 
 @negotiations_bp.route('/api/negotiations-cancel', methods=['POST'])
 @jwt_required_with_user
 def cancel(user):
-    """Cancel a negotiation (not if Started/Completed)."""
+    """Cancel a negotiation / ride (v4: refund policy applies — see /api/rides/.../cancel-preview)."""
+    from backend.services import trip_state_machine as TSM
+    from backend.services.ride_actions import cancel as cancel_ride
     data = request.get_json(silent=True) or request.form
     negotiation_id = data.get('negotiation_id')
 
@@ -373,14 +421,13 @@ def cancel(user):
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)
 
-    if negotiation.status in ('Started', 'Completed'):
-        return error_response("Cannot cancel a negotiation that is already " + negotiation.status)
+    try:
+        cancel_ride('carhire', negotiation.id, actor=user, reason_code=(data.get('reason_code') or 'legacy_cancel'),
+                    note=data.get('reason') or data.get('note'), legacy=True)
+    except TSM.TransitionError as e:
+        return _v4_error(e)
 
-    negotiation.status = 'Cancelled'
-    negotiation.is_active = 'No'
-    db.session.commit()
-
-    return success_response("Negotiation cancelled", negotiation.to_dict())
+    return success_response("Negotiation cancelled", Negotiation.query.get(negotiation.id).to_dict())
 
 
 @negotiations_bp.route('/api/negotiations-complete', methods=['POST'])
@@ -390,6 +437,8 @@ def complete(user):
 
     Flutter sends message_type='Complete' or message_type='Cancel'.
     """
+    from backend.services import trip_state_machine as TSM
+    from backend.services.ride_actions import cancel as cancel_ride
     data = request.get_json(silent=True) or request.form
     negotiation_id = data.get('negotiation_id')
 
@@ -401,30 +450,26 @@ def complete(user):
         return error_response("Forbidden", status_code=403)
 
     message_type = data.get('message_type', 'Complete')
+    stage = TSM.ensure_stage('carhire', negotiation)
 
-    if message_type == 'Cancel':
-        if negotiation.status == 'Completed':
-            return error_response("Cannot cancel an already completed trip")
-        negotiation.status = 'Cancelled'
-        negotiation.is_active = 'No'
-        msg = "Trip cancelled"
-    else:
-        if user.id != negotiation.driver_id:
-            return error_response("Only the assigned driver can complete this trip", status_code=403)
+    try:
+        if message_type == 'Cancel':
+            cancel_ride('carhire', negotiation.id, actor=user, reason_code='legacy_cancel',
+                        note=data.get('reason'), legacy=True)
+            msg = "Trip cancelled"
+        else:
+            if user.id != negotiation.driver_id:
+                return error_response("Only the assigned driver can complete this trip", status_code=403)
+            if not _is_paid(negotiation) and not TSM.payment_secured('carhire', negotiation):
+                return error_response("Payment must be completed before ending this trip")
+            if stage != 'COMPLETED':
+                TSM.walk_to('carhire', negotiation.id, 'COMPLETED', actor=user, legacy=True,
+                            lat=data.get('latitude'), lng=data.get('longitude'))
+            msg = "Trip completed"
+    except TSM.TransitionError as e:
+        return _v4_error(e)
 
-        if not _is_paid(negotiation):
-            return error_response("Payment must be completed before ending this trip")
-
-        if negotiation.status not in ('Started', 'Accepted', 'Active'):
-            return error_response(
-                f"Cannot complete — current status is '{negotiation.status}'"
-            )
-        negotiation.status = 'Completed'
-        negotiation.is_active = 'No'
-        msg = "Trip completed"
-
-    db.session.commit()
-    return success_response(msg, negotiation.to_dict())
+    return success_response(msg, Negotiation.query.get(negotiation.id).to_dict())
 
 
 @negotiations_bp.route('/api/negotiations-list', methods=['GET'])
@@ -490,6 +535,32 @@ def refresh_payment(user):
 
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)
+
+    # v4: authorization hold via the payment service while the ride is payable.
+    from backend.services import trip_state_machine as TSM
+    from backend.services.payments import payment_service as PS
+    stage = TSM.ensure_stage('carhire', negotiation)
+    if stage in PS.PAYABLE_STAGES['carhire'] and negotiation.stripe_paid != 'Yes':
+        if user.id != negotiation.customer_id:
+            return error_response("Only the customer can pay for this ride", status_code=403)
+        try:
+            rp = PS.start_payment('carhire', negotiation, user,
+                                  force_new=bool(data.get('force_regenerate', False)))
+        except PS.PaymentError as e:
+            db.session.rollback()
+            return error_response(e.message, data={'error_code': e.code})
+        negotiation = Negotiation.query.get(negotiation.id)
+        return success_response("Payment link ready", {
+            'negotiation_id': negotiation.id,
+            'stripe_url': rp.checkout_url,
+            'stripe_id': rp.checkout_session_id,
+            'agreed_price': negotiation.agreed_price,
+            'payment_status': 'paid' if rp.is_secured else 'pending',
+            'stripe_paid': negotiation.stripe_paid,
+            'is_paid': rp.is_secured,
+            'ride_payment_id': rp.id,
+            'capture_method': rp.capture_method,
+        })
 
     # Already paid — no need to regenerate
     if negotiation.stripe_paid == 'Yes':
@@ -582,6 +653,21 @@ def check_payment(user):
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)
 
+    # v4 ride payments (authorization hold): sync from the provider.
+    from backend.services.payments import payment_service as PS
+    rp = PS.latest_payment('carhire', negotiation.id)
+    if rp is not None:
+        if not rp.is_secured:
+            PS.sync_from_provider(rp)
+            rp = PS.latest_payment('carhire', negotiation.id)
+        return success_response("Success", {
+            'payment_status': 'paid' if rp.is_secured else ('failed' if rp.capture_status == 'failed' else 'pending'),
+            'stripe_paid': 'Yes' if rp.is_secured else 'No',
+            'is_paid': rp.is_secured,
+            'stripe_url': rp.checkout_url,
+            'capture_status': rp.capture_status,
+        })
+
     # Already marked paid locally — return immediately
     if negotiation.stripe_paid == 'Yes':
         return success_response("Success", {
@@ -595,15 +681,27 @@ def check_payment(user):
     if negotiation.stripe_session_id:
         try:
             from backend.services.stripe_service import check_session_status
+            # Reuse the webhook's idempotent path so this poll ALSO credits the
+            # driver's wallet (keyed on negotiation id) — otherwise a poll that
+            # confirms payment before the webhook would leave the driver unpaid.
+            from backend.routes.webhooks import _mark_negotiation_paid
 
             status_data = check_session_status(negotiation.stripe_session_id)
 
             if status_data.get('is_paid'):
-                negotiation.stripe_paid = 'Yes'
-                negotiation.payment_status = 'paid'
                 from datetime import datetime
                 negotiation.payment_completed_at = datetime.utcnow()
-                db.session.commit()
+                amount_cents = (
+                    status_data.get('amount_total')
+                    or negotiation.agreed_price
+                    or negotiation.initial_price
+                    or 0
+                )
+                _mark_negotiation_paid(
+                    negotiation,
+                    negotiation.stripe_session_id,
+                    amount_cents,
+                )  # records payment + credits driver + commits (all idempotent)
 
                 return success_response("Success", {
                     'payment_status': 'paid',
@@ -611,16 +709,29 @@ def check_payment(user):
                     'is_paid': True,
                     'stripe_url': negotiation.stripe_url,
                 })
-        except Exception as e:
+        except Exception:
             # Stripe check failed — fall through to return current DB state
-            pass
+            db.session.rollback()
 
     # Auto-generate a Stripe session if none exists so the client gets a
     # payment URL.  Only do this for the customer on an accepted/started trip
     # that has a valid price.
+    from backend.services import trip_state_machine as TSM
+    if (user.id == negotiation.customer_id
+            and TSM.ensure_stage('carhire', negotiation) in PS.PAYABLE_STAGES['carhire']):
+        try:
+            rp = PS.start_payment('carhire', negotiation, user)
+            return success_response("Success", {
+                'payment_status': 'pending', 'stripe_paid': 'No', 'is_paid': False,
+                'stripe_url': rp.checkout_url, 'capture_status': rp.capture_status,
+            })
+        except PS.PaymentError:
+            db.session.rollback()
+
     if (not negotiation.stripe_session_id
             and user.id == negotiation.customer_id
-            and negotiation.status in ('Accepted', 'Started', 'Active')):
+            and negotiation.status in ('Accepted', 'Started', 'Active')
+            and not TSM.is_terminal('carhire', negotiation.trip_stage or 'REQUESTED')):
         price_cents = 0
         if negotiation.agreed_price:
             price_cents = int(negotiation.agreed_price)

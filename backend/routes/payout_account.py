@@ -1,3 +1,4 @@
+from datetime import datetime
 from flask import Blueprint, request, render_template_string
 from backend.models import db
 from backend.models.payout_account import PayoutAccount
@@ -8,6 +9,15 @@ import os
 payout_account_bp = Blueprint('payout_account', __name__)
 
 STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+
+
+def _sensitive_guard(user, data):
+    """v4 clients must re-verify their phone (purpose=sensitive_action) before
+    changing the payout account (spec §11.2 #7). v3 clients are unaffected."""
+    from backend.services import phone_verification as PV
+    return PV.require_sensitive_action(user, (data or {}).get('verification_token')
+                                       or request.headers.get('X-Verification-Token'), data)
+
 
 
 @payout_account_bp.route('/api/payout-account', methods=['GET'])
@@ -34,6 +44,9 @@ def create_stripe(user):
     email = data.get('email')
     if not email:
         return error_response("Email is required")
+    blocked = _sensitive_guard(user, data)
+    if blocked is not None:
+        return blocked
 
     account = PayoutAccount.query.filter_by(user_id=user.id).first()
 
@@ -53,7 +66,14 @@ def create_stripe(user):
             business_type=data.get('business_type', 'individual'),
         )
     except stripe.error.StripeError as e:
-        return error_response(str(e))
+        msg = str(e)
+        # Friendlier message while the platform hasn't finished enabling Connect.
+        if 'connect' in msg.lower() or 'signed up for Connect' in msg:
+            return error_response(
+                "Driver payouts aren't switched on yet. The NegoRide team is "
+                "finalising payout setup — please try again shortly."
+            )
+        return error_response(msg)
 
     if not account:
         account = PayoutAccount(user_id=user.id)
@@ -61,7 +81,7 @@ def create_stripe(user):
 
     account.stripe_account_id = stripe_account.id
     account.account_type = 'express'
-    account.status = 'pending_verification'
+    account.status = 'restricted'  # created on Stripe, not yet onboarded/verified
     db.session.commit()
 
     return success_response("Stripe account created", {
@@ -153,14 +173,14 @@ def sync(user):
             account.card_brand = ext.brand
 
     if stripe_acct.requirements:
-        account.requirements_current = str(stripe_acct.requirements.currently_due) if stripe_acct.requirements.currently_due else None
+        account.requirements_currently_due = str(stripe_acct.requirements.currently_due) if stripe_acct.requirements.currently_due else None
         account.requirements_past_due = str(stripe_acct.requirements.past_due) if stripe_acct.requirements.past_due else None
 
     if stripe_acct.details_submitted and stripe_acct.charges_enabled:
         account.status = 'active'
         account.verification_status = 'verified'
     else:
-        account.status = 'pending_verification'
+        account.status = 'restricted'
 
     db.session.commit()
     return success_response("Account synced", {'account': account.to_dict()})
@@ -171,6 +191,9 @@ def sync(user):
 def preferences(user):
     """Update payout preferences."""
     data = request.get_json(silent=True) or request.form
+    blocked = _sensitive_guard(user, data)
+    if blocked is not None:
+        return blocked
     account = PayoutAccount.query.filter_by(user_id=user.id).first()
     if not account:
         return error_response("No payout account found")
@@ -181,10 +204,13 @@ def preferences(user):
 
     min_amount = data.get('minimum_payout_amount')
     if min_amount is not None:
-        min_amount = int(min_amount)
-        if min_amount < 10:
-            return error_response("Minimum payout amount must be at least $0.10")
-        account.minimum_payout_amount = min_amount
+        try:
+            min_amount = float(min_amount)  # dollars
+        except (TypeError, ValueError):
+            return error_response("Invalid minimum payout amount")
+        if min_amount < 1:
+            return error_response("Minimum payout amount must be at least $1.00")
+        account.minimum_payout_amount = round(min_amount, 2)
 
     db.session.commit()
     return success_response("Preferences updated", {'account': account.to_dict()})
@@ -195,12 +221,15 @@ def preferences(user):
 def deactivate(user):
     """Deactivate payout account."""
     data = request.get_json(silent=True) or request.form
+    blocked = _sensitive_guard(user, data)
+    if blocked is not None:
+        return blocked
     account = PayoutAccount.query.filter_by(user_id=user.id).first()
     if not account:
         return error_response("No payout account found")
 
-    account.is_active = False
-    account.status = 'inactive'
+    account.status = 'disabled'
+    account.disabled_at = datetime.utcnow()
     db.session.commit()
 
     return success_response("Account deactivated", {'account': account.to_dict()})
@@ -211,6 +240,9 @@ def deactivate(user):
 def reactivate(user):
     """Reactivate payout account (checks Stripe good standing)."""
     import stripe
+    blocked = _sensitive_guard(user, request.get_json(silent=True) or request.form)
+    if blocked is not None:
+        return blocked
     stripe.api_key = STRIPE_SECRET_KEY
 
     account = PayoutAccount.query.filter_by(user_id=user.id).first()
@@ -225,8 +257,8 @@ def reactivate(user):
         except stripe.error.StripeError as e:
             return error_response(str(e))
 
-    account.is_active = True
     account.status = 'active'
+    account.activated_at = datetime.utcnow()
     db.session.commit()
 
     return success_response("Account reactivated", {'account': account.to_dict()})

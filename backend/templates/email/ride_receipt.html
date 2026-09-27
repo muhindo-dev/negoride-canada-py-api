@@ -1,0 +1,93 @@
+{% extends "_layout.html" %}
+{# Thank-you + receipt (spec §13.2/§13.3). show_thanks / show_receipt let the
+   same template produce one combined email or two separate ones. Table-based,
+   inline styles, dark-mode classes from _layout.html. #}
+{% set tz = r.timezone %}
+{% block content %}
+{% if show_thanks %}
+<h1 class="ink" style="margin:0 0 6px 0;font-size:24px;line-height:1.25;color:#111827">Thanks for riding, {{ first_name }}!</h1>
+<p class="muted" style="margin:0 0 20px 0;color:#6b7280;font-size:14px">{{ local_time(r.dropoff_at or t.captured_at, tz) }}</p>
+
+{% if map_url %}
+<table role="presentation" width="100%" style="margin:0 0 18px 0"><tr><td>
+  <img src="{{ map_url }}" width="536" alt="Map of your route" style="display:block;width:100%;max-width:536px;height:auto;border-radius:12px;border:0">
+</td></tr></table>
+{% endif %}
+
+<table role="presentation" width="100%" style="margin:0 0 18px 0">
+  <tr>
+    <td width="18" valign="top" style="padding:2px 10px 0 0"><span style="display:inline-block;width:10px;height:10px;border-radius:5px;background:#16a34a"></span></td>
+    <td class="ink" style="color:#111827;font-size:15px;padding-bottom:10px"><strong>{{ r.pickup_address or 'Pickup' }}</strong>{% if r.pickup_at %}<br><span class="muted" style="color:#6b7280;font-size:13px">{{ local_time(r.pickup_at, tz, False) }}</span>{% endif %}</td>
+  </tr>
+  <tr>
+    <td width="18" valign="top" style="padding:2px 10px 0 0"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:#dc2626"></span></td>
+    <td class="ink" style="color:#111827;font-size:15px"><strong>{{ r.dropoff_address or 'Drop-off' }}</strong>{% if r.dropoff_at %}<br><span class="muted" style="color:#6b7280;font-size:13px">{{ local_time(r.dropoff_at, tz, False) }}</span>{% endif %}</td>
+  </tr>
+</table>
+
+<table role="presentation" width="100%" class="line" style="border-top:1px solid #e5e7eb;border-bottom:1px solid #e5e7eb;margin:0 0 18px 0">
+  <tr>
+    <td align="center" style="padding:12px 4px"><span class="muted" style="color:#6b7280;font-size:12px">Duration</span><br><strong class="ink" style="color:#111827">{{ human_duration(r.duration_s) or '—' }}</strong></td>
+    <td align="center" style="padding:12px 4px"><span class="muted" style="color:#6b7280;font-size:12px">Distance</span><br><strong class="ink" style="color:#111827">{{ human_distance(r.distance_m, r.distance_estimated) or '—' }}</strong></td>
+    <td align="center" style="padding:12px 4px"><span class="muted" style="color:#6b7280;font-size:12px">You paid</span><br><strong class="ink" style="color:#111827">{{ money(t.total_cents) }}</strong></td>
+  </tr>
+</table>
+
+{% if r.driver_first %}
+<table role="presentation" width="100%" style="margin:0 0 18px 0"><tr>
+  {% if r.driver_photo %}<td width="56" valign="middle" style="padding-right:12px"><img src="{{ r.driver_photo }}" width="48" height="48" alt="{{ r.driver_first }}" style="display:block;width:48px;height:48px;border-radius:24px;object-fit:cover;border:0"></td>{% endif %}
+  <td valign="middle" class="ink" style="color:#111827;font-size:15px">Your driver <strong>{{ r.driver_first }}</strong>{% if r.vehicle %}<br><span class="muted" style="color:#6b7280;font-size:13px">{{ r.vehicle }}{% if r.plate %} · {{ r.plate }}{% endif %}</span>{% endif %}</td>
+</tr></table>
+{% endif %}
+
+{% if t.negotiation and t.negotiation.saved_cents %}
+<table role="presentation" width="100%" style="margin:0 0 18px 0"><tr>
+  <td style="background:#fff7e6;border:1px solid #f6c56b;border-radius:12px;padding:14px 16px;color:#7a4a00;font-size:15px">
+    🤝 <strong>You negotiated and saved {{ money(t.negotiation.saved_cents) }}</strong> vs. the initial ask of {{ money(t.negotiation.initial_ask_cents) }}.
+  </td>
+</tr></table>
+{% endif %}
+
+<p class="ink" style="margin:0 0 8px 0;color:#111827;font-weight:700">How was your trip with {{ r.driver_first or 'your driver' }}?</p>
+<table role="presentation" style="margin:0 0 18px 0"><tr>
+  {% for s in ratings %}<td style="padding-right:6px"><a href="{{ s.url }}" title="{{ s.stars }} star{{ 's' if s.stars > 1 }}" style="display:inline-block;text-decoration:none;font-size:30px;line-height:34px;color:{{ brand_color }}">&#9733;</a></td>{% endfor %}
+</tr></table>
+
+<table role="presentation" style="margin:0 0 22px 0"><tr>
+  <td style="padding-right:10px"><a class="btn" href="{{ tip_url }}" style="background:{{ brand_color }};color:#111111;text-decoration:none;font-weight:700;border-radius:10px;padding:12px 20px;display:inline-block">Add a tip</a></td>
+  <td><a href="{{ receipt_url }}" class="ink" style="color:#111827;font-weight:600;text-decoration:underline">View in app</a></td>
+</tr></table>
+{% endif %}
+
+{% if show_receipt %}
+<h2 class="ink" style="margin:{{ '6px' if show_thanks else '0' }} 0 4px 0;font-size:18px;color:#111827">Receipt {{ number }}</h2>
+<p class="muted" style="margin:0 0 12px 0;color:#6b7280;font-size:13px">Ride {{ r.ride_ref }} · {{ r.pickup_address }} → {{ r.dropoff_address }}{% if not show_thanks and r.dropoff_at %} · {{ local_time(r.dropoff_at, tz) }}{% endif %}</p>
+<table role="presentation" width="100%" style="font-size:14px;margin:0 0 6px 0">
+  {% for l in t.lines %}
+  <tr><td class="ink" style="padding:5px 0;color:#111827">{{ l.label }}</td><td align="right" class="ink" style="padding:5px 0;color:#111827;white-space:nowrap">{{ money(l.amount_cents) }}</td></tr>
+  {% endfor %}
+  <tr><td class="ink line" style="padding:7px 0;border-top:1px solid #e5e7eb;color:#111827;font-weight:600">Subtotal{% if t.tax_inclusive %} (before tax){% endif %}</td><td align="right" class="ink line" style="padding:7px 0;border-top:1px solid #e5e7eb;color:#111827;font-weight:600">{{ money(t.subtotal_cents) }}</td></tr>
+  {% for x in t.taxes %}
+  <tr><td class="muted" style="padding:4px 0;color:#6b7280">{{ x.label }} ({{ t.province }})</td><td align="right" class="muted" style="padding:4px 0;color:#6b7280">{{ money(x.amount_cents) }}</td></tr>
+  {% endfor %}
+  {% if t.tip_cents %}
+  <tr><td class="ink" style="padding:5px 0;color:#111827">Tip (100% to your driver, not taxed)</td><td align="right" class="ink" style="padding:5px 0;color:#111827">{{ money(t.tip_cents) }}</td></tr>
+  {% endif %}
+  <tr><td class="ink line" style="padding:10px 0;border-top:2px solid #111827;color:#111827;font-size:17px;font-weight:800">Total charged</td><td align="right" class="ink line" style="padding:10px 0;border-top:2px solid #111827;color:#111827;font-size:17px;font-weight:800">{{ money(t.total_cents) }} CAD</td></tr>
+</table>
+<p class="muted" style="margin:0 0 4px 0;color:#6b7280;font-size:13px">{{ t.payment_method }}{% if t.authorized_at %} · authorized {{ local_time(t.authorized_at, tz) }}{% endif %}{% if t.captured_at %} · charged {{ local_time(t.captured_at, tz) }}{% endif %}</p>
+{% if t.registration.gst_hst %}<p class="muted" style="margin:0 0 4px 0;color:#6b7280;font-size:12px">GST/HST reg. no. {{ t.registration.gst_hst }}{% if t.registration.qst and t.province == 'QC' %} · QST reg. no. {{ t.registration.qst }}{% endif %}</p>{% endif %}
+{% if t.refunds %}
+<table role="presentation" width="100%" style="font-size:14px;margin:10px 0 0 0">
+  <tr><td colspan="2" class="ink" style="padding:4px 0;color:#111827;font-weight:700">Refunds</td></tr>
+  {% for f in t.refunds %}<tr><td class="ink" style="padding:3px 0;color:#111827">{{ local_time(f.at, tz) }}{% if f.reason %} — {{ f.reason }}{% endif %}</td><td align="right" class="ink" style="color:#111827">-{{ money(f.amount_cents) }}</td></tr>{% endfor %}
+  <tr><td class="ink" style="padding:6px 0;color:#111827;font-weight:700">Net total</td><td align="right" class="ink" style="color:#111827;font-weight:700">{{ money(t.net_total_cents) }}</td></tr>
+</table>
+{% endif %}
+<p class="muted" style="margin:12px 0 0 0;color:#6b7280;font-size:13px">📎 Your PDF receipt is attached.</p>
+{% endif %}
+
+<p class="muted" style="margin:22px 0 0 0;color:#6b7280;font-size:13px">
+  <a href="{{ lost_item_url }}" style="color:#6b7280">Lost an item?</a> &nbsp;·&nbsp; <a href="{{ report_url }}" style="color:#6b7280">Report an issue</a> &nbsp;·&nbsp; <a href="{{ policy_url }}" style="color:#6b7280">Cancellation policy</a>
+</p>
+{% endblock %}

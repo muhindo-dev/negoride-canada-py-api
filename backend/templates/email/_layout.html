@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="{{ lang or 'en' }}" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>{{ title }}</title>
+<style>
+  body{margin:0;padding:0;background:#f3f4f6;-webkit-text-size-adjust:100%;}
+  table{border-collapse:collapse;}
+  .card{background:#ffffff;}
+  .muted{color:#6b7280;}
+  .ink{color:#111827;}
+  a.btn{background:{{ brand_color }};color:#111111 !important;text-decoration:none;font-weight:700;border-radius:10px;padding:14px 22px;display:inline-block;}
+  @media (prefers-color-scheme: dark){
+    body,.bg{background:#0b0f17 !important;}
+    .card{background:#151d2b !important;}
+    .ink{color:#e5e7eb !important;}
+    .muted{color:#9ca3af !important;}
+    .line{border-color:#26314a !important;}
+  }
+  [data-ogsc] .card{background:#151d2b !important;}
+  [data-ogsc] .ink{color:#e5e7eb !important;}
+  @media only screen and (max-width:620px){ .container{width:100% !important;} .px{padding-left:18px !important;padding-right:18px !important;} }
+</style>
+</head>
+<body class="bg">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0">{{ preheader }}</div>
+<table role="presentation" width="100%" class="bg" style="background:#f3f4f6">
+  <tr><td align="center" style="padding:24px 12px">
+    <table role="presentation" width="600" class="container" style="width:600px;max-width:600px">
+      <tr><td style="padding:8px 4px 16px 4px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+        <span style="display:inline-block;background:{{ brand_color }};color:#111;font-weight:800;border-radius:8px;padding:6px 10px;font-size:15px">NegoRide</span>
+        <span class="muted" style="font-size:13px;color:#6b7280;padding-left:6px">Canada</span>
+      </td></tr>
+      <tr><td class="card px" style="background:#ffffff;border-radius:16px;padding:28px 32px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.55">
+        {% block content %}{% endblock %}
+      </td></tr>
+      <tr><td class="px" style="padding:18px 32px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:12px;line-height:1.5;color:#6b7280" >
+        <span class="muted">{{ company_legal_name }} · {{ company_address }}<br>
+        Questions? <a href="mailto:{{ support_email }}" style="color:#6b7280">{{ support_email }}</a>{% if support_phone %} · {{ support_phone }}{% endif %}<br>
+        <a href="{{ web_base }}/terms" style="color:#6b7280">Terms</a> · <a href="{{ web_base }}/privacy" style="color:#6b7280">Privacy</a> · <a href="{{ web_base }}/cancellation-policy" style="color:#6b7280">Cancellation policy</a></span>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>

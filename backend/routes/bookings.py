@@ -13,6 +13,11 @@ from backend.utils.response import success_response, error_response
 bookings_bp = Blueprint('bookings', __name__)
 
 
+def _is_admin(user):
+    """True for platform admins. Role-based — never a hardcoded user id."""
+    return user is not None and user.user_type in ('Admin', 'Super Admin')
+
+
 def _is_courier(booking_or_data):
     service = ''
     if isinstance(booking_or_data, dict):
@@ -20,6 +25,23 @@ def _is_courier(booking_or_data):
     else:
         service = str(getattr(booking_or_data, 'service_type', '')).strip().lower()
     return service in ('courier', 'delivery')
+
+
+def _v4_error(e):
+    db.session.rollback()
+    return error_response(e.message, data={'error_code': e.code, **getattr(e, 'data', {})},
+                          status_code=e.status if e.status != 409 else 400)
+
+
+def _party(user, booking):
+    """'customer' | 'driver' | 'admin' | None"""
+    if _is_admin(user):
+        return 'admin'
+    if booking.driver_id and int(booking.driver_id) == user.id:
+        return 'driver'
+    if int(booking.customer_id) == user.id:
+        return 'customer'
+    return None
 
 
 def _to_bool(value):
@@ -43,10 +65,10 @@ def _save_booking_image(booking_id: int, image_file, prefix: str):
 @bookings_bp.route('/api/bookings', methods=['GET'])
 @jwt_required_with_user
 def index(user):
-    """List bookings – admin (id=1) sees all, others see own."""
+    """List bookings – admins see all, others see own."""
     status = request.args.get('status')
 
-    if user.id == 1:
+    if _is_admin(user):
         q = ScheduledBooking.query
     else:
         q = ScheduledBooking.query.filter(
@@ -104,16 +126,19 @@ def create(user):
         luggage_weight_lbs=data.get('luggage_weight_lbs'),
         luggage_description=data.get('luggage_description'),
         message=data.get('message'),
-        scheduled_at=data.get('scheduled_at'),
+        # On-demand bookings carry no schedule time; the column is NOT NULL, so
+        # default to "now" instead of letting the INSERT crash with a 500.
+        scheduled_at=data.get('scheduled_at') or datetime.utcnow(),
         customer_proposed_price=customer_proposed_price,
         status='pending',
         community_guidelines_accepted=guidelines_accepted,
         community_guidelines_accepted_at=guidelines_accepted_at,
     )
     db.session.add(booking)
+    db.session.flush()
+    from backend.services import trip_state_machine as TSM
+    TSM.record_creation('scheduled', booking, actor=user, actor_type='customer')
     db.session.commit()
-
-    # TODO: Notify admin via SMS
 
     return success_response("Booking created", booking.to_dict(), status_code=201)
 
@@ -169,7 +194,7 @@ def create_courier_batch(user):
             luggage_weight_lbs=int(parcel.get('luggage_weight_lbs', data.get('luggage_weight_lbs', 0)) or 0),
             luggage_description=parcel.get('luggage_description') or data.get('luggage_description'),
             message=parcel.get('message') or data.get('message'),
-            scheduled_at=parcel.get('scheduled_at') or data.get('scheduled_at'),
+            scheduled_at=parcel.get('scheduled_at') or data.get('scheduled_at') or now,
             customer_proposed_price=customer_price,
             status='pending',
             community_guidelines_accepted=True,
@@ -179,6 +204,9 @@ def create_courier_batch(user):
             courier_total=len(parcels),
         )
         db.session.add(booking)
+        db.session.flush()
+        from backend.services import trip_state_machine as TSM
+        TSM.record_creation('scheduled', booking, actor=user, actor_type='customer')
         created.append(booking)
 
     db.session.flush()
@@ -203,8 +231,8 @@ def show(user, booking_id):
     if not booking:
         return error_response("Booking not found", status_code=404)
 
-    # Access control: customer, driver, or admin
-    if user.id not in (booking.customer_id, booking.driver_id, 1):
+    # Access control: customer, assigned driver, or admin (role-based)
+    if _party(user, booking) is None:
         return error_response("Unauthorized", status_code=403)
 
     return success_response("Success", booking.to_dict())
@@ -213,37 +241,63 @@ def show(user, booking_id):
 @bookings_bp.route('/api/bookings/<int:booking_id>/cancel', methods=['POST'])
 @jwt_required_with_user
 def cancel(user, booking_id):
-    """Customer cancels booking."""
+    """Customer / driver / admin cancels the booking (refund policy §7 applies)."""
+    from backend.services import trip_state_machine as TSM
+    from backend.services.ride_actions import cancel as cancel_ride
     booking = ScheduledBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
+    role = _party(user, booking)
+    if role is None:
+        return error_response("Unauthorized", status_code=403)
 
     data = request.get_json(silent=True) or request.form
-    booking.status = 'cancelled'
-    booking.cancellation_reason = data.get('reason')
+    try:
+        cancel_ride('scheduled', booking.id, actor=user, actor_type='admin' if role == 'admin' else None,
+                    reason='customer_cancel' if role == 'admin' else None,
+                    reason_code=data.get('reason_code') or 'cancelled', note=data.get('reason'), legacy=True)
+    except TSM.TransitionError as e:
+        return _v4_error(e)
+    booking = ScheduledBooking.query.get(booking_id)
+    booking.cancellation_reason = data.get('reason') or booking.cancellation_reason
     db.session.commit()
-
     return success_response("Booking cancelled", booking.to_dict())
 
 
 @bookings_bp.route('/api/bookings/<int:booking_id>/propose-price', methods=['POST'])
 @jwt_required_with_user
 def propose_price(user, booking_id):
-    """Driver proposes a counter-price."""
+    """Assigned driver (or admin) proposes a counter-price."""
+    from backend.services import trip_state_machine as TSM
     booking = ScheduledBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
+    role = _party(user, booking)
+    if role not in ('driver', 'admin'):
+        return error_response("Only the assigned driver can propose a price", status_code=403)
 
     data = request.get_json(silent=True) or request.form
     price = int(data.get('price', 0))
     if price < 50:
         return error_response("Minimum price is $0.50 (50 cents)")
 
+    stage = TSM.ensure_stage('scheduled', booking)
+    if stage not in ('REQUESTED', 'NEGOTIATING'):
+        return error_response("The price can no longer be changed for this booking.")
     booking.driver_proposed_price = price
-    booking.status = 'price_negotiating'
-    db.session.commit()
-
-    # TODO: SMS to customer
+    try:
+        if stage == 'REQUESTED':
+            TSM.transition('scheduled', booking.id, 'NEGOTIATING', actor=user,
+                           actor_type='admin' if role == 'admin' else None, ride=booking, commit=False,
+                           meta={'price_cents': price})
+        booking.status = 'price_negotiating'
+        from backend.services.notify import notify
+        from backend.utils.money import fmt
+        notify('negotiation.counter_offer', [booking.customer_id],
+               {'ride_type': 'scheduled', 'ride_id': booking.id, 'price': fmt(price), 'from_name': 'Your driver'})
+        db.session.commit()
+    except TSM.TransitionError as e:
+        return _v4_error(e)
 
     return success_response("Price proposed", booking.to_dict())
 
@@ -251,42 +305,56 @@ def propose_price(user, booking_id):
 @bookings_bp.route('/api/bookings/<int:booking_id>/accept-price', methods=['POST'])
 @jwt_required_with_user
 def accept_price(user, booking_id):
-    """Customer accepts driver's proposed price. Generates Stripe link."""
+    """Customer accepts the driver's proposed price → PRICE_AGREED → payment."""
+    from backend.services import trip_state_machine as TSM
     booking = ScheduledBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
+    if _party(user, booking) not in ('customer', 'admin'):
+        return error_response("Only the customer can accept the driver's price", status_code=403)
+    if not booking.driver_proposed_price:
+        return error_response("The driver has not proposed a price yet.")
 
     booking.agreed_price = booking.driver_proposed_price
-    booking.status = 'price_accepted'
-    db.session.commit()
+    try:
+        TSM.ensure_stage('scheduled', booking)
+        TSM.transition('scheduled', booking.id, 'PRICE_AGREED', actor=user,
+                       actor_type='admin' if _is_admin(user) else None, ride=booking,
+                       meta={'agreed_price_cents': booking.agreed_price})
+    except TSM.TransitionError as e:
+        return _v4_error(e)
 
-    # TODO: Generate Stripe Checkout Session via services/stripe_service.py
-
-    return success_response("Price accepted", booking.to_dict())
+    return success_response("Price accepted", ScheduledBooking.query.get(booking_id).to_dict())
 
 
 @bookings_bp.route('/api/bookings/<int:booking_id>/accept-original-price', methods=['POST'])
 @jwt_required_with_user
 def accept_original_price(user, booking_id):
-    """Driver accepts customer's original price. Generates Stripe link."""
+    """Driver accepts the customer's original price → PRICE_AGREED → payment."""
+    from backend.services import trip_state_machine as TSM
     booking = ScheduledBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
+    if _party(user, booking) not in ('driver', 'admin'):
+        return error_response("Only the assigned driver can accept the customer's price", status_code=403)
 
     booking.agreed_price = booking.customer_proposed_price
-    booking.status = 'price_accepted'
-    db.session.commit()
+    try:
+        TSM.ensure_stage('scheduled', booking)
+        TSM.transition('scheduled', booking.id, 'PRICE_AGREED', actor=user,
+                       actor_type='admin' if _is_admin(user) else None, ride=booking,
+                       meta={'agreed_price_cents': booking.agreed_price})
+    except TSM.TransitionError as e:
+        return _v4_error(e)
 
-    # TODO: Generate Stripe Checkout Session + SMS to customer
-
-    return success_response("Original price accepted", booking.to_dict())
+    return success_response("Original price accepted", ScheduledBooking.query.get(booking_id).to_dict())
 
 
 @bookings_bp.route('/api/bookings/<int:booking_id>/assign-driver', methods=['POST'])
 @jwt_required_with_user
 def assign_driver(user, booking_id):
-    """Admin assigns a driver to a booking (admin only, id=1)."""
-    if user.id != 1:
+    """Admin assigns a driver to a booking (admin only)."""
+    if not _is_admin(user):
         return error_response("Admin access required", status_code=403)
 
     booking = ScheduledBooking.query.get(booking_id)
@@ -316,10 +384,7 @@ def start(user, booking_id):
     if not booking:
         return error_response("Booking not found", status_code=404)
 
-    if booking.status not in ('confirmed',):
-        return error_response("Booking must be confirmed and paid before starting")
-
-    if user.id not in (booking.driver_id, 1):
+    if _party(user, booking) not in ('driver', 'admin'):
         return error_response("Only assigned driver or admin can start this booking", status_code=403)
 
     if _is_courier(booking) and booking.courier_batch_id:
@@ -334,11 +399,16 @@ def start(user, booking_id):
                 status_code=409,
             )
 
-    booking.status = 'in_progress'
-    booking.started_at = datetime.utcnow()
-    db.session.commit()
+    from backend.services import trip_state_machine as TSM
+    try:
+        TSM.walk_to('scheduled', booking.id, 'IN_PROGRESS', actor=user,
+                    actor_type='admin' if _party(user, booking) == 'admin' else None, legacy=True)
+    except TSM.TransitionError as e:
+        if e.code == 'payment_required':
+            e.message = "Booking must be confirmed and paid before starting"
+        return _v4_error(e)
 
-    return success_response("Trip started", booking.to_dict())
+    return success_response("Trip started", ScheduledBooking.query.get(booking_id).to_dict())
 
 
 @bookings_bp.route('/api/bookings/<int:booking_id>/complete', methods=['POST'])
@@ -349,7 +419,7 @@ def complete(user, booking_id):
     if not booking:
         return error_response("Booking not found", status_code=404)
 
-    if user.id not in (booking.driver_id, 1):
+    if _party(user, booking) not in ('driver', 'admin'):
         return error_response("Only assigned driver or admin can complete this booking", status_code=403)
 
     if _is_courier(booking):
@@ -359,8 +429,14 @@ def complete(user, booking_id):
             return error_response("Dropoff proof photo is required before completing courier booking")
 
     data = request.get_json(silent=True) or request.form
-    booking.status = 'completed'
-    booking.completed_at = datetime.utcnow()
+    from backend.services import trip_state_machine as TSM
+    try:
+        TSM.walk_to('scheduled', booking.id, 'COMPLETED', actor=user,
+                    actor_type='admin' if _party(user, booking) == 'admin' else None, legacy=True,
+                    lat=data.get('latitude'), lng=data.get('longitude'))
+    except TSM.TransitionError as e:
+        return _v4_error(e)
+    booking = ScheduledBooking.query.get(booking_id)
     booking.driver_notes = data.get('driver_notes')
 
     # Auto-advance next booking in courier chain so the driver can continue.
@@ -379,48 +455,75 @@ def complete(user, booking_id):
 @bookings_bp.route('/api/bookings/<int:booking_id>/refresh-payment', methods=['POST'])
 @jwt_required_with_user
 def refresh_payment(user, booking_id):
-    """Get/refresh Stripe payment link (customer only)."""
+    """Get/refresh the payment link (customer only) — authorization hold (spec §6)."""
+    from backend.services.payments import payment_service as PS
     booking = ScheduledBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
-
-    # TODO: Stripe Checkout Session via services/stripe_service.py
-
-    return success_response("Payment link refreshed", booking.to_dict())
+    if _party(user, booking) != 'customer':
+        return error_response("Only the customer can pay for this booking", status_code=403)
+    try:
+        rp = PS.start_payment('scheduled', booking, user,
+                              force_new=bool((request.get_json(silent=True) or {}).get('force_regenerate')))
+    except PS.PaymentError as e:
+        db.session.rollback()
+        return error_response(e.message, data={'error_code': e.code}, status_code=e.status)
+    data = ScheduledBooking.query.get(booking_id).to_dict()
+    data.update({'checkout_url': rp.checkout_url, 'ride_payment_id': rp.id, 'is_paid': rp.is_secured})
+    return success_response("Payment link refreshed", data)
 
 
 @bookings_bp.route('/api/bookings/<int:booking_id>/check-payment', methods=['POST'])
 @jwt_required_with_user
 def check_payment(user, booking_id):
-    """Verify Stripe payment status."""
+    """Verify payment status (syncs with the provider)."""
+    from backend.services.payments import payment_service as PS
+    from backend.services import trip_state_machine as TSM
     booking = ScheduledBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
-
-    # TODO: Sync with Stripe via services/stripe_service.py
-
+    if _party(user, booking) is None:
+        return error_response("Unauthorized", status_code=403)
+    rp = PS.latest_payment('scheduled', booking.id)
+    if rp and not rp.is_secured:
+        PS.sync_from_provider(rp)
+    booking = ScheduledBooking.query.get(booking_id)
     return success_response("Success", {
         'booking': booking.to_dict(),
-        'payment_status': getattr(booking, 'payment_status', 'pending'),
-        'is_paid': getattr(booking, 'stripe_paid', 'No') == 'Yes',
+        'payment_status': booking.payment_status,
+        'is_paid': TSM.payment_secured('scheduled', booking),
     })
 
 
 @bookings_bp.route('/api/bookings/<int:booking_id>/mark-paid', methods=['POST'])
 @jwt_required_with_user
 def mark_paid(user, booking_id):
-    """Admin force-marks a booking as paid (admin only, id=1)."""
-    if user.id != 1:
+    """Admin records an offline payment and confirms the booking (audited)."""
+    from backend.services import trip_state_machine as TSM
+    from backend.services.audit import audit
+    if not _is_admin(user):
         return error_response("Admin access required", status_code=403)
 
     booking = ScheduledBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
 
+    before = booking.to_dict()
     booking.payment_status = 'paid'
     booking.stripe_paid = True
-    booking.status = 'confirmed'
-    booking.confirmed_at = datetime.utcnow()
+    booking.payment_completed_at = datetime.utcnow()
+    try:
+        stage = TSM.ensure_stage('scheduled', booking)
+        if stage in ('REQUESTED', 'NEGOTIATING'):
+            TSM.transition('scheduled', booking.id, 'PRICE_AGREED', actor=user, actor_type='admin', ride=booking,
+                           commit=False, meta={'admin_mark_paid': True})
+            stage = 'PRICE_AGREED'
+        if stage in ('PRICE_AGREED', 'AWAITING_PAYMENT'):
+            TSM.transition('scheduled', booking.id, 'CONFIRMED', actor=user, actor_type='admin', ride=booking,
+                           commit=False, meta={'admin_mark_paid': True})
+    except TSM.TransitionError as e:
+        return _v4_error(e)
+    audit('booking.mark_paid', user, 'scheduled', booking.id, before=before, after=booking.to_dict())
     db.session.commit()
 
     return success_response("Marked as paid", booking.to_dict())
@@ -479,7 +582,7 @@ def upload_dropoff_proof(user, booking_id):
 def courier_batch_next(user, batch_id):
     """Get next pending stop in a courier batch for progress chaining."""
     q = ScheduledBooking.query.filter_by(courier_batch_id=batch_id)
-    if user.id != 1:
+    if not _is_admin(user):
         q = q.filter(
             (ScheduledBooking.customer_id == user.id) | (ScheduledBooking.driver_id == user.id)
         )

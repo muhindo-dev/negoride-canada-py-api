@@ -26,7 +26,7 @@ api.interceptors.response.use(
 /* ── Auth ── */
 export const authAPI = {
   login: (data) => api.post('/users/login', data),
-  me: () => api.get('/me'),
+  me: () => api.get('/users/me'),
 };
 
 /* ── Admin ── */
