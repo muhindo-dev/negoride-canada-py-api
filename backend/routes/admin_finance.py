@@ -3,7 +3,7 @@
 Roles: finance, super_admin. Every endpoint writes audit_logs (admin views of
 personal data are logged too, PIPEDA). All amounts are integer cents, CAD.
 List endpoints accept ?from=YYYY-MM-DD&to=YYYY-MM-DD (UTC, `to` inclusive),
-?page=&per_page= and ?format=csv (CSV export of the whole filtered set).
+?page=&per_page= and ?format=csv | ?format=xlsx (CSV / Excel export of the whole filtered set).
 
     GET  /api/admin/finance/receipts                 list (+csv)  ?q=number|customer_id|driver_id|ride_type
     GET  /api/admin/finance/receipts/{id}            detail (+ credit notes, payment, refunds)
@@ -21,6 +21,11 @@ List endpoints accept ?from=YYYY-MM-DD&to=YYYY-MM-DD (UTC, `to` inclusive),
     GET  /api/admin/finance/statements/{id}/pdf      statement PDF
     POST /api/admin/finance/statements/run           {week_start?} build statements for a week (job)
     GET  /api/admin/finance/reconciliation           DB vs payment provider, per payment (+csv)
+    GET  /api/admin/finance/tax-rates                effective-dated provincial rates (?province=)
+    POST /api/admin/finance/tax-rates                {province, name, gst_bp, pst_bp, hst_bp, qst_bp, effective_from, effective_to?}
+    PUT  /api/admin/finance/tax-rates/{id}           same fields (partial); audited, no overlaps per province
+    GET  /api/admin/finance/tip-receipts             tip receipts NR-TIP-… (+csv/xlsx) ?q=&ride_type=&ride_id=&customer_id=&driver_id=
+    GET  /api/admin/finance/tip-receipts/{id}/pdf    tip receipt PDF (audited)
 """
 import csv
 import io
@@ -75,22 +80,73 @@ def _dated(q, col):
     return q
 
 
+def _export_format():
+    f = (request.args.get('format') or '').lower()
+    return f if f in ('csv', 'xlsx') else None
+
+
 def _want_csv():
-    return (request.args.get('format') or '').lower() == 'csv'
+    """True for any file export (?format=csv or ?format=xlsx)."""
+    return _export_format() is not None
+
+
+XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+
+def _xlsx_bytes(sheet_name, columns, rows):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    wb = Workbook(write_only=False)
+    ws = wb.active
+    ws.title = sheet_name[:31] or 'export'
+    ws.append(columns)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for r in rows:
+        ws.append([_xlsx_value(r.get(c)) for c in columns])
+    ws.freeze_panes = 'A2'
+    for i, col in enumerate(columns, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(10, min(40, len(col) + 4))
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _xlsx_value(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float, str, bool, datetime, date)):
+        # Excel formula injection: neutralise cells that start with = + - @
+        if isinstance(v, str) and v[:1] in ('=', '+', '-', '@') and not _numeric(v):
+            return "'" + v
+        return v
+    return str(v)
+
+
+def _numeric(v):
+    try:
+        float(v)
+        return True
+    except ValueError:
+        return False
 
 
 def _csv(filename, columns, rows, admin, action):
+    """File export of a filtered set: CSV (default) or Excel with ?format=xlsx."""
+    fmt_ = _export_format() or 'csv'
+    rows = list(rows)
+    audit('finance.export', admin, 'finance', action,
+          meta={'rows': len(rows), 'format': fmt_, 'filters': {k: v for k, v in request.args.items()}})
+    db.session.commit()
+    stamp = datetime.utcnow().strftime('%Y%m%d-%H%M')
+    if fmt_ == 'xlsx':
+        return Response(_xlsx_bytes(filename, columns, rows), mimetype=XLSX_MIME, headers={
+            'Content-Disposition': f'attachment; filename="{filename}-{stamp}.xlsx"', 'Cache-Control': 'no-store'})
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(columns)
-    n = 0
     for r in rows:
         w.writerow(['' if r.get(c) is None else r.get(c) for c in columns])
-        n += 1
-    audit('finance.export', admin, 'finance', action,
-          meta={'rows': n, 'filters': {k: v for k, v in request.args.items()}})
-    db.session.commit()
-    stamp = datetime.utcnow().strftime('%Y%m%d-%H%M')
     return Response(buf.getvalue(), mimetype='text/csv', headers={
         'Content-Disposition': f'attachment; filename="{filename}-{stamp}.csv"', 'Cache-Control': 'no-store'})
 
@@ -205,14 +261,182 @@ def receipt_resend(admin, receipt_id):
     r = db.session.get(Receipt, receipt_id)
     if r is None:
         return error_response('Receipt not found', status_code=404)
-    ok = RC.resend(r.id, actor=admin)       # audited inside (receipt.resend)
-    db.session.refresh(r)
-    if not ok:
-        return error_response('The email could not be sent. The attempt is in the notification log.',
-                              data={'number': r.number, 'error_code': 'email_failed'}, status_code=502)
-    return success_response(f'Receipt {r.number} re-sent', {'id': r.id, 'number': r.number,
-                                                              'email_count': r.email_count,
-                                                              'emailed_at': RC._iso(r.emailed_at)})
+    # Sending (PDF + provider call) happens in a job; audited there (receipt.resend).
+    jobs.enqueue('backend.services.receipts.resend_job', r.id, admin.id)
+    db.session.rollback()
+    r = db.session.get(Receipt, receipt_id)
+    return success_response(f'Receipt {r.number} is being re-sent', {
+        'id': r.id, 'number': r.number, 'queued': True, 'email_count': r.email_count,
+        'emailed_at': RC._iso(r.emailed_at)}, status_code=202)
+
+
+# ── tip receipts (NR-TIP-…) — admin list + PDF (additive, admin console) ────
+
+TIP_RECEIPT_COLS = ['id', 'number', 'issued_at', 'ride_type', 'ride_id', 'receipt_id', 'ride_payment_id',
+                    'customer_id', 'driver_id', 'amount_cents', 'currency', 'paid_at', 'payment_method', 'emailed_at']
+
+
+def _tip_receipt_row(t):
+    tot = t.totals or {}
+    return {'id': t.id, 'number': t.number, 'issued_at': RC._iso(t.issued_at), 'ride_type': t.ride_type,
+            'ride_id': t.ride_id, 'receipt_id': t.receipt_id, 'ride_payment_id': t.ride_payment_id,
+            'customer_id': t.customer_id, 'driver_id': t.driver_id, 'amount_cents': int(t.amount_cents),
+            'currency': t.currency, 'paid_at': tot.get('paid_at'), 'payment_method': tot.get('payment_method'),
+            'emailed_at': RC._iso(t.emailed_at)}
+
+
+@admin_finance_bp.route('/api/admin/finance/tip-receipts', methods=['GET'])
+@admin_role_required(*ROLES)
+def tip_receipts_list(admin):
+    """Tip receipts (NR-TIP-YYYY-NNNNNN) ?q=number&ride_type=&ride_id=&customer_id=&driver_id= (+csv/xlsx)."""
+    from backend.models.money import TipReceipt
+    q = _dated(TipReceipt.query, TipReceipt.issued_at)
+    a = request.args
+    if a.get('q'):
+        q = q.filter(TipReceipt.number.like(f"%{a['q'].strip()}%"))
+    for f in ('customer_id', 'driver_id', 'ride_id'):
+        if a.get(f, type=int):
+            q = q.filter(getattr(TipReceipt, f) == a.get(f, type=int))
+    if a.get('ride_type'):
+        q = q.filter(TipReceipt.ride_type == a['ride_type'])
+    return _list(q, TipReceipt.id, _tip_receipt_row, admin, 'tip_receipts', TIP_RECEIPT_COLS)
+
+
+@admin_finance_bp.route('/api/admin/finance/tip-receipts/<int:tip_receipt_id>/pdf', methods=['GET'])
+@admin_role_required(*ROLES)
+def tip_receipt_pdf_admin(admin, tip_receipt_id):
+    from backend.models.money import TipReceipt
+    t = db.session.get(TipReceipt, tip_receipt_id)
+    if t is None:
+        return error_response('Tip receipt not found', data={'error_code': 'not_found'}, status_code=404)
+    blob = RC.ensure_tip_pdf(t)
+    audit('personal_data.view', admin, 'tip_receipt', t.id, meta={'number': t.number, 'format': 'pdf'})
+    db.session.commit()
+    return _pdf(blob, f'NegoRide-tip-{t.number}.pdf')
+
+
+# ── tax rates (effective-dated, audited) ────────────────────────────────────
+
+def _tax_row(t):
+    total = int(t.gst_bp or 0) + int(t.pst_bp or 0) + int(t.hst_bp or 0) + int(t.qst_bp or 0)
+    return {'id': t.id, 'province': t.province, 'name': t.name, 'gst_bp': t.gst_bp, 'pst_bp': t.pst_bp,
+            'hst_bp': t.hst_bp, 'qst_bp': t.qst_bp, 'total_bp': total,
+            'effective_from': t.effective_from.isoformat() if t.effective_from else None,
+            'effective_to': t.effective_to.isoformat() if t.effective_to else None,
+            'current': bool(t.effective_from and t.effective_from <= date.today()
+                            and (t.effective_to is None or t.effective_to >= date.today()))}
+
+
+def _tax_values(data, row=None):
+    from backend.services.receipts import PROVINCES
+    out = {}
+    prov = (data.get('province') if 'province' in data else (row.province if row else '')) or ''
+    prov = str(prov).strip().upper()
+    if prov not in PROVINCES:
+        raise ValueError('province must be a Canadian province/territory code (ON, QC, …).')
+    out['province'] = prov
+    out['name'] = str(data.get('name') or (row.name if row else '') or f'{prov} sales tax')[:60]
+    for k in ('gst_bp', 'pst_bp', 'hst_bp', 'qst_bp'):
+        v = data.get(k, getattr(row, k, 0) if row else 0)
+        try:
+            v = int(v or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f'{k} must be an integer (basis points, 500 = 5 %).')
+        if v < 0 or v > 5000:
+            raise ValueError(f'{k} must be between 0 and 5000 basis points.')
+        out[k] = v
+    if out['hst_bp'] and (out['gst_bp'] or out['pst_bp']):
+        raise ValueError('HST replaces GST + PST — set either hst_bp or gst_bp/pst_bp.')
+    for k in ('effective_from', 'effective_to'):
+        v = data.get(k, getattr(row, k, None) if row else None)
+        if isinstance(v, str):
+            v = v.strip() or None
+            try:
+                v = date.fromisoformat(v) if v else None
+            except ValueError:
+                raise ValueError(f'{k} must be YYYY-MM-DD.')
+        out[k] = v
+    if not out['effective_from']:
+        raise ValueError('effective_from is required (YYYY-MM-DD).')
+    if out['effective_to'] and out['effective_to'] < out['effective_from']:
+        raise ValueError('effective_to must be on or after effective_from.')
+    return out
+
+
+def _overlaps(values, exclude_id=None):
+    from backend.models.money import TaxRate
+    q = TaxRate.query.filter(TaxRate.province == values['province'])
+    if exclude_id:
+        q = q.filter(TaxRate.id != exclude_id)
+    far = date(9999, 12, 31)
+    for t in q.all():
+        a1, a2 = t.effective_from, t.effective_to or far
+        b1, b2 = values['effective_from'], values['effective_to'] or far
+        if a1 <= b2 and b1 <= a2:
+            return t
+    return None
+
+
+@admin_finance_bp.route('/api/admin/finance/tax-rates', methods=['GET'])
+@admin_role_required(*ROLES)
+def tax_rates_list(admin):
+    from backend.models.money import TaxRate
+    q = TaxRate.query
+    if request.args.get('province'):
+        q = q.filter(TaxRate.province == request.args['province'].upper())
+    rows = [_tax_row(t) for t in q.order_by(TaxRate.province.asc(), TaxRate.effective_from.desc())]
+    _viewed(admin, 'tax_rates')
+    return success_response('Tax rates', {'items': rows})
+
+
+@admin_finance_bp.route('/api/admin/finance/tax-rates', methods=['POST'])
+@admin_role_required(*ROLES)
+def tax_rates_create(admin):
+    """New effective-dated rate. To change a rate from a date, close the current
+    row (PUT effective_to = day before) and create the new one; rows of one
+    province may not overlap."""
+    from backend.models.money import TaxRate
+    data = request.get_json(silent=True) or {}
+    try:
+        values = _tax_values(data)
+    except ValueError as e:
+        return error_response(str(e), data={'error_code': 'bad_tax_rate'})
+    clash = _overlaps(values)
+    if clash is not None:
+        return error_response(f'Overlaps rate #{clash.id} ({clash.effective_from} → {clash.effective_to or "open"}). '
+                              'Close it first (effective_to).', data={'error_code': 'overlap', 'rate_id': clash.id},
+                              status_code=409)
+    t = TaxRate(**values)
+    db.session.add(t)
+    db.session.flush()
+    audit('finance.tax_rate_create', admin, 'tax_rate', t.id, after=_tax_row(t))
+    db.session.commit()
+    return success_response('Tax rate created', _tax_row(t), status_code=201)
+
+
+@admin_finance_bp.route('/api/admin/finance/tax-rates/<int:rate_id>', methods=['PUT', 'PATCH'])
+@admin_role_required(*ROLES)
+def tax_rates_update(admin, rate_id):
+    from backend.models.money import TaxRate
+    t = db.session.get(TaxRate, rate_id)
+    if t is None:
+        return error_response('Tax rate not found', status_code=404)
+    data = request.get_json(silent=True) or {}
+    try:
+        values = _tax_values(data, row=t)
+    except ValueError as e:
+        return error_response(str(e), data={'error_code': 'bad_tax_rate'})
+    clash = _overlaps(values, exclude_id=t.id)
+    if clash is not None:
+        return error_response(f'Overlaps rate #{clash.id}.', data={'error_code': 'overlap', 'rate_id': clash.id},
+                              status_code=409)
+    before = _tax_row(t)
+    for k, v in values.items():
+        setattr(t, k, v)
+    db.session.flush()
+    audit('finance.tax_rate_update', admin, 'tax_rate', t.id, before=before, after=_tax_row(t))
+    db.session.commit()
+    return success_response('Tax rate updated', _tax_row(t))
 
 
 # ── credit notes ────────────────────────────────────────────────────────────
@@ -537,8 +761,9 @@ def _reconcile(p, gw):
 def reconciliation(admin):
     """Compare our captured/refunded totals with the payment provider, one
     payment at a time (bounded page: provider calls are made synchronously)."""
-    q = _dated(RidePayment.query.filter(RidePayment.intent_id.isnot(None),
-                                        RidePayment.capture_status.in_(('captured', 'partially_captured'))),
+    from backend.models.money import CAPTURED_STATES
+    q = _dated(RidePayment.query.filter(RidePayment.intent_id.isnot(None), RidePayment.provider != 'offline',
+                                        RidePayment.capture_status.in_(CAPTURED_STATES)),
                RidePayment.captured_at)
     if request.args.get('purpose'):
         q = q.filter(RidePayment.purpose == request.args['purpose'])

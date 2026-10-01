@@ -244,10 +244,17 @@ def ride_detail(admin, ride_type, ride_id):
     data['pin'] = getattr(ride, 'ride_pin', None)
     try:
         from backend.models.money import Receipt
+        from backend.services import receipts as RC
         rc = Receipt.query.filter_by(ride_type=rt, ride_id=ride.id).first()
         data['receipt'] = rc.to_dict() if rc else None
+        data['tip_receipts'] = RC.tips_section(rt, ride.id)
     except Exception:
         data['receipt'] = None
+    rp = PS.latest_payment(rt, ride.id) if rt != 'rideshare_trip' else None
+    data['safety_settlement'] = ({'status': rp.settlement_status, 'due_at': rp.settle_due_at.strftime('%Y-%m-%dT%H:%M:%SZ')
+                                  if rp.settle_due_at else None, 'held_cents': PS.held_cents(rp),
+                                  'decision': (rp.meta or {}).get('safety_settlement')}
+                                 if rp is not None and rp.settlement_status else None)
     if rt == 'carhire':
         from backend.models.negotiation_record import NegotiationRecord
         data['negotiation_history'] = [r.to_dict() for r in NegotiationRecord.query
@@ -304,6 +311,71 @@ def ride_cancel(admin, ride_type, ride_id):
     except TSM.TransitionError as e:
         db.session.rollback()
         return error_response(e.message, data={'error_code': e.code}, status_code=e.status)
+
+
+@admin_v4_bp.route('/api/admin/rides/<ride_type>/<int:ride_id>/settle-safety', methods=['POST'])
+@admin_role_required('super_admin', 'ops', 'safety_reviewer', 'finance')
+def ride_settle_safety(admin, ride_type, ride_id):
+    """Decide a safety-ended ride's payment (§7.1): charge `amount_cents`
+    (pro-rated, 0 = nothing) and release/refund the rest. {amount_cents, reason}."""
+    data = _body()
+    try:
+        rt = R.normalize_type(ride_type)
+        R.load(rt, ride_id)
+        out = PS.settle_safety(rt, ride_id, data.get('amount_cents'), data.get('reason') or '', admin)
+    except R.RideNotFound as e:
+        return error_response(str(e), status_code=404)
+    except PS.PaymentError as e:
+        db.session.rollback()
+        return error_response(e.message, data={'error_code': e.code}, status_code=e.status)
+    except Exception as e:   # provider refusal
+        from backend.services.payments.gateway import GatewayError
+        if isinstance(e, GatewayError):
+            db.session.rollback()
+            return error_response(f'Stripe refused: {e}', data={'error_code': 'gateway_error'}, status_code=502)
+        raise
+    rp = PS.latest_payment(rt, ride_id)
+    return success_response('Safety settlement applied', {**out, 'payment': rp.to_dict() if rp else None})
+
+
+@admin_v4_bp.route('/api/admin/rides/<ride_type>/<int:ride_id>/receipt/issue', methods=['POST'])
+@admin_role_required('super_admin', 'finance', 'ops', 'support')
+def ride_issue_receipt(admin, ride_type, ride_id):
+    """Issue (and email) the receipt of a completed, paid ride now — for rides
+    the sweeper would pick up anyway, or after fixing a capture. Runs as a job
+    (202); returns the receipt when it already exists / was issued."""
+    from backend import jobs
+    from backend.services import receipts as RC
+    try:
+        rt = R.normalize_type(ride_type)
+        ride = R.load(rt, ride_id)
+    except R.RideNotFound as e:
+        return error_response(str(e), status_code=404)
+    if rt not in RC.RECEIPT_RIDE_TYPES:
+        return error_response('Receipts are issued per car hire, scheduled ride or seat booking.',
+                              data={'error_code': 'unsupported'})
+    stage = R.current_stage(rt, ride)
+    existing = RC.find_receipt(rt, ride_id)
+    if existing is None:
+        if stage not in ('COMPLETED', 'DROPPED_OFF', 'CLOSED') and not PS.latest_payment(rt, ride_id):
+            return error_response(f'The ride is {stage}; there is nothing to receipt.',
+                                  data={'error_code': 'not_completed', 'stage': stage}, status_code=409)
+        audit('receipt.issue_requested', admin, rt, ride_id)
+        db.session.commit()
+        jobs.enqueue('backend.services.trip_effects.issue_receipt_safe', rt, ride_id)
+        db.session.rollback()
+        existing = RC.find_receipt(rt, ride_id)
+    return success_response('Receipt issued' if existing else 'Receipt queued', {
+        'queued': existing is None, 'receipt': RC.receipt_payload(existing, viewer='customer') if existing else None},
+        status_code=200 if existing else 202)
+
+
+@admin_v4_bp.route('/api/admin/readiness', methods=['GET'])
+@admin_role_required()
+def readiness(admin):
+    """Launch blockers / warnings (configuration only, no vendor calls)."""
+    from backend.services import readiness as RD
+    return success_response('Readiness', RD.report())
 
 
 @admin_v4_bp.route('/api/admin/ride-payments/<int:rp_id>/refund', methods=['POST'])
@@ -438,6 +510,16 @@ def alerts_feed(admin):
                           'at': inc.created_at.strftime('%Y-%m-%dT%H:%M:%SZ')})
     except Exception:
         pass
+    # Ride-PIN lockouts (possible wrong-car / brute force) and missing on-call config
+    for a in (AuditLog.query.filter(AuditLog.action.in_(['ride.pin_locked', 'safety.oncall_missing']))
+              .order_by(AuditLog.id.desc()).limit(10)):
+        pin = a.action == 'ride.pin_locked'
+        items.append({'kind': 'pin_locked' if pin else 'oncall_not_configured', 'severity': 'critical',
+                      'text': (f'Ride PIN locked on {a.entity_type} #{a.entity_id}' if pin
+                               else 'SOS escalation skipped: no on-call phones configured'),
+                      'ride_type': a.entity_type if pin else None,
+                      'ride_id': int(a.entity_id) if pin and a.entity_id and str(a.entity_id).isdigit() else None,
+                      'at': a.created_at.strftime('%Y-%m-%dT%H:%M:%SZ')})
     items.sort(key=lambda x: x['at'], reverse=True)
     return success_response('Alerts', items[:limit])
 
@@ -500,59 +582,151 @@ def ride_chat_log(admin, ride_type, ride_id):
 def ride_reassign(admin, ride_type, ride_id):
     """Reassign the driver before pickup (car hire / scheduled). Reason required,
     audited, both drivers and the customer are notified in realtime."""
-    from backend.services import realtime
     data = _body()
     reason = (data.get('reason') or '').strip()
     if len(reason) < 5:
         return error_response('A reason is required.')
     try:
-        rt = R.normalize_type(ride_type)
+        payload = RA.reassign_driver(ride_type, ride_id, data.get('driver_id'), admin, reason)
     except R.RideNotFound as e:
         return error_response(str(e), status_code=404)
-    if rt not in ('carhire', 'scheduled'):
-        return error_response('Only car hire and scheduled rides can be reassigned.')
-    ride = R.load(rt, ride_id, lock=True)
-    stage = TSM.ensure_stage(rt, ride)
-    if stage not in ('REQUESTED', 'NEGOTIATING', 'PRICE_AGREED', 'AWAITING_PAYMENT', 'CONFIRMED',
-                     'DRIVER_EN_ROUTE', 'DRIVER_ARRIVING'):
-        return error_response(f'A ride in stage {stage} cannot be reassigned.', data={'error_code': 'bad_stage'})
-    new_driver = db.session.get(AdminUser, int(data.get('driver_id') or 0))
-    if not new_driver or not new_driver.is_approved_driver() or not new_driver.is_account_active():
-        return error_response('Choose an approved, active driver.')
-    old = ride.driver_id
-    if old == new_driver.id:
-        return error_response('That driver is already assigned.')
-    ride.driver_id = new_driver.id
-    if rt == 'carhire':
-        ride.driver_name = new_driver.name
-    else:
-        ride.assigned_by, ride.assigned_at = admin.id, datetime.utcnow()
-    for rp in RidePayment.query.filter_by(ride_type=rt, ride_id=ride.id).all():
-        rp.driver_id = new_driver.id
-    db.session.add(TripEvent(ride_type=rt, ride_id=ride.id, from_stage=stage, to_stage=stage, actor_type='admin',
-                             actor_id=admin.id, meta={'reassigned_from': old, 'reassigned_to': new_driver.id,
-                                                      'reason': reason}))
-    audit('ride.reassign_driver', admin, rt, ride.id, before={'driver_id': old},
-          after={'driver_id': new_driver.id}, meta={'reason': reason})
-    db.session.commit()
-    payload = {'ride_type': rt, 'ride_id': ride.id, 'stage': stage, 'driver_id': new_driver.id}
-    for uid in {old, new_driver.id, *R.customer_ids(rt, ride)} - {None}:
-        realtime.to_user(uid, 'ride.driver_reassigned', payload)
-    realtime.to_ride(rt, ride.id, 'ride.driver_reassigned', payload)
+    except TSM.TransitionError as e:
+        db.session.rollback()
+        return error_response(e.message, data={'error_code': e.code}, status_code=e.status)
     return success_response('Driver reassigned', payload)
 
 
 @admin_v4_bp.route('/api/admin/notifications/templates', methods=['GET'])
 @admin_role_required()
 def notification_templates(admin):
-    """The notification catalogue (read-only): copy in EN/FR, channels, groups."""
+    """The notification catalogue: copy in EN/FR, channels, groups, plus any admin
+    overrides (PUT/DELETE /api/admin/notifications/templates/{event_key})."""
     from backend.services.notify import catalogue as C
+    from backend.models.notification import NotificationTemplateOverride as O
+    ov = {}
+    for o in O.query.all():
+        ov.setdefault(o.event_key, {})[o.lang] = _override_row(o)
     items = [{'event_key': k, 'group': v['group'], 'channels': list(v['channels']), 'critical': v['critical'],
               'sms_fallback': v['sms_fallback'], 'route': v['route'], 'android_channel': v['android_channel'],
-              'mandatory': v['group'] in C.MANDATORY_GROUPS, 'title': v['title'], 'body': v['body']}
+              'mandatory': v['group'] in C.MANDATORY_GROUPS, 'title': v['title'], 'body': v['body'],
+              'overrides': ov.get(k, {})}
              for k, v in sorted(C.CATALOGUE.items())]
     return success_response('Templates', {'items': items, 'mandatory_groups': list(C.MANDATORY_GROUPS),
                                           'mutable_groups': list(C.MUTABLE_GROUPS)})
+
+
+def _override_row(o):
+    return {'event_key': o.event_key, 'lang': o.lang, 'title': o.title, 'body': o.body, 'updated_by': o.updated_by,
+            'updated_at': (o.updated_at or o.created_at).strftime('%Y-%m-%dT%H:%M:%SZ')}
+
+
+def _template_key(event_key):
+    from backend.services.notify import catalogue as C
+    if event_key not in C.CATALOGUE:
+        return None
+    return C.CATALOGUE[event_key]
+
+
+@admin_v4_bp.route('/api/admin/notifications/templates/<event_key>', methods=['GET'])
+@admin_role_required()
+def notification_template_get(admin, event_key):
+    from backend.models.notification import NotificationTemplateOverride as O
+    spec = _template_key(event_key)
+    if spec is None:
+        return error_response('Unknown event', data={'error_code': 'not_found'}, status_code=404)
+    overrides = {o.lang: _override_row(o) for o in O.query.filter_by(event_key=event_key)}
+    return success_response('Template', {'event_key': event_key, 'group': spec['group'],
+                                         'channels': list(spec['channels']), 'default': {'title': spec['title'],
+                                                                                         'body': spec['body']},
+                                         'overrides': overrides})
+
+
+@admin_v4_bp.route('/api/admin/notifications/templates/<event_key>', methods=['PUT'])
+@admin_role_required('super_admin', 'ops')
+def notification_template_put(admin, event_key):
+    """Override the copy of one event {lang: en|fr, title?, body?} (Jinja2, the
+    same variables as the catalogue). Empty fields fall back to the default."""
+    from jinja2 import Environment, TemplateSyntaxError
+    from backend.models.notification import NotificationTemplateOverride as O
+    spec = _template_key(event_key)
+    if spec is None:
+        return error_response('Unknown event', data={'error_code': 'not_found'}, status_code=404)
+    data = _body()
+    lang = (data.get('lang') or 'en').lower()
+    if lang not in ('en', 'fr'):
+        return error_response('lang must be en or fr', data={'error_code': 'bad_lang'})
+    title, body = data.get('title'), data.get('body')
+    if title is None and body is None:
+        return error_response('Provide title and/or body.', data={'error_code': 'empty'})
+    for name, tpl, limit in (('title', title, 255), ('body', body, 2000)):
+        if tpl is None:
+            continue
+        if len(str(tpl)) > limit:
+            return error_response(f'{name} is too long (max {limit}).', data={'error_code': 'too_long'})
+        try:
+            Environment().parse(str(tpl))
+        except TemplateSyntaxError as e:
+            return error_response(f'{name}: template error — {e.message}', data={'error_code': 'bad_template'})
+    row = O.query.filter_by(event_key=event_key, lang=lang).first()
+    before = _override_row(row) if row else None
+    if row is None:
+        row = O(event_key=event_key, lang=lang, created_at=datetime.utcnow())
+        db.session.add(row)
+    if title is not None:
+        row.title = str(title)
+    if body is not None:
+        row.body = str(body)
+    row.updated_by = admin.id
+    row.updated_at = datetime.utcnow()
+    db.session.flush()
+    audit('notifications.template_override', admin, 'notification_template', f'{event_key}:{lang}', before=before,
+          after=_override_row(row))
+    db.session.commit()
+    return success_response('Template saved', _override_row(row))
+
+
+@admin_v4_bp.route('/api/admin/notifications/templates/<event_key>', methods=['DELETE'])
+@admin_role_required('super_admin', 'ops')
+def notification_template_delete(admin, event_key):
+    """Remove the override (?lang=en|fr, default both) — back to the catalogue copy."""
+    from backend.models.notification import NotificationTemplateOverride as O
+    q = O.query.filter_by(event_key=event_key)
+    if request.args.get('lang'):
+        q = q.filter_by(lang=request.args['lang'].lower())
+    rows = q.all()
+    for r in rows:
+        audit('notifications.template_reset', admin, 'notification_template', f'{r.event_key}:{r.lang}',
+              before=_override_row(r))
+        db.session.delete(r)
+    db.session.commit()
+    return success_response('Template reset', {'removed': len(rows)})
+
+
+@admin_v4_bp.route('/api/admin/notifications/templates/<event_key>/preview', methods=['POST'])
+@admin_role_required()
+def notification_template_preview(admin, event_key):
+    """Render {lang, title?, body?, context?} (unsaved draft or the effective
+    template) with sample context — nothing is sent."""
+    from backend.services.notify import dispatcher as D
+    spec = _template_key(event_key)
+    if spec is None:
+        return error_response('Unknown event', data={'error_code': 'not_found'}, status_code=404)
+    data = _body()
+    lang = (data.get('lang') or 'en').lower()
+    title_t, body_t = D.template_for(spec, event_key, lang if lang in ('en', 'fr') else 'en')
+    if data.get('title') is not None:
+        title_t = data['title']
+    if data.get('body') is not None:
+        body_t = data['body']
+    sample = {'driver_first': 'Amara', 'customer_first': 'Sam', 'price': '$20.00', 'eta_min': 4, 'pin': '4821',
+              'wait_until': '10:42', 'vehicle': 'Grey Toyota Corolla ABC 123', 'amount': '$12.00', 'route':
+              'Toronto → Ottawa', 'departure': 'Fri Oct 02, 08:00', 'minutes': 60, 'pickup': 'Union Station',
+              'is_customer': True, 'earning': '$18.00', 'cancelled_by': 'driver', 'refund_text': 'Full refund issued.',
+              'name': 'Sam', 'document': 'Terms', 'reason': 'Example reason', 'number': 'NR-2026-000123',
+              'total': '$22.00', 'ride_id': 42, 'ride_type': 'carhire', 'other_first': 'Amara'}
+    sample.update(data.get('context') or {})
+    return success_response('Preview', {'title': D.render(title_t, sample), 'body': D.render(body_t, sample),
+                                        'context': sample})
 
 
 @admin_v4_bp.route('/api/admin/users/<int:user_id>/view-as', methods=['GET'])

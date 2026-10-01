@@ -3,6 +3,19 @@ from backend.models import db
 from backend.models.base import SerializeMixin, utcnow
 
 
+# Statuses in which money was captured (refund overlay included).
+CAPTURED_STATES = ('captured', 'partially_captured', 'partially_refunded', 'refunded')
+# Statuses in which the customer's money is secured for the ride (§6 guard).
+SECURED_STATES = ('authorized', 'captured', 'partially_captured', 'partially_refunded')
+
+
+def refund_overlay_status(captured_cents, refunded_cents, current):
+    """capture_status after a refund: refunded (all money back) / partially_refunded."""
+    if not refunded_cents or current not in CAPTURED_STATES:
+        return current
+    return 'refunded' if int(refunded_cents) >= int(captured_cents or 0) else 'partially_refunded'
+
+
 class RidePayment(SerializeMixin, db.Model):
     """One Stripe authorization (manual capture) or immediate charge for a ride,
     a seat booking, a tip or a background-check fee."""
@@ -28,6 +41,7 @@ class RidePayment(SerializeMixin, db.Model):
     amount_refunded_cents = db.Column(db.BigInteger, nullable=False, default=0)
     tip_cents = db.Column(db.BigInteger, nullable=False, default=0)
     # pending → authorized → captured | partially_captured | canceled | failed | expired
+    # refund overlay (after money came back): partially_refunded | refunded
     capture_status = db.Column(db.String(30), nullable=False, default='pending')
     payment_method_brand = db.Column(db.String(30))
     payment_method_last4 = db.Column(db.String(4))
@@ -37,6 +51,9 @@ class RidePayment(SerializeMixin, db.Model):
     canceled_at = db.Column(db.DateTime)
     failure_reason = db.Column(db.Text)
     idempotency_key = db.Column(db.String(120))
+    # 'safety_review' while a safety-ended ride's hold waits for the admin; then 'settled' / 'auto_released'
+    settlement_status = db.Column(db.String(20))
+    settle_due_at = db.Column(db.DateTime)
     meta = db.Column(db.JSON)
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
     updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
@@ -44,7 +61,12 @@ class RidePayment(SerializeMixin, db.Model):
     @property
     def is_secured(self):
         """Money is secured (authorized or already captured)."""
-        return self.capture_status in ('authorized', 'captured', 'partially_captured')
+        return self.capture_status in SECURED_STATES
+
+    @property
+    def took_money(self):
+        """Money was captured at some point (including later-refunded payments)."""
+        return self.capture_status in CAPTURED_STATES
 
     @property
     def net_cents(self):
@@ -149,3 +171,24 @@ class DriverStrike(SerializeMixin, db.Model):
     ride_id = db.Column(db.BigInteger)
     note = db.Column(db.String(500))
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+
+
+class TipReceipt(SerializeMixin, db.Model):
+    """NR-TIP-YYYY-NNNNNN — receipt for a tip paid after the ride (tips are not taxable)."""
+    __tablename__ = 'tip_receipts'
+    _hidden = ('pdf_path',)
+
+    id = db.Column(db.BigInteger, primary_key=True)
+    number = db.Column(db.String(30), nullable=False, unique=True)
+    ride_payment_id = db.Column(db.BigInteger, nullable=False, unique=True)
+    ride_type = db.Column(db.String(30), nullable=False)
+    ride_id = db.Column(db.BigInteger, nullable=False)
+    receipt_id = db.Column(db.BigInteger)
+    customer_id = db.Column(db.Integer, nullable=False)
+    driver_id = db.Column(db.Integer)
+    currency = db.Column(db.String(3), nullable=False, default='cad')
+    amount_cents = db.Column(db.BigInteger, nullable=False)
+    totals = db.Column(db.JSON, nullable=False)
+    pdf_path = db.Column(db.String(500))
+    emailed_at = db.Column(db.DateTime)
+    issued_at = db.Column(db.DateTime, nullable=False, default=utcnow)

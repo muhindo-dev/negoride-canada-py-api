@@ -27,6 +27,8 @@ PERIODIC = [
     (3600, 'backend.services.account_jobs.tick'),
     (24 * 3600, 'backend.services.safety_jobs.retention_cleanup'),
     (7 * 24 * 3600, 'backend.services.receipt_jobs.weekly_driver_statements'),
+    (60, 'backend.services.receipt_jobs.sweep_missing_receipts'),
+    (300, 'backend.services.payments.payment_service.auto_release_safety_holds'),
 ]
 
 _last_run = {}

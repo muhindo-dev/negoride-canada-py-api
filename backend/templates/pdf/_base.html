@@ -30,7 +30,8 @@
 </head>
 <body>
 <table class="head"><tr>
-  <td><span class="brand">NegoRide</span> <span class="muted">Canada</span><br>
+  <td>{% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="NegoRide Canada" style="height:11mm;width:auto;display:block">{% else %}<span class="brand">NegoRide</span> <span class="muted">Canada</span>{% endif %}
+    {% if driver_copy %}<div style="margin-top:2mm"><span class="pill" style="border-color:#2563eb;color:#1d4ed8">DRIVER COPY</span></div>{% endif %}
     <div style="margin-top:3mm"><strong>{{ (t.company or {}).legal_name }}</strong><br>
     <span class="muted">{{ (t.company or {}).address }}</span><br>
     {% if t.registration and t.registration.gst_hst %}<span class="muted">GST/HST reg. no. {{ t.registration.gst_hst }}</span><br>{% endif %}

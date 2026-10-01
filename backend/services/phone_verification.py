@@ -9,12 +9,16 @@ Scenarios (§11.2) are expressed as `purpose`:
     password_reset · sensitive_action
 
 Delivery modes, in order:
-  test    number listed in TWILIO_TEST_NUMBERS ("+15555550100:123456,…") and
-          FLASK_ENV != production → fixed code, nothing is sent (App Store / QA).
+  test    number listed in TWILIO_TEST_NUMBERS ("+15555550100:123456,…"),
+          TWILIO_TEST_MODE_ENABLED=1 and not production → fixed code, nothing is
+          sent (App Store / QA).
   twilio  TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN + TWILIO_VERIFY_SERVICE_SID set.
-  dev     Twilio not configured and FLASK_ENV != production → a random code is
+  dev     Twilio not configured and not production → a random code is
           generated, only its SHA-256 is stored and the code is written to the log.
   In production without Twilio, start() fails with 503 `sms_unavailable`.
+
+"Production" = FLASK_ENV is anything other than development / dev / testing /
+test / local (an unset FLASK_ENV counts as production — fail closed, §11.2 #14).
 
 Only a SHA-256 hash of the verification_token is stored (phone_verifications.token_hash).
 """
@@ -53,13 +57,22 @@ class VerifyError(Exception):
         return d
 
 
+NON_PRODUCTION_ENVS = ('development', 'dev', 'testing', 'test', 'local')
+
+
 def is_production():
-    return os.getenv('FLASK_ENV', '').strip().lower() == 'production'
+    """Fail closed: only an explicit development/testing/local FLASK_ENV is non-production."""
+    return os.getenv('FLASK_ENV', '').strip().lower() not in NON_PRODUCTION_ENVS
+
+
+def test_mode_enabled():
+    """Fixed-code test numbers need TWILIO_TEST_MODE_ENABLED=1 AND a non-production env."""
+    return os.getenv('TWILIO_TEST_MODE_ENABLED', '').strip().lower() in ('1', 'true', 'yes') and not is_production()
 
 
 def test_numbers():
     """{e164: code} from TWILIO_TEST_NUMBERS — never honoured in production."""
-    if is_production():
+    if not test_mode_enabled():
         return {}
     out = {}
     for part in (os.getenv('TWILIO_TEST_NUMBERS') or '').split(','):
@@ -73,7 +86,7 @@ def test_numbers():
 
 
 def test_voip_numbers():
-    if is_production():
+    if not test_mode_enabled():
         return set()
     return {P.safe_normalize(n.strip()) for n in (os.getenv('TWILIO_TEST_VOIP_NUMBERS') or '').split(',') if n.strip()}
 
@@ -131,9 +144,29 @@ def _normalize(raw):
         raise VerifyError(str(e), 'invalid_phone')
     if P.is_premium(e164):
         raise VerifyError('Premium-rate numbers cannot receive verification codes.', 'premium_blocked')
-    if not P.is_allowed_country(e164, S.get('otp.allowed_countries')):
+    if not P.is_allowed_country(e164, S.get('otp.allowed_countries'), S.get('otp.allowed_nanp_regions')):
         raise VerifyError('Phone verification is available for Canadian and US numbers only.', 'country_not_allowed')
     return e164
+
+
+def account_phone(user):
+    """The phone a sensitive-action OTP goes to: phone_e164 (verified or not), else the
+    legacy phone_number when it normalises to E.164. None when the account has no phone."""
+    if not user:
+        return None
+    return user.phone_e164 or P.safe_normalize(user.phone_number)
+
+
+ANDROID_APP_HASH_RE = __import__('re').compile(r'^[A-Za-z0-9+/]{11}$')
+
+
+def android_app_hash(value=None):
+    """Android SMS Retriever hash (11 chars) from the request or TWILIO_ANDROID_APP_HASH."""
+    for v in (value, os.getenv('TWILIO_ANDROID_APP_HASH')):
+        v = (str(v).strip() if v else '')
+        if v and ANDROID_APP_HASH_RE.match(v):
+            return v
+    return None
 
 
 def _resolve_phone(phone, purpose, user, step_up_ticket):
@@ -149,11 +182,12 @@ def _resolve_phone(phone, purpose, user, step_up_ticket):
     if purpose == 'sensitive_action':
         if not user:
             raise VerifyError('Please log in again.', 'unauthorized', 401)
-        if not user.phone_e164 or not user.phone_verified_at:
+        own = account_phone(user)
+        if not own:
             raise VerifyError('Add and verify a phone number first.', 'no_verified_phone')
-        if phone and P.safe_normalize(phone) not in (None, user.phone_e164):
+        if phone and P.safe_normalize(phone) not in (None, own):
             raise VerifyError('Use the phone number on your account.', 'phone_mismatch')
-        return user.phone_e164, user
+        return own, user
     if not phone:
         raise VerifyError('Phone number is required.', 'invalid_phone')
     return _normalize(phone), user
@@ -164,7 +198,11 @@ def lookup_line_type(e164, test_mode=False):
     if test_mode or e164 in test_numbers():
         return 'nonFixedVoip' if e164 in test_voip_numbers() else 'mobile'
     if not twilio_client.is_configured():
-        return 'nonFixedVoip' if e164 in test_voip_numbers() else None
+        if e164 in test_voip_numbers():
+            return 'nonFixedVoip'
+        # dev/test without Twilio: assume mobile so the driver wizard can be exercised
+        # locally; production without Twilio cannot send codes at all (sms_unavailable).
+        return None if is_production() else 'mobile'
     try:
         return twilio_client.lookup_line_type(e164)
     except Exception as exc:
@@ -198,12 +236,23 @@ def _sms_sends(e164, purpose):
     since = _now() - timedelta(hours=1)
     return PhoneVerification.query.filter(PhoneVerification.phone == e164, PhoneVerification.purpose == purpose,
                                           PhoneVerification.channel == 'sms',
+                                          PhoneVerification.status.notin_(('rejected', 'suppressed')),
                                           PhoneVerification.created_at >= since).count()
 
 
 # ── start ───────────────────────────────────────────────────────────────────
 
-def start(phone, purpose, channel='sms', user=None, step_up_ticket=None, device_id=None, ip=None, locale=None):
+def _record_rejected(e164, purpose, channel, ip, device_id, user, reason):
+    """Count refused starts (phone_in_use …) against the per-phone / per-IP limits
+    so the endpoint cannot be used to enumerate registered numbers at speed."""
+    db.session.add(PhoneVerification(user_id=user.id if user else None, phone=e164, purpose=purpose,
+                                     channel=channel, status='rejected', ip=ip, device_id=device_id,
+                                     error=reason, created_at=_now()))
+    db.session.commit()
+
+
+def start(phone, purpose, channel='sms', user=None, step_up_ticket=None, device_id=None, ip=None, locale=None,
+          app_hash=None):
     purpose = (purpose or '').strip().lower()
     channel = (channel or 'sms').strip().lower()
     if purpose not in PURPOSES:
@@ -220,16 +269,25 @@ def start(phone, purpose, channel='sms', user=None, step_up_ticket=None, device_
     test_mode = e164 in tests
     suppressed = False
 
+    if channel == 'whatsapp' and not S.get('otp.whatsapp_enabled'):
+        raise VerifyError('WhatsApp codes are not available. Use SMS or a voice call.', 'channel_unavailable')
+    if channel == 'call' and _sms_sends(e164, purpose) < S.get_int('otp.voice_after_failed_sms'):
+        raise VerifyError('A voice call is offered after we have sent you a text message.', 'voice_not_available',
+                          data={'voice_after_sms': S.get_int('otp.voice_after_failed_sms')})
+
+    # Rate limits BEFORE any account lookup (anti-enumeration, §11.2 #10).
+    _rate_limits(e164, ip, purpose)
+
     if purpose == 'signup':
         owner = find_verified_owner(e164, exclude_id=user.id if user else None)
         if owner:
+            _record_rejected(e164, purpose, channel, ip, device_id, user, 'phone_in_use')
             raise VerifyError('This phone number is already registered. Log in instead.', 'phone_in_use', 409,
                               {'login_instead': True})
     elif purpose == 'login':
         account = find_verified_owner(e164)
-        if not account:
-            raise VerifyError('No account uses this phone number yet. Sign up instead.', 'no_account', 404,
-                              {'signup_instead': True})
+        # never reveal whether the number is registered: same answer, nothing is sent
+        suppressed = account is None
     elif purpose == 'password_reset':
         account = find_verified_owner(e164)
         suppressed = account is None       # never reveal whether the number is registered
@@ -241,23 +299,17 @@ def start(phone, purpose, channel='sms', user=None, step_up_ticket=None, device_
         if purpose == 'change_phone' and user.phone_e164 == e164 and user.phone_verified_at:
             raise VerifyError('This is already your verified phone number.', 'same_phone')
 
-    if channel == 'whatsapp' and not S.get('otp.whatsapp_enabled'):
-        raise VerifyError('WhatsApp codes are not available. Use SMS or a voice call.', 'channel_unavailable')
-    if channel == 'call' and _sms_sends(e164, purpose) < S.get_int('otp.voice_after_failed_sms'):
-        raise VerifyError('A voice call is offered after we have sent you a text message.', 'voice_not_available',
-                          data={'voice_after_sms': S.get_int('otp.voice_after_failed_sms')})
-
-    _rate_limits(e164, ip, purpose)
-
     line_type = None
-    if purpose == 'driver_onboarding' or (purpose == 'signup' and S.get('otp.lookup_at_signup')):
+    is_voip = False
+    # Carrier classification is optional during signup. Driver onboarding uses
+    # the server-confirmed OTP as proof of phone ownership and must not fail if
+    # Twilio Lookup is unavailable or returns an unknown line type.
+    if not suppressed and purpose == 'signup' and S.get('otp.lookup_at_signup'):
         line_type = lookup_line_type(e164, test_mode)
         is_voip = (line_type or '') in VOIP_TYPES
-        if is_voip and ((purpose == 'driver_onboarding' and S.get('otp.block_voip_drivers'))
-                        or (purpose == 'signup' and S.get('otp.block_voip_signup'))):
-            raise VerifyError('Drivers must use a mobile phone number (internet/VoIP numbers are not accepted).'
-                              if purpose == 'driver_onboarding' else
-                              'Please use a mobile phone number (internet/VoIP numbers are not accepted).',
+        if is_voip and S.get('otp.block_voip_signup'):
+            _record_rejected(e164, purpose, channel, ip, device_id, user, 'voip_not_allowed')
+            raise VerifyError('Please use a mobile phone number (internet/VoIP numbers are not accepted).',
                               'voip_not_allowed')
 
     # older pending codes for the same number+purpose are superseded
@@ -274,7 +326,8 @@ def start(phone, purpose, channel='sms', user=None, step_up_ticket=None, device_
         pass
     elif verify_configured():
         try:
-            res = twilio_client.verify_start(e164, channel=channel, locale=locale)
+            res = twilio_client.verify_start(e164, channel=channel, locale=locale,
+                                             app_hash=android_app_hash(app_hash) if channel == 'sms' else None)
             row.twilio_sid = res.get('sid')
         except twilio_client.TwilioError as e:
             row.status, row.error = 'failed', str(e)[:500]
@@ -306,6 +359,11 @@ def start(phone, purpose, channel='sms', user=None, step_up_ticket=None, device_
         'whatsapp_available': bool(S.get('otp.whatsapp_enabled')),
         'max_attempts': S.get_int('otp.max_check_attempts'),
         'test_mode': bool(test_mode),
+        # sign-up only: VoIP numbers are allowed for customers (otp.block_voip_signup off) but flagged
+        'line_type_warning': 'voip' if (purpose == 'signup' and is_voip) else None,
+        'line_type_warning_message': ('This looks like an internet (VoIP) number. You can use it to ride, but '
+                                      'drivers must verify a mobile number.') if (purpose == 'signup' and is_voip)
+        else None,
     }
 
 
@@ -409,6 +467,18 @@ def consume(token, purpose, phone=None, user=None):
     return row
 
 
+def is_verified_phone_conflict(exc):
+    """True for the DB-level one-verified-phone-per-account violation
+    (UNIQUE admin_users.verified_phone, migration v4_0203)."""
+    return 'uq_admin_users_verified_phone' in str(getattr(exc, 'orig', exc))
+
+
+def phone_in_use_response():
+    from backend.utils.response import error_response
+    return error_response('This phone number is already used by another account.',
+                          data={'error_code': 'phone_in_use', 'login_instead': True}, status_code=409)
+
+
 def apply_to_user(user, row, set_legacy_phone=True):
     """Mark the verified number as the user's phone."""
     user.phone_e164 = row.phone
@@ -422,15 +492,17 @@ def apply_to_user(user, row, set_legacy_phone=True):
 
 
 def require_sensitive_action(user, token, data=None):
-    """Spec §11.2 #7. v4 clients must present a `sensitive_action` verification_token
-    for payout-account changes and account deletion (when the user has a verified phone).
+    """Spec §11.2 #7. v4 clients (or every client when app.legacy_clients_allowed is off)
+    must present a `sensitive_action` verification_token for payout-account changes,
+    Stripe onboarding / dashboard links and account deletion whenever the account has a
+    phone number (verified or not — the OTP goes to that number).
     Returns an error tuple for the route, or None when allowed."""
     from backend.utils.client_info import is_v4_client
     from backend.utils.response import error_response
     if not S.flag('sensitive_action_reverify') or not is_v4_client(data):
         return None
-    if not user.phone_e164 or not user.phone_verified_at:
-        return None
+    if not account_phone(user):
+        return None   # no phone on the account at all — nothing to re-verify against
     try:
         consume(token, 'sensitive_action', user=user)
         return None
@@ -441,3 +513,30 @@ def require_sensitive_action(user, token, data=None):
         return error_response(e.message if e.code != 'verification_required'
                               else 'Please confirm it’s you with a code sent to your phone.', data=data,
                               status_code=403)
+
+
+# ── ff.phone_required_signup: no rides without a verified phone (§11.2 #1) ───
+
+PHONE_REQUIRED_MESSAGE = 'Verify your mobile number before requesting a ride.'
+
+
+def ride_phone_block(user, data=None):
+    """None when the user may create rides / bookings; otherwise the error `data`.
+    Applies when ff.phone_required_signup is on, to v4 clients (every client when
+    app.legacy_clients_allowed is off). Admin accounts are exempt."""
+    from backend.utils.client_info import is_v4_client
+    if not user or user.phone_verified_at or not S.flag('phone_required_signup'):
+        return None
+    if user.get_admin_roles() or not is_v4_client(data):
+        return None
+    return {'error_code': 'phone_verification_required', 'requires_phone_verification': True,
+            'purpose': 'signup'}
+
+
+def require_phone_for_rides(user, data=None):
+    """Route helper: an error response (403) or None."""
+    blocked = ride_phone_block(user, data)
+    if blocked is None:
+        return None
+    from backend.utils.response import error_response
+    return error_response(PHONE_REQUIRED_MESSAGE, data=blocked, status_code=403)

@@ -5,7 +5,7 @@ import {
   Stack, Switch, Table, Text, Textarea, Title, Tooltip,
 } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
-import { FiAlertCircle, FiDownload, FiInbox } from 'react-icons/fi';
+import { FiAlertCircle, FiDownload, FiGrid, FiInbox } from 'react-icons/fi';
 import { ago, fmt, humanize, money, RIDE_TYPES, stageColor, statusColor, TZ } from '../lib/format';
 import { download } from '../lib/api';
 
@@ -153,15 +153,15 @@ export function DataTable({ columns, rows, onRowClick, loading, error, empty, pa
   );
 }
 
-export function CsvButton({ url, params, name = 'export', label = 'CSV' }) {
+function ExportButton({ url, params, name, format, label, icon }) {
   const [busy, setBusy] = useState(false);
   return (
     <Button
-      size="xs" variant="default" leftSection={<FiDownload />} loading={busy}
+      size="xs" variant="default" leftSection={icon} loading={busy} data-testid={`export-${format}`}
       onClick={async () => {
         setBusy(true);
         try {
-          await download(url, { ...(params || {}), format: 'csv' }, `${name}.csv`);
+          await download(url, { ...(params || {}), format }, `${name}.${format}`);
         } catch (e) {
           notifications.show({ color: 'red', title: 'Export failed', message: e.message });
         } finally {
@@ -171,6 +171,20 @@ export function CsvButton({ url, params, name = 'export', label = 'CSV' }) {
     >
       {label}
     </Button>
+  );
+}
+
+/**
+ * File exports of a filtered list: CSV and Excel (?format=csv|xlsx). Both are
+ * audited server-side (`finance.export`, meta.format). `xlsx={false}` for
+ * endpoints that only stream CSV.
+ */
+export function CsvButton({ url, params, name = 'export', label = 'CSV', xlsx = true }) {
+  return (
+    <Button.Group>
+      <ExportButton url={url} params={params} name={name} format="csv" label={label} icon={<FiDownload />} />
+      {xlsx && <ExportButton url={url} params={params} name={name} format="xlsx" label="Excel" icon={<FiGrid />} />}
+    </Button.Group>
   );
 }
 

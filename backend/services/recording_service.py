@@ -80,15 +80,26 @@ def create(user, ride_type, ride, role, trigger='manual', incident_id=None):
 
 
 def status_payload(ride_type, ride_id, viewer_id=None):
-    recs = active_for_ride(ride_type, ride_id)
-    others = [r for r in recs if viewer_id is None or r.user_id != int(viewer_id)]
-    mine = [r for r in recs if viewer_id is not None and r.user_id == int(viewer_id)]
-    return {'ride_type': ride_type, 'ride_id': int(ride_id), 'recording_active': bool(recs),
+    """Transparency payload for any party. `recording_active` / `banner` are about
+    running recordings; `ever_recorded` + `recordings` list EVERY non-deleted
+    recording of the ride (running or stopped) so the other party still sees
+    that audio was recorded after it stopped or the ride ended. Never URLs."""
+    recs = (Recording.query.filter(Recording.ride_type == ride_type, Recording.ride_id == int(ride_id),
+                                   Recording.status != 'deleted')
+            .order_by(Recording.started_at, Recording.id).all())
+    active = [r for r in recs if r.status == 'recording']
+    vid = int(viewer_id) if viewer_id is not None else None
+    others = [r for r in active if vid is None or r.user_id != vid]
+    mine = [r for r in active if vid is not None and r.user_id == vid]
+    return {'ride_type': ride_type, 'ride_id': int(ride_id), 'recording_active': bool(active),
             'other_party_recording': bool(others), 'i_am_recording': bool(mine),
-            'by_roles': sorted({r.role for r in recs}),
+            'by_roles': sorted({r.role for r in active}),
             'banner': BANNER if others else None,
-            'recordings': [{'id': r.id, 'role': r.role, 'status': r.status, 'is_mine': r in mine,
-                            'started_at': iso(r.started_at)} for r in recs]}
+            'ever_recorded': bool(recs),
+            'other_party_ever_recorded': any(vid is None or r.user_id != vid for r in recs),
+            'recordings': [{'id': r.id, 'role': r.role, 'status': r.status,
+                            'is_mine': vid is not None and r.user_id == vid,
+                            'started_at': iso(r.started_at), 'stopped_at': iso(r.stopped_at)} for r in recs]}
 
 
 def emit_status(rec):
@@ -101,9 +112,16 @@ def emit_status(rec):
     realtime.to_ride(rec.ride_type, rec.ride_id, 'recording.status', payload)
     try:
         ride = R.load(rec.ride_type, rec.ride_id)
-        for uid in R.all_party_ids(rec.ride_type, ride):
-            if uid != rec.user_id:
-                realtime.to_user(uid, 'recording.status', payload)
+        others = [uid for uid in R.all_party_ids(rec.ride_type, ride) if uid != rec.user_id]
+        for uid in others:
+            realtime.to_user(uid, 'recording.status', payload)
+        # Transparency (spec §10.1): the other party is also told by push/inbox,
+        # so they know even if their app is closed or offline.
+        if others and rec.status == 'recording':
+            from backend.services.notify import notify
+            notify('safety.recording_started', others,
+                   {'ride_type': rec.ride_type, 'ride_id': rec.ride_id, 'recording_id': rec.id},
+                   dedupe_key=f'rec-{rec.id}')
     except R.RideNotFound:
         pass
 
@@ -172,13 +190,19 @@ def add_chunk(rec, seq, data, sha256, content_type=None, filename=None, duration
     return chunk, False
 
 
-def chunk_urls(rec, actor_id, ttl_s=300):
+def chunk_urls(rec, actor_id, ttl_s=300, stream_base=None):
+    """Chunk list with short-lived signed URLs. `stream_base` (admin) adds
+    `stream_url` = the authenticated, per-fetch audited streaming proxy, which
+    admin players should prefer over the signed `url`."""
     out = []
     for c in RecordingChunk.query.filter_by(recording_id=rec.id).order_by(RecordingChunk.seq).all():
-        out.append({'seq': c.seq, 'bytes': c.bytes, 'sha256': c.sha256, 'duration_ms': c.duration_ms,
-                    'started_at': iso(c.started_at), 'uploaded_at': iso(c.uploaded_at),
-                    'url': PS.signed_url(c.storage_key, ttl_s=ttl_s, content_type='audio/mp4',
-                                         filename=f'recording-{rec.id}-{c.seq:05d}.m4a', actor_id=actor_id)})
+        item = {'seq': c.seq, 'bytes': c.bytes, 'sha256': c.sha256, 'duration_ms': c.duration_ms,
+                'started_at': iso(c.started_at), 'uploaded_at': iso(c.uploaded_at),
+                'url': PS.signed_url(c.storage_key, ttl_s=ttl_s, content_type='audio/mp4',
+                                     filename=f'recording-{rec.id}-{c.seq:05d}.m4a', actor_id=actor_id)}
+        if stream_base:
+            item['stream_url'] = f'{stream_base}/{c.seq}'
+        out.append(item)
     return out
 
 

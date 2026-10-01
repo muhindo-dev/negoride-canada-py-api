@@ -9,7 +9,9 @@ super_admin / ops / safety_reviewer).
 Client → server events
   ride:subscribe      {ride_type, ride_id}      join ride:{type}:{id} (parties/admin only)
   ride:unsubscribe    {ride_type, ride_id}
-  location:update     {lat, lng, speed?, heading?, accuracy?}
+  location:update     {lat, lng, speed?, heading?, accuracy?, recorded_at?} and/or
+                      {points: [{lat, lng, speed, heading, accuracy, recorded_at}]}  (offline catch-up)
+                      ack → {ok, live, stored, received, rejected}
   notification:ack    {id}                      marks the notification opened
   ping                {}                         → pong
 
@@ -101,8 +103,9 @@ def register_realtime_events(socketio, app):
             user = _user()
             if not user:
                 return disconnect()
-            tracking.ingest(user, data or {})
-            return {'ok': True}
+            _p, _ctx, stats = tracking.ingest_batch(user, data or {})
+            return {'ok': True, 'live': stats['live'], 'stored': stats['stored'],
+                    'received': stats['received'], 'rejected': stats['rejected']}
         except tracking.LocationError as e:
             db.session.rollback()
             return {'ok': False, 'error': str(e)}

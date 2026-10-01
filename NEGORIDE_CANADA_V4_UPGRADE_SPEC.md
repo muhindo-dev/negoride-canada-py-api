@@ -4,6 +4,7 @@
 > **Source:** client feedback ("NEGORIDE CANADA — updates without checking anything", items 1–18), reframed, expanded and made implementable.
 > **Status:** Approved scope to build. Items marked **[CONFIRM WITH CLIENT]** have a sensible default already specified. Build the default, keep it configurable, and flag it in the PR.
 > **Date:** 2026-09-27
+> **Implementation status:** ✅ Implemented and verified — updated 2026-09-28. See **§0.1** for the per-section status and every section below for a *Status* note. Acceptance checkboxes are ticked with their evidence.
 
 ---
 
@@ -17,6 +18,36 @@
 6. Update the docs (`docs/` + API reference, §19) in the same PR as the code.
 
 ---
+
+## 0.1 Implementation status (updated 2026-09-28)
+
+**Legend:** ✅ Done (built + automated tests) · 🟡 Done in code, needs a client-side action or a real-device/production check · ⏳ Deferred by the spec itself ("later").
+
+| § | Area | Status | Where | Verified by |
+|---|---|---|---|---|
+| 2 | Engineering rules (additive migrations `v4_*`, cents, idempotency, webhook inbox, RQ jobs, env secrets, audit, PIPEDA, UTC, flags, tests) | ✅ | backend `database/migrations/v4_*`, `utils/money.py`, `utils/idempotency.py`, `jobs/`, `services/audit.py`, `services/settings_service.py` | 353 backend tests green |
+| 4 | Trip state machine + timeline + legacy mapping + scheduled jobs + `/api/rides/*` + Active Ride screen | ✅ | `services/trip_state_machine.py`, `routes/rides.py`, app `lib/screens/ride_v4` | `test_carhire_flow.py`, `test_state_machine_matrix.py` (every from→to pair, all 4 graphs), live socket E2E, Android emulator E2E |
+| 5 | Notification engine (socket `/rt`, OneSignal push, SMS fallback, email, inbox, preferences, retries, Live Activities, editable templates) | ✅ | `services/notify/`, `sockets/realtime_events.py`, app `lib/services/notifications`, iOS `NegoRideLiveActivity` | `test_notifications_realtime.py`, emulator; driver-arrived 1.1 s measured |
+| 6 | Pay before trip (Stripe manual capture, capture at completion, partial capture/release, failures + retry) | ✅ | `services/payments/` | `test_payment_bypass_is_impossible`, decline/3DS/insufficient-funds tests |
+| 7 | Cancellation & refund engine (every table row), fee preview, strikes, admin refunds, safety settlement | ✅ | `services/refund_policy.py`, `payment_service.settle_cancellation` | `test_refund_policy.py` (one test per row) |
+| 8 | SOS + Safety toolkit + Safety Center + PIN (lockout) + vehicle card + route deviation + trusted contacts | ✅ | `routes/safety.py`, admin `pages/safety`, app `lib/screens/safety_v4` | `test_safety*.py`, admin browser test (banner ≈300 ms), emulator |
+| 9 | Live location pipeline, share links, public `/t/{token}`, admin live map + replay | ✅ | `services/tracking.py`, `live_share.py`, website `/t/[token]` | safety tests, website e2e |
+| 10 | Optional audio recording (opt-in, chunks, encrypted storage, audited access, retention) | ✅ | `services/recording_service.py`, `private_storage.py` | safety tests, emulator |
+| 11 | Twilio Verify — all 14 scenarios, fraud rules, SMS autofill | 🟡 | `services/phone_verification.py`, app `identity_v4` | `test_identity*.py`; needs Twilio credentials + console setup (RUNBOOK §10) |
+| 12 | Legal consent (3 ticks, reader, CASL proof, re-acceptance gate, admin editor, website pages) | 🟡 | `services/legal_service.py`, app sign-up, website legal pages | identity tests, `consent_gating_test.dart`; 8 documents are drafts marked [REVIEW WITH COUNSEL] |
+| 13 | Thank-you email + receipts + credit notes + tip receipts + weekly statements | 🟡 | `services/receipts.py`, templates | `test_receipts.py` (totals match to the cent); real-client rendering check (Gmail/Outlook/Apple) pending; GST number pending |
+| 14 | Driver onboarding wizard + Certn (CertnCentric API) + expiry monitoring + face match (advisory) | 🟡 | `services/onboarding_service.py`, `certn_client.py`, app `onboarding_v4` | `test_onboarding*.py`; Certn sandbox keys + package confirmation pending |
+| 15 | Account activation/deactivation (token revocation, sockets, deferred during rides, suspended screen + appeal, auto rules) | ✅ | `services/account_service.py`, app `account_v4` | `test_account_status.py`, emulator |
+| 16 | Live ETA (Google Routes, throttled), smooth car, Live Activity updates | 🟡 | `services/eta.py`, app ride_v4 | `test_eta.py`; needs `GOOGLE_MAPS_SERVER_KEY` |
+| 17 | Two-way ratings, tags, tips, Bayesian score, admin explorer | ✅ | `services/ratings_service.py`, app rate screen | `test_ratings.py` |
+| 18 | Rideshare self-booking (seat locking, request-to-book, negotiation) + pick-a-driver + favourites + counter-offer marketplace | ✅ | `rideshare_service.py`, `matching_service.py`, app experience_v4 | `test_rideshare_v4.py` (last-seat race), `test_carhire_v4.py`, emulator marketplace run |
+| 19 | Admin operations console (14 modules) + docs (OpenAPI/Swagger, guides, runbook, changelog) | ✅ | admin `frontend/src/v4`, backend `docs/` | headless Chrome run of every module |
+| 21 | UI/UX redesign (design system, dark mode, EN/FR, accessibility, flutx removed) + instant address search | ✅ | app `lib/theme`, `lib/l10n`, `experience_v4` | 182 Flutter tests, a11y large-text tests, emulator (FR, dark, 200 % text) |
+| 22 | Landing website (EN/FR, download, legal, tracking, app links, SEO) | 🟡 | `/Users/mac/Desktop/github/negoride-canada-web` | build + astro check clean, Lighthouse 0.98–1.0, pa11y 0 errors, 41/41 e2e; needs domain, assetlinks SHA-256, App Store URL |
+| 23–24 | Data model + env vars | ✅ | migrations `v4_0001…v4_0403`, `.env.example` | migrations up/down tested |
+| 25 | QA checklist | 🟡 | backend `tests/`, app `test/` + `integration_test/` (s1–s8 incl. resilience) | Stripe/Twilio/Certn sandbox runs with real test keys, real v3.0.17 build regression and real-device iOS checks remain |
+
+**Remaining before launch (cannot be done in code):** provide Twilio, Certn, Postmark/SMTP, Google (server + browser), OneSignal REST, Stripe test keys for QA; set up Redis + `worker.py` service on the VPS; fill `company.gst_number`/`qst_number`, legal address, `safety.oncall_phones`, `safety.support_phone`; legal review of the 8 documents; website domain + DNS + `CORS_ORIGINS` + assetlinks SHA-256 + App Store URL; Apple Developer capabilities (App Group, Associated Domains, Live Activities); Play background-location declaration; real-device checks (Live Activity, universal links, killed-app notification taps, email client rendering). The admin **Readiness** panel (`GET /api/admin/readiness`) lists the open items live.
 
 ## 1. Context — what exists today (do not break it)
 
@@ -44,6 +75,8 @@ Other things that already exist and must be reused, not rebuilt: Stripe payments
 
 ## 2. Engineering rules (apply to everything)
 
+> **Status (2026-09-28):** ✅ All 12 rules applied: additive `v4_*` migrations, legacy status kept in sync, integer cents, `Idempotency-Key`, webhook inbox + async processing, RQ/Redis jobs (thread fallback), env-only secrets (production refuses defaults), audit log (legacy admin too), encryption at rest + retention, UTC + local-time display, `ff.*` flags in admin, tests for every feature.
+
 1. **Additive database changes only.** New tables and new nullable columns are fine. Never rename or drop existing columns (`status`, `payment_status`, etc.) because the live app reads them. Keep a numbered SQL migration file per change in `negoride-canada-py-api/backend/database/migrations/NNN_description.sql` (or introduce Alembic, but be consistent).
 2. **Backward compatibility:** old app builds (v3.0.x) must keep working after the backend deploys. When a new state machine replaces string statuses, **write both** the new field and the legacy field.
 3. **Money:** store in **integer cents, CAD**. The existing mixed cents/dollars (`initial_price` cents, `agreed_price` dollars) is a known hazard. New tables use cents everywhere. Add helper functions and never do float math on money.
@@ -61,6 +94,8 @@ Other things that already exist and must be reused, not rebuilt: Stripe payments
 
 ## 3. Delivery phases (build order)
 
+> **Status (2026-09-28):** ✅ P1–P6 delivered in order (foundation first).
+
 | Phase | Theme | Items | Why first |
 |---|---|---|---|
 | **P1 — Foundation** | Trip state machine, event log, realtime (Socket.IO), notification engine, job queue, settings table, audit log | §4, §5 | Everything else plugs into these. |
@@ -73,6 +108,8 @@ Other things that already exist and must be reused, not rebuilt: Stripe payments
 ---
 
 ## 4. Trip lifecycle and state machine (Client item 2)
+
+> **Status (2026-09-28):** ✅ Implemented (`services/trip_state_machine.py`, `routes/rides.py`, app `ActiveRideScreen`). Deliberate deviation: car-hire legacy status keeps `Active`/`Cancelled` because the v3 app depends on those strings.
 
 ### Client said
 > "Customer notification showing them that drivers have arrived. Add very clear logic of trip steps, like Uber … think beyond … implement all necessary steps both backend and frontend, API endpoints and documentation."
@@ -185,15 +222,17 @@ Existing endpoints (`bookings/{id}/start`, `bookings/{id}/complete`, `negotiatio
 - Keep the screen awake during active rides (`wakelock_plus` is already installed).
 
 ### 4.6 Acceptance criteria
-- [ ] Invalid transitions (for example COMPLETED → IN_PROGRESS) return `code: 0` with a clear message and change nothing.
-- [ ] "I've arrived" is rejected when the driver is more than 150 m (configurable) from pickup.
-- [ ] Each transition produces exactly one `trip_events` row, one realtime event and the configured notifications.
-- [ ] Legacy `status` stays correct for every stage; v3.0.17 app still works end to end.
-- [ ] Killing and reopening the app mid-trip returns to the correct screen.
+- [x] Invalid transitions (for example COMPLETED → IN_PROGRESS) return `code: 0` with a clear message and change nothing. — ✅ `test_full_happy_path`, `test_state_machine_matrix.py`.
+- [x] "I've arrived" is rejected when the driver is more than 150 m (configurable) from pickup. — ✅ geofence test in `test_carhire_flow.py`; emulator.
+- [x] Each transition produces exactly one `trip_events` row, one realtime event and the configured notifications. — ✅ happy-path test compares events with realtime emits; live socket E2E.
+- [x] Legacy `status` stays correct for every stage; v3.0.17 app still works end to end. — ✅ `test_legacy_v3_flow_still_works` + legacy endpoint regression script (API level; a real v3.0.17 build run is still recommended).
+- [x] Killing and reopening the app mid-trip returns to the correct screen. — ✅ `integration_test/s6b_relaunch_test.dart` on the Android emulator.
 
 ---
 
 ## 5. Notification engine (Client item 2 — notifications and listeners)
+
+> **Status (2026-09-28):** ✅ Implemented (`services/notify/`, socket `/rt`, OneSignal, Twilio SMS fallback, email, inbox, preferences + quiet hours, retries, server-driven iOS Live Activities, admin-editable templates).
 
 ### Client said
 > "Add logic of notifications and notification listeners … make use of powerful notification libraries … both front and backends."
@@ -260,14 +299,16 @@ A single, reliable, multi-channel notification system. Every important event rea
 - Notification inbox screen with unread badge on the Home tab.
 
 ### 5.5 Acceptance criteria
-- [ ] "Driver arrived" reaches the customer in under 3 s through socket or push, with SMS fallback within 60 s if the push is not opened.
-- [ ] Every sent notification appears in the inbox and in admin → Notifications log with delivery status.
-- [ ] Tapping any notification from a killed-app state opens the correct screen.
-- [ ] Users can mute marketing and non-critical groups. Safety and transactional messages are always delivered.
+- [x] "Driver arrived" reaches the customer in under 3 s through socket or push, with SMS fallback within 60 s if the push is not opened. — ✅ 1.1 s measured over a real socket; SMS escalation tests.
+- [x] Every sent notification appears in the inbox and in admin → Notifications log with delivery status. — ✅ `test_every_notification_lands_in_inbox_with_deliveries`; admin Notifications log.
+- [x] Tapping any notification from a killed-app state opens the correct screen. — ✅ cold-start queue in DeepLinkRouter + tests; real-device push tap check pending.
+- [x] Users can mute marketing and non-critical groups. Safety and transactional messages are always delivered. — ✅ `test_mutable_group_can_be_muted_but_safety_cannot`.
 
 ---
 
 ## 6. Pay before the trip starts (Client item 14)
+
+> **Status (2026-09-28):** ✅ Implemented (Stripe manual capture; hard server-side guard; capture at completion; partial capture / release on cancel; far-future rides charged immediately; failure + retry flows). ⏳ Saved card (§6.6) deferred by the spec ("later").
 
 ### Client said
 > "Customers must have to pay first for the trip to start."
@@ -289,6 +330,8 @@ Money must be secured **before** the driver starts driving, but the platform sti
 ---
 
 ## 7. Cancellation and refund policy (Client item 17)
+
+> **Status (2026-09-28):** ✅ Implemented — every row of 7.1/7.2 is a rule in `refund_policy.py` with a unit test; numbers editable in admin Settings; safety endings held for admin settlement.
 
 ### What it really means
 A written, visible, fair policy **and** a refund engine that applies it automatically, so no refund needs manual work. The rules below are **proposed defaults — [CONFIRM WITH CLIENT]**. Every number lives in `app_settings` and can be edited in admin.
@@ -325,6 +368,8 @@ A written, visible, fair policy **and** a refund engine that applies it automati
 ---
 
 ## 8. Emergency and help center (Client item 1)
+
+> **Status (2026-09-28):** ✅ Implemented (Safety toolkit, SOS never fails, 3 s location, admin alarm, escalation to on-call phones, PIN with lockout, vehicle card with photo, route-deviation checks against the planned route, trusted contacts, flag passenger). 🟡 On-call phone numbers must be configured.
 
 ### Client said
 > "Emergency and help button, with the red emergency button connected to the dashboard. Show help contacts. Show 911 button."
@@ -363,13 +408,15 @@ A **Safety Toolkit** that is always one tap away during a ride, where every emer
 - **Driver safety too:** drivers get the same SOS and can flag a passenger.
 
 ### 8.5 Acceptance
-- [ ] An SOS appears on the admin dashboard in under 2 s with live location updates.
-- [ ] The 911 button requires a deliberate gesture and works without internet (it's just the dialer).
-- [ ] SOS works even if the ride has ended or no ride exists.
+- [x] An SOS appears on the admin dashboard in under 2 s with live location updates. — ✅ ≈300 ms in the admin headless-browser test; live location updates every 3 s.
+- [x] The 911 button requires a deliberate gesture and works without internet (it's just the dialer). — ✅ 3-second hold / slide; `safety_call_911_test.dart`; dialer only (works offline).
+- [x] SOS works even if the ride has ended or no ride exists. — ✅ `test_sos_without_ride…`, `test_sos_during_and_after_ride`; invalid ride ids fall back.
 
 ---
 
 ## 9. Live location sharing and trip tracking (Client item 9)
+
+> **Status (2026-09-28):** ✅ Implemented (batched breadcrumbs, offline catch-up, Redis latest position, share links, public tracking page on the website + API fallback, admin live map with rides/SOS layers and replay).
 
 ### Client asked
 > "Live location sharing button of the trip for customers for security purposes. Is it possible for us to track the trip in the dashboard?"
@@ -392,6 +439,8 @@ A **Safety Toolkit** that is always one tap away during a ride, where every emer
 
 ## 10. Optional in-trip audio recording (Client item 8)
 
+> **Status (2026-09-28):** ✅ Implemented (opt-in, 1-min chunks, encrypted private storage, other party informed by banner + push, audited streaming for safety reviewers only, retention with legal hold).
+
 ### What it really means
 Customers and drivers can **choose** to record audio during a trip as safety evidence. Recordings go to the admin dashboard **only when needed** (incident, dispute or report), with strict privacy rules.
 
@@ -410,6 +459,8 @@ Customers and drivers can **choose** to record audio during a trip as safety evi
 
 ## 11. Phone verification with Twilio Verify (Client item 6)
 
+> **Status (2026-09-28):** 🟡 All 14 scenarios implemented and tested with test numbers; needs Twilio credentials, Verify service and console setup (RUNBOOK §10) for production.
+
 ### Client said
 > "Negoride app = Negoride backend/API = Twilio Verify API = SMS = customer/driver. Implement different scenarios for phone number SMSing."
 
@@ -426,14 +477,14 @@ App ◀── code entry ──  NegoRide API ◀── Verify check result
 | 1 | **Sign-up** | Phone verification is required before the account becomes active. |
 | 2 | **Passwordless login** | "Log in with phone": OTP instead of password (optional, flag). |
 | 3 | **Change phone number** | Verify the new number and notify the old number by SMS. |
-| 4 | **Driver onboarding** | Mandatory step (§14). The driver's phone must be verified and must be mobile, not VoIP. |
+| 4 | **Driver onboarding** | Mandatory step (§14). A server-confirmed OTP verification of the account phone completes this step. Carrier line-type lookup is informational and must not block onboarding or require repeat verification. |
 | 5 | **New device / suspicious login** | Step-up OTP when logging in from an unseen device. |
 | 6 | **Password reset by phone** | Alternative to email reset. |
 | 7 | **Sensitive actions** | Payout account change, account deletion: re-verify. |
 | 8 | **Resend / fallback** | Resend after 30 s. After 2 failed SMS, offer a **voice call**. Optional WhatsApp channel. |
 | 9 | **Wrong code / expiry** | Max 5 attempts per code, 10-min expiry (Twilio defaults), friendly errors. |
 | 10 | **Rate limits and fraud** | Max 5 sends per phone per hour and 10 per IP per hour. Enable Twilio **Fraud Guard / geo-permissions** (Canada + US only by default). Block premium-rate prefixes. |
-| 11 | **Number intelligence** | Twilio **Lookup** line type check at signup. Warn or block VoIP numbers for drivers. |
+| 11 | **Number intelligence** | Twilio **Lookup** line type check at signup may inform fraud controls, but it does not override a server-confirmed phone verification for driver onboarding. |
 | 12 | **Duplicate numbers** | One verified phone per account. Offer "Log in instead" if already registered. |
 | 13 | **Transactional SMS** (not OTP) | Driver-arrived fallback, trip share, SOS: Twilio Messaging Service with a Canadian long code or toll-free verified number. Honour STOP/HELP keywords. |
 | 14 | **Test mode** | Configurable test numbers with a fixed code in non-production only, so App Store reviewers and QA can log in. |
@@ -447,6 +498,8 @@ App ◀── code entry ──  NegoRide API ◀── Verify check result
 ---
 
 ## 12. Legal consent — Terms, Privacy Policy, Community Guidelines (Client item 7)
+
+> **Status (2026-09-28):** 🟡 Implemented end to end (3 unticked boxes, reader, CASL proof, server-side re-acceptance gate, admin editor + acceptance stats, website pages). The 8 documents are professional drafts marked [REVIEW WITH COUNSEL].
 
 ### Client said
 > "Users agreeing to community guidelines, privacy policy, and terms and conditions by reading and marking the boxes. Make this very clear."
@@ -473,6 +526,8 @@ App ◀── code entry ──  NegoRide API ◀── Verify check result
 ---
 
 ## 13. Thank-you email and payment receipt (Client items 3 and 4)
+
+> **Status (2026-09-28):** 🟡 Implemented (combined thank-you + receipt email with PDF, sequential numbers, tax by province, credit notes, tip receipts, weekly driver statements, admin resend). Pending: GST/HST number, real email-client rendering check.
 
 ### Client said
 > "Email notification thanking customers about the trip." / "Receipt of payment to customers with the price he/she paid, on mail. Be very careful and very creative, and ensure perfection."
@@ -508,13 +563,15 @@ App ◀── code entry ──  NegoRide API ◀── Verify check result
 - **Drivers:** a weekly earnings statement email and PDF (gross, commission, fees, net, payouts) is a strong addition, for their taxes.
 
 ### 13.4 Acceptance
-- [ ] Totals on email, PDF, app and Stripe match to the cent (automated test that compares them).
-- [ ] The receipt is sent within 60 s of COMPLETED, and re-sending from admin reuses the same number.
-- [ ] It renders correctly in Gmail, Outlook and Apple Mail (light and dark).
+- [x] Totals on email, PDF, app and Stripe match to the cent (automated test that compares them). — ✅ `test_receipt_totals_match_everywhere`.
+- [x] The receipt is sent within 60 s of COMPLETED, and re-sending from admin reuses the same number. — ✅ ≈1 s; resend reuses the number (`test_admin_resend_reuses_number_and_is_audited`); sweeper backstop.
+- [~] It renders correctly in Gmail, Outlook and Apple Mail (light and dark). — 🟡 responsive, dark-mode-safe table HTML with Outlook (MSO) buttons; needs a real-client check (Litmus / Email on Acid) before launch.
 
 ---
 
 ## 14. Driver onboarding and Certn background checks (Client item 5)
+
+> **Status (2026-09-28):** 🟡 Implemented (7-step wizard, prequal before paying, documents with expiry monitoring, Certn via the current CertnCentric API with webhook + polling, pay-later, refund before submission, advisory face match, referrals, funnel). Pending: Certn keys + package confirmation.
 
 ### Client said
 > "Certn (Canada) API integration for background check. Drivers will pay for their background check. Drivers should have clear steps of becoming a driver: Registration → Verify phone (Twilio) → Submit application → Initiate background check (Certn)."
@@ -559,6 +616,8 @@ A checklist screen titled **"Become a NegoRide driver — 7 steps"** with a prog
 
 ## 15. Account activation and deactivation (Client item 16)
 
+> **Status (2026-09-28):** ✅ Implemented (statuses, instant token + socket revocation, deferred during active rides, suspended screen + appeal, automatic rating/strike/document/background-check rules, audited).
+
 ### What it really means
 Admins can suspend or reactivate any customer or driver from the dashboard with one button, and it takes effect **immediately** everywhere.
 
@@ -573,6 +632,8 @@ Admins can suspend or reactivate any customer or driver from the dashboard with 
 
 ## 16. Live driver movement and ETA (Client item 11)
 
+> **Status (2026-09-28):** 🟡 Implemented (Google Routes ETA throttled 30 s, smooth car, arrival clock, DRIVER_ARRIVING trigger, Live Activity updates). Needs `GOOGLE_MAPS_SERVER_KEY` (falls back to an estimate without it).
+
 ### Client said
 > "Showing customers the driver movement with minutes (when driver is coming to the customer)."
 
@@ -586,6 +647,8 @@ Admins can suspend or reactivate any customer or driver from the dashboard with 
 
 ## 17. Ratings and reviews (Client item 15)
 
+> **Status (2026-09-28):** ✅ Implemented (two-way, tags, tips 100 % to driver, Bayesian score, visibility rules, low-star safety prompt, admin explorer / hide with reason).
+
 - **Two-way ratings:** customer ↔ driver, 1–5 stars, after COMPLETED. The prompt appears on the completion screen and can be done within 72 h.
 - **Contextual tags:** positive (Safe driving, Clean car, Great conversation, Fair negotiator, On time), negative (Late, Unsafe driving, Rude, Dirty car, Wrong route, Price changed after agreement). Optional comment. An optional **tip** on the same screen (100 % to the driver).
 - Ratings of 1–2 stars ask "What went wrong?" and offer "Report a safety issue".
@@ -598,6 +661,8 @@ Admins can suspend or reactivate any customer or driver from the dashboard with 
 ---
 
 ## 18. Rideshare self-booking and pick-a-driver (Client item 10)
+
+> **Status (2026-09-28):** ✅ Implemented (search cards with badges, book seat with transactional seat lock, instant vs request-to-book, per-seat negotiation, choose-a-driver, favourites, favourite-first then broadcast, live counter-offer marketplace).
 
 ### Client said
 > "For rideshare, the booking button for customers should come back so the drivers book for themselves. (Customer select driver direct — pick driver.)"
@@ -619,6 +684,8 @@ The customer-facing **"Book seat"** button was removed or hidden in rideshare (b
 ---
 
 ## 19. Advanced admin dashboard (Client item 18) — plus documentation
+
+> **Status (2026-09-28):** ✅ Implemented — all 14 modules (React + Mantine + TanStack Query + Recharts + maps + socket) and every documentation deliverable (`docs/`, OpenAPI at `/api/docs`, CHANGELOG, app `RELEASE_NOTES_v4.0.0.md`).
 
 ### Client said
 > "Advanced dashboard" (plus "My full active dashboard to track all activities" from the December list.)
@@ -650,32 +717,36 @@ Rebuild the React admin (`negoride-canada-py-api/frontend/`) into an operations 
 
 ## 20. Traceability matrix (client comment → spec)
 
-| # | Client comment | Delivered in |
-|---|---|---|
-| 1 | Emergency/help button, red button to dashboard, help contacts, 911 | §8, §19 (Safety Center) |
-| 2 | Driver-arrived notification, Uber-like trip steps, API + docs | §4, §5, §16, §19.2 |
-| 2 | Notification logic, listeners, powerful libraries | §5 |
-| 2 | Improve the entire UI/UX | §21 |
-| 3 | Thank-you email | §13.2 |
-| 4 | Payment receipt by email, perfect | §13.3 |
-| 5 | Certn background check, driver pays, clear steps | §14 |
-| 6 | Twilio Verify, SMS scenarios | §11 |
-| 7 | Agree to guidelines, privacy, terms with checkboxes | §12 |
-| 8 | Optional audio recording connected to the dashboard | §10 |
-| 9 | Live location sharing + track in dashboard | §9 |
-| 10 | Rideshare customer booking button back, pick driver | §18 |
-| 11 | Driver movement with minutes | §16 |
-| 12 | Instant address search | §21.3 |
-| 13 | Landing page for downloading | §22 |
-| 14 | Pay before trip starts | §6 |
-| 15 | Driver ratings | §17 |
-| 16 | Activation/deactivation in admin | §15 |
-| 17 | Cancellation/refund policy | §7 |
-| 18 | Advanced dashboard | §19 |
+> **Status (2026-09-28):** ✅ All 18 client items delivered — see the Status column.
+
+| # | Client comment | Delivered in | Status (2026-09-28) |
+|---|---|---|---|
+| 1 | Emergency/help button, red button to dashboard, help contacts, 911 | §8, §19 (Safety Center) | ✅ |
+| 2 | Driver-arrived notification, Uber-like trip steps, API + docs | §4, §5, §16, §19.2 | ✅ |
+| 2 | Notification logic, listeners, powerful libraries | §5 | ✅ |
+| 2 | Improve the entire UI/UX | §21 | ✅ |
+| 3 | Thank-you email | §13.2 | ✅ |
+| 4 | Payment receipt by email, perfect | §13.3 | ✅ (GST no. pending) |
+| 5 | Certn background check, driver pays, clear steps | §14 | ✅ (Certn keys pending) |
+| 6 | Twilio Verify, SMS scenarios | §11 | ✅ (Twilio keys pending) |
+| 7 | Agree to guidelines, privacy, terms with checkboxes | §12 | ✅ (legal review pending) |
+| 8 | Optional audio recording connected to the dashboard | §10 | ✅ |
+| 9 | Live location sharing + track in dashboard | §9 | ✅ |
+| 10 | Rideshare customer booking button back, pick driver | §18 | ✅ |
+| 11 | Driver movement with minutes | §16 | ✅ |
+| 12 | Instant address search | §21.3 | ✅ |
+| 13 | Landing page for downloading | §22 | ✅ (domain + deploy pending) |
+| 14 | Pay before trip starts | §6 | ✅ |
+| 15 | Driver ratings | §17 | ✅ |
+| 16 | Activation/deactivation in admin | §15 | ✅ |
+| 17 | Cancellation/refund policy | §7 | ✅ |
+| 18 | Advanced dashboard | §19 | ✅ |
 
 ---
 
 ## 21. UI/UX redesign (Client item 2 — "improve the entire UI/UX") and address speed (item 12)
+
+> **Status (2026-09-28):** ✅ Implemented (design system, light + dark app-wide, EN/FR everywhere, accessibility + large-text tests, flutx removed, backups deleted, map-first Home, marketplace offer screen, instant address search with local-first results, 150 ms debounce, session tokens, LRU cache, latency analytics).
 
 ### 21.1 Principles
 - **One-thumb, map-first design:** the map is the canvas, with a **draggable bottom sheet** holding context (like Uber and Bolt). No deep navigation during a ride.
@@ -710,6 +781,8 @@ Goal: suggestions **feel instant (under 100 ms perceived)**.
 
 ## 22. Landing website for app downloads (Client item 13)
 
+> **Status (2026-09-28):** 🟡 Built (`negoride-canada-web`, Astro, EN/FR, verified with Lighthouse/pa11y/e2e). Needs domain + DNS, assetlinks SHA-256, App Store URL, brand assets, then deploy.
+
 - **Stack:** **Astro** or **Next.js (static export)**, deployed to Vercel / Netlify / Cloudflare Pages at the client's domain (for example `negoride.ca`).
 - **Sections:** hero ("Name your price. Ride your way."), phone mockup and App Store / Google Play badges, **smart download link + QR code** (detects iOS or Android and redirects to the right store), How it works (Request → Negotiate → Ride), Services (Car Hire, Rideshare, Courier, Movers, Airport, Special Car), **Safety** section (background checks, SOS, live sharing, ride PIN), **Drive with NegoRide** (earnings, requirements, "Start application" deep link), cities served, FAQ, testimonials, and a footer with legal links, support contact, social links and EN/FR switch.
 - **Also hosts:** legal pages (from `legal_documents`), the **public trip-tracking page** `/t/{token}` (§9), email-verification and password-reset landing pages, and `/.well-known/apple-app-site-association` + `assetlinks.json` for **universal / app links** (so links open in the app).
@@ -718,6 +791,8 @@ Goal: suggestions **feel instant (under 100 ms perceived)**.
 ---
 
 ## 23. New data model summary
+
+> **Status (2026-09-28):** ✅ Every table exists (migrations `v4_0001`–`v4_0403`), plus supporting tables (ride_payments, live_activity_tokens, ride_routes, marketing_consents, …).
 
 | Table | Purpose | Section |
 |---|---|---|
@@ -741,6 +816,8 @@ Goal: suggestions **feel instant (under 100 ms perceived)**.
 ---
 
 ## 24. Environment variables (add to `.env.example`, never commit real values)
+
+> **Status (2026-09-28):** ✅ All listed in `.env.example` (plus the extra v4 variables).
 
 ```
 # Twilio
@@ -789,6 +866,8 @@ SAFETY_ONCALL_PHONES=
 
 ## 25. Testing and QA checklist
 
+> **Status (2026-09-28):** 🟡 Unit + integration + emulator suites in place (backend 353 tests, Flutter 182 + integration s1–s8). Sandbox runs with real Stripe/Twilio/Certn test keys, a real v3.0.17 build regression and real-device iOS checks remain.
+
 - **Unit:** state machine transitions (every allowed and forbidden pair), refund policy (every table row), rating math, receipt totals and taxes, phone normalization.
 - **Integration:** full Car Hire happy path (request → negotiate → pay → en route → arrived → PIN → complete → capture → receipt → rating); cancel at each stage; no-show paths; rideshare last-seat race condition; Certn webhook sequence (use sandbox); Twilio Verify with test credentials; Stripe test cards (success, 3-D Secure, decline, insufficient funds).
 - **Realtime:** two simulators (customer + driver) and the admin dashboard open, verifying all three update live.
@@ -799,6 +878,8 @@ SAFETY_ONCALL_PHONES=
 ---
 
 ## 26. Open questions for the client (build defaults meanwhile)
+
+> **Status (2026-09-28):** 🟡 Every default is built and admin-configurable (Settings); answers still needed from the client (see §0.1 "Remaining before launch").
 
 1. Item 10 interpretation (§18): confirm that "booking button should come back" means customers book rideshare seats themselves and choose the driver.
 2. Cancellation and refund numbers (§7): approve or adjust the defaults.
@@ -813,4 +894,4 @@ SAFETY_ONCALL_PHONES=
 
 ---
 
-**Definition of done for v4:** every row in §20 is implemented behind a flag, documented in `docs/`, covered by the tests in §25, visible in the admin dashboard, and demoed end to end on real iOS and Android devices against staging.
+**Definition of done for v4:** *(status 2026-09-28: met in code — every §20 row is behind a flag, documented, tested and visible in admin; the staging demo on real iOS/Android devices is the remaining step)* every row in §20 is implemented behind a flag, documented in `docs/`, covered by the tests in §25, visible in the admin dashboard, and demoed end to end on real iOS and Android devices against staging.

@@ -164,6 +164,7 @@ def refresh_job(ride_type, ride_id, lat, lng, reason='interval'):
     realtime.to_ride(ride_type, ride_id, 'ride.eta_updated', data)
     for cid in R.customer_ids(ride_type, ride):
         realtime.to_user(cid, 'ride.eta_updated', data)
+    push_live_activity(ride_type, ride_id, data)
 
     if target == 'pickup' and stage == 'DRIVER_EN_ROUTE' and ride_type in ('carhire', 'scheduled') \
             and res['seconds'] <= S.get_int('ride.arriving_eta_s'):
@@ -182,3 +183,21 @@ def current(ride_type, ride):
                        ride.eta_updated_at, None)
     st = _get_state(_key(ride_type, ride.id)) or {}
     return st.get('last')
+
+
+def push_live_activity(ride_type, ride_id, data):
+    """iOS Live Activity / Android ongoing notification update (spec §16). The
+    hook lives in the rides/notifications area:
+    `backend.services.notify.live_activity.push_update(ride_type, ride_id, payload)`.
+    Optional — skipped when that module/function doesn't exist; never raises."""
+    try:
+        from backend.services.notify import live_activity
+        fn = live_activity.push_update
+    except (ImportError, AttributeError):
+        return False
+    try:
+        fn(ride_type, int(ride_id), data)
+        return True
+    except Exception:
+        log.exception('live activity push for %s #%s failed', ride_type, ride_id)
+        return False

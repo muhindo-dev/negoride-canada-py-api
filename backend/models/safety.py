@@ -193,3 +193,30 @@ class RecordingChunk(SerializeMixin, db.Model):
     duration_ms = db.Column(db.Integer)
     started_at = db.Column(db.DateTime)
     uploaded_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+
+
+class RideRoute(SerializeMixin, db.Model):
+    """Planned route for a ride (spec §8.4 route deviation). target: pickup|dropoff.
+    `polyline` is a Google encoded polyline (precision 5)."""
+    __tablename__ = 'ride_routes'
+
+    id = db.Column(db.BigInteger, primary_key=True)
+    ride_type = db.Column(db.String(30), nullable=False)
+    ride_id = db.Column(db.BigInteger, nullable=False)
+    target = db.Column(db.String(10), nullable=False)
+    polyline = db.Column(db.Text, nullable=False)
+    distance_m = db.Column(db.Integer)
+    duration_s = db.Column(db.Integer)
+    source = db.Column(db.String(20), nullable=False, default='straight_line')  # google_routes|straight_line
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+
+
+class RidePinFailure(SerializeMixin, db.Model):
+    """One wrong ride-PIN attempt (brute-force lock, sliding window)."""
+    __tablename__ = 'ride_pin_failures'
+
+    id = db.Column(db.BigInteger, primary_key=True)
+    ride_type = db.Column(db.String(30), nullable=False)
+    ride_id = db.Column(db.BigInteger, nullable=False)
+    actor_id = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)

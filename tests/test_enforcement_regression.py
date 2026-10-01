@@ -1,5 +1,6 @@
 import io
 import unittest
+import uuid
 from datetime import datetime, timedelta
 
 from flask_jwt_extended import create_access_token
@@ -9,6 +10,7 @@ from backend.models import db
 from backend.models.negotiation import Negotiation
 from backend.models.negotiation_record import NegotiationRecord
 from backend.models.scheduled_booking import ScheduledBooking
+from backend.models.user import AdminUser
 
 
 class EnforcementRegressionTests(unittest.TestCase):
@@ -18,14 +20,44 @@ class EnforcementRegressionTests(unittest.TestCase):
         cls.ctx = cls.app.app_context()
         cls.ctx.push()
         cls.client = cls.app.test_client()
+        tag = uuid.uuid4().hex[:12]
+        cls.customer = AdminUser(
+            username=f"v4test_enforcement_customer_{tag}",
+            password="test-only",
+            name="Enforcement Test Customer",
+            user_type="Customer",
+            status=1,
+        )
+        cls.driver = AdminUser(
+            username=f"v4test_enforcement_driver_{tag}",
+            password="test-only",
+            name="Enforcement Test Driver",
+            user_type="Driver",
+            status=1,
+        )
+        db.session.add_all([cls.customer, cls.driver])
+        db.session.commit()
+        cls.customer_id = cls.customer.id
+        cls.driver_id = cls.driver.id
 
     @classmethod
     def tearDownClass(cls):
+        customer = db.session.get(AdminUser, cls.customer_id)
+        driver = db.session.get(AdminUser, cls.driver_id)
+        if customer:
+            db.session.delete(customer)
+        if driver:
+            db.session.delete(driver)
+        db.session.commit()
         cls.ctx.pop()
 
     def setUp(self):
-        self.token = create_access_token(identity="1")
-        self.headers = {"Authorization": f"Bearer {self.token}"}
+        self.customer_headers = {
+            "Authorization": f"Bearer {create_access_token(identity=str(self.customer_id))}"
+        }
+        self.driver_headers = {
+            "Authorization": f"Bearer {create_access_token(identity=str(self.driver_id))}"
+        }
         self.created_booking_ids = []
         self.created_negotiation_ids = []
 
@@ -64,7 +96,7 @@ class EnforcementRegressionTests(unittest.TestCase):
                     }
                 ],
             },
-            headers=self.headers,
+            headers=self.customer_headers,
         )
         self.assertEqual(bad_resp.status_code, 400)
 
@@ -92,7 +124,7 @@ class EnforcementRegressionTests(unittest.TestCase):
                     },
                 ],
             },
-            headers=self.headers,
+            headers=self.customer_headers,
         )
         self.assertEqual(ok_resp.status_code, 201)
 
@@ -106,30 +138,42 @@ class EnforcementRegressionTests(unittest.TestCase):
 
         first = db.session.get(ScheduledBooking, first_id)
         second = db.session.get(ScheduledBooking, second_id)
+        first.driver_id = self.driver_id
+        second.driver_id = self.driver_id
         first.status = "confirmed"
         second.status = "confirmed"
+        first.payment_status = "paid"
+        second.payment_status = "paid"
         db.session.commit()
 
         start_second = self.client.post(
-            f"/api/bookings/{second_id}/start", headers=self.headers
+            f"/api/bookings/{second_id}/start", headers=self.driver_headers
         )
         self.assertEqual(start_second.status_code, 409)
 
         start_first = self.client.post(
-            f"/api/bookings/{first_id}/start", headers=self.headers
+            f"/api/bookings/{first_id}/start", headers=self.driver_headers
         )
         self.assertEqual(start_first.status_code, 200)
 
         complete_without_proofs = self.client.post(
-            f"/api/bookings/{first_id}/complete", headers=self.headers
+            f"/api/bookings/{first_id}/complete", headers=self.driver_headers
         )
         self.assertEqual(complete_without_proofs.status_code, 400)
+
+        customer_upload = self.client.post(
+            f"/api/bookings/{first_id}/pickup-proof",
+            data={"photo": (io.BytesIO(b"fakejpeg0"), "pickup.jpg")},
+            content_type="multipart/form-data",
+            headers=self.customer_headers,
+        )
+        self.assertEqual(customer_upload.status_code, 403)
 
         pickup_resp = self.client.post(
             f"/api/bookings/{first_id}/pickup-proof",
             data={"photo": (io.BytesIO(b"fakejpeg1"), "pickup.jpg")},
             content_type="multipart/form-data",
-            headers=self.headers,
+            headers=self.driver_headers,
         )
         self.assertEqual(pickup_resp.status_code, 200)
 
@@ -137,12 +181,12 @@ class EnforcementRegressionTests(unittest.TestCase):
             f"/api/bookings/{first_id}/dropoff-proof",
             data={"photo": (io.BytesIO(b"fakejpeg2"), "dropoff.jpg")},
             content_type="multipart/form-data",
-            headers=self.headers,
+            headers=self.driver_headers,
         )
         self.assertEqual(dropoff_resp.status_code, 200)
 
         complete_with_proofs = self.client.post(
-            f"/api/bookings/{first_id}/complete", headers=self.headers
+            f"/api/bookings/{first_id}/complete", headers=self.driver_headers
         )
         self.assertEqual(complete_with_proofs.status_code, 200)
 
@@ -153,9 +197,9 @@ class EnforcementRegressionTests(unittest.TestCase):
 
     def test_negotiation_exposes_last_two_prices(self):
         n = Negotiation(
-            customer_id=1,
+            customer_id=self.customer_id,
             customer_name="Customer One",
-            driver_id=2,
+            driver_id=self.driver_id,
             driver_name="Driver Two",
             status="Active",
             is_active="Yes",
@@ -174,10 +218,10 @@ class EnforcementRegressionTests(unittest.TestCase):
         db.session.add(
             NegotiationRecord(
                 negotiation_id=n.id,
-                customer_id=1,
-                driver_id=2,
-                last_negotiator_id=1,
-                first_negotiator_id=1,
+                customer_id=self.customer_id,
+                driver_id=self.driver_id,
+                last_negotiator_id=self.customer_id,
+                first_negotiator_id=self.customer_id,
                 price=1000,
                 created_at=base,
             )
@@ -185,10 +229,10 @@ class EnforcementRegressionTests(unittest.TestCase):
         db.session.add(
             NegotiationRecord(
                 negotiation_id=n.id,
-                customer_id=1,
-                driver_id=2,
-                last_negotiator_id=2,
-                first_negotiator_id=1,
+                customer_id=self.customer_id,
+                driver_id=self.driver_id,
+                last_negotiator_id=self.driver_id,
+                first_negotiator_id=self.customer_id,
                 price=1200,
                 created_at=base + timedelta(seconds=1),
             )
@@ -196,10 +240,10 @@ class EnforcementRegressionTests(unittest.TestCase):
         db.session.add(
             NegotiationRecord(
                 negotiation_id=n.id,
-                customer_id=1,
-                driver_id=2,
-                last_negotiator_id=1,
-                first_negotiator_id=1,
+                customer_id=self.customer_id,
+                driver_id=self.driver_id,
+                last_negotiator_id=self.customer_id,
+                first_negotiator_id=self.customer_id,
                 price=900,
                 created_at=base + timedelta(seconds=2),
             )

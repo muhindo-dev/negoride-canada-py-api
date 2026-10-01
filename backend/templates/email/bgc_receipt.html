@@ -1,0 +1,14 @@
+{% extends "_layout.html" %}
+{% block content %}
+<h1 class="ink" style="margin:0 0 12px 0;font-size:22px;color:#111827">{{ title }}</h1>
+<p class="ink" style="margin:0 0 16px 0;color:#111827">{% if fr %}Bonjour{% else %}Hi{% endif %} {{ first_name }},</p>
+<p class="ink" style="margin:0 0 20px 0;color:#111827">{{ preheader }}</p>
+<table role="presentation" width="100%" style="font-size:14px;margin:0 0 20px 0">
+  <tr><td class="muted" style="padding:6px 0;color:#6b7280">{% if fr %}N° de reçu{% else %}Receipt no.{% endif %}</td><td class="ink" align="right" style="padding:6px 0;color:#111827">{{ receipt_number }}</td></tr>
+  <tr><td class="muted" style="padding:6px 0;color:#6b7280">{% if fr %}Date{% else %}Date{% endif %}</td><td class="ink" align="right" style="padding:6px 0;color:#111827">{{ paid_at }}</td></tr>
+  <tr><td class="muted" style="padding:6px 0;color:#6b7280">{% if fr %}Description{% else %}Description{% endif %}</td><td class="ink" align="right" style="padding:6px 0;color:#111827">{{ description }}</td></tr>
+  <tr><td class="muted" style="padding:6px 0;color:#6b7280">{% if fr %}Mode de paiement{% else %}Payment method{% endif %}</td><td class="ink" align="right" style="padding:6px 0;color:#111827">{{ method }}</td></tr>
+  <tr><td class="ink line" style="padding:10px 0;border-top:1px solid #e5e7eb;font-weight:700;color:#111827">{% if fr %}Total payé (CAD){% else %}Total paid (CAD){% endif %}</td><td class="ink line" align="right" style="padding:10px 0;border-top:1px solid #e5e7eb;font-weight:700;color:#111827">{{ amount }}</td></tr>
+</table>
+<p class="muted" style="margin:0;font-size:13px;color:#6b7280">{{ refund_note }}</p>
+{% endblock %}

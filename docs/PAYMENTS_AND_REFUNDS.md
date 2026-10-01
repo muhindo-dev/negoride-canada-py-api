@@ -21,6 +21,30 @@ Code: `backend/services/payments/payment_service.py`, provider layer `gateway.py
 
 Tips and background-check fees use `start_extra_payment()` (immediate capture). Tips credit 100 % to the driver.
 
+### Payment status overlay, failures, offline payments
+
+* **Refund overlay (§4.1 REFUNDED / PARTIALLY_REFUNDED)**: after a money-back refund `capture_status` becomes
+  `partially_refunded` or `refunded` (pre-refund value in `meta.capture_status_before_refund`). Code that means
+  "money was captured" uses `models.money.CAPTURED_STATES`; `is_secured` = authorized / captured /
+  partially_captured / partially_refunded. The ride API exposes `payment.refund_status`.
+* **Failures**: a declined card (`requires_payment_method`, e.g. `insufficient_funds`) → `capture_status='failed'`,
+  `meta.decline_code`; 3-D Secure pending (`requires_action`) → stays `pending`, `failure_reason='authentication_required'`.
+  Both send `payment.failed` once per attempt (with `reason` / `action_required`); the ride stays
+  AWAITING_PAYMENT / PENDING_PAYMENT and the customer retries with `POST …/pay {force_new: true}`. `FakeGateway.simulate_customer_pays(session, decline=True|'insufficient_funds'|'expired_card', requires_action=True)`.
+* **Offline payments** (admin mark-paid): `RidePayment(provider='offline', capture_method='offline',
+  capture_status='captured')`; completion credits the driver as usual; refunds are recorded without calling Stripe
+  (ops returns the money the way it was received); reconciliation skips them.
+
+### Safety endings (§7.1 "pro-rated or $0 after admin review")
+
+A cancellation with rule `safety_review` does **not** move money: the payment gets `settlement_status='safety_review'`
+and `settle_due_at = now + safety.settle_hold_h` (24 h), the admin room gets `payment.safety_review`. The admin decides
+with `POST /api/admin/rides/{type}/{id}/settle-safety {amount_cents, reason}`: an authorized hold is partially captured
+(rest released) or cancelled; captured money is refunded down to `amount_cents`; the driver is credited the fare share
+of the charged amount (net of commission), a receipt is issued when something was charged, `refund.issued` goes to the
+customer, audit `payment.safety_settlement`. `payment_service.auto_release_safety_holds` (every 5 min) releases holds
+nobody decided in time (`settlement_status='auto_released'`).
+
 ## 2. Cancellation & refund engine (spec §7)
 
 `backend/services/refund_policy.py` is a **pure function** `evaluate(ctx, now, cfg) → Decision{allowed, rule_id, fee_cents, refund_cents, driver_share_cents, credit_cents, strike, needs_admin_review, explanation}`; one unit test per policy row (`tests/test_refund_policy.py`). All numbers live in `app_settings` (category *cancellation*) and are editable in admin.
@@ -60,12 +84,26 @@ Every provider call uses a deterministic idempotency key (`rp-{id}-capture`, `rp
 
 Receipts are issued for `carhire`, `scheduled` and `rideshare_booking` rides. There is **one receipt per seat booking** and none for the driver's `rideshare_trip`. Rides paid through the legacy v3 path, which have no `ride_payments` row, still get a receipt (fare from `rides.fare_cents`, payment method "Card"). If a ride has no captured payment, no receipt is issued.
 
+### Sweeper, admin issue, tips after the receipt
+
+* `receipt_jobs.sweep_missing_receipts` (every 60 s): rides COMPLETED / DROPPED_OFF / CLOSED with a captured ride
+  payment older than `receipts.sweep_after_s` (120 s, last 14 days) and no receipt get one (a worker died between
+  capture and receipt). Cancelled rides with a fee capture are not receipted.
+* `POST /api/admin/rides/{type}/{id}/receipt/issue` issues it on demand (job; 202 when queued).
+* **Tips after the ride**: `POST /api/rides/{type}/{id}/tip {amount_cents}` (rider, within `tip.within_h`), independent
+  of the rating. When paid a **tip receipt** `NR-TIP-YYYY-NNNNNN` (`tip_receipts`, own `document_sequences` row
+  `doc_type='tip'`) is rendered, stored (`tip_receipts/{year}/{number}.pdf`) and emailed (`tip.receipt`). The ride
+  receipt is never edited; its API payload gets a `tips` section listing the tip receipts.
+* **Driver copy**: `GET …/receipt.pdf` by the driver renders on the fly without the rider's full name or payment method.
+* **Resend** from admin is a job (HTTP 202).
+
 ### Numbering
 
 | Document | Format | Sequence (`document_sequences`) |
 |---|---|---|
 | Receipt | `NR-2026-000123` | `doc_type='receipt'`, per year |
 | Credit note | `NR-CN-2026-000045` | `doc_type='credit_note'`, per year |
+| Tip receipt | `NR-TIP-2026-000007` | `doc_type='tip'`, per year |
 | Driver statement | `NR-ST-2026-W38-{driver_id}` | deterministic (unique per driver and ISO week) |
 
 The number is allocated with `SELECT … FOR UPDATE` on the sequence row, in the **same transaction** that inserts the document:
@@ -97,7 +135,7 @@ Numbers are never reused, including after test data is deleted.
 | `registration`, `company` | GST/HST and QST numbers, legal name, address, support contact (from settings) |
 | `internal` | **Admin only.** Ride payment id, intent id, commission % and cents, driver fare (feeds the driver statements) |
 
-**Tax math.** Rates live in `tax_rates` in basis points (seeded: ON HST 13 %, QC GST 5 % + QST 9.975 %, AB GST 5 %, and so on). The province comes from `ride.pickup_province`, then the pickup address (", QC H2X…" / "Québec"), then the setting `tax.default_province`.
+**Tax math.** Rates live in `tax_rates` in basis points (seeded: ON HST 13 %, QC GST 5 % + QST 9.975 %, AB GST 5 %, and so on), editable in admin (`GET/POST/PUT /api/admin/finance/tax-rates`, effective-dated, no overlaps per province, audited). The province comes from `ride.pickup_province` (stamped at creation from the pickup lat/lng by `utils/province.py`), then a lat/lng lookup for older rides (`province_source: 'geo'`), then the pickup address (", QC H2X…" / "Québec"), then the setting `tax.default_province`.
 
 With `pricing.tax_inclusive = true` (the default), the tax is **extracted** from the charged amount:
 
@@ -128,6 +166,12 @@ Templates: `backend/templates/email/ride_receipt.html` and `.txt`. They are tabl
 - an "Add a tip" button (`negoride://tip/{type}/{id}`)
 - "Lost an item?" and "Report an issue" (`negoride://support/new?category=…&ride_type=…&ride_id=…`), and the cancellation-policy link
 - the receipt section, with the PDF attached
+
+Branding: the layout shows the logo (`EMAIL_LOGO_URL`, else `{APP_URL}/api/brand/logo.png` served from
+`backend/static/brand/logo.png`) with an alt-text wordmark fallback when images are blocked; PDFs embed the same PNG as
+a data URI. The "Add a tip" button has an Outlook VML (`v:roundrect`) version; dark-mode variants cover the savings box
+and totals (`prefers-color-scheme` and Outlook.com `[data-ogsc]`). Reply-To is `EMAIL_REPLY_TO`, else
+`safety.support_email`. Replace `logo.png` (and `logo.svg`) with the final artwork — same names.
 
 If `GOOGLE_MAPS_STATIC_KEY` / `GOOGLE_MAPS_SERVER_KEY` is missing, the map is omitted. The key appears in the email HTML, so use a key restricted to the Static Maps API and set `GOOGLE_MAPS_URL_SIGNING_SECRET` so the URLs are signed.
 
@@ -186,7 +230,7 @@ Customer and driver endpoints use a Bearer JWT and the `{code, message, data}` e
 Admin endpoints require the role `finance` (`super_admin` always passes). Resend also allows `support` and `ops`.
 
 - Every call is audited: `finance.view`, `personal_data.view`, `finance.export`, `finance.reconciliation`, `receipt.resend`, `finance.statements_run`.
-- Every list accepts `from` / `to` (YYYY-MM-DD, UTC, inclusive), `page` / `per_page` and `format=csv`.
+- Every list accepts `from` / `to` (YYYY-MM-DD, UTC, inclusive), `page` / `per_page` and `format=csv` or `format=xlsx` (Excel, openpyxl; formula-injection safe).
 
 | Method | Path | Notes |
 |---|---|---|
@@ -222,4 +266,4 @@ Admin endpoints require the role `finance` (`super_admin` always passes). Resend
 - Confirm tax-inclusive pricing. If fares must be tax-exclusive, the charge in `payment_service.start_payment` must add the tax first.
 - Confirm the legal name and address for documents, and one vs two emails.
 - Set up a Static Maps key restricted to the Static Maps API, plus a signing secret.
-- Waiting-time, tolls and discount lines appear only when the payment actually charged them (`ride_payments.meta.waiting_fee_cents`, `tolls_cents`, `discount_cents`). The capture currently charges fare + booking fee only.
+- Waiting-time, tolls and discount lines appear only when the payment actually charged them (`ride_payments.meta.waiting_fee_cents`, `tolls_cents`, `discount_cents`) — zero lines are never printed. The capture currently charges fare + booking fee only, so riders normally see fare (+ fee) only; tolls/discounts are not part of the spec-facing output until a feature populates them.

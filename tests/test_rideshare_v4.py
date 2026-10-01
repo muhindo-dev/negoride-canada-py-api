@@ -2,17 +2,32 @@
 negotiation bounds, last-seat race, manifest, departure reminders."""
 import threading
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from backend.models import db
 from backend.models.notification import Notification
 from backend.models.trip import Trip
 from backend.models.trip_booking import TripBooking
 from backend.services import experience_jobs, ride_jobs
+from backend.routes.rideshare_v4 import _day_range
 from tests.conftest import body
 from tests.exp_helpers import _experience_cleanup, make_trip  # noqa: F401
 
 TORONTO = (43.6532, -79.3832)
 OTTAWA = (45.4215, -75.6972)
+
+
+def test_search_date_uses_valid_request_timezone_then_account_fallback(app):
+    user = SimpleNamespace(timezone='America/Toronto')
+    with app.test_request_context('/api/rideshare/search?timezone=America/Vancouver'):
+        start, end = _day_range('2026-07-01', user)
+    assert start == datetime(2026, 7, 1, 7, 0)
+    assert end == datetime(2026, 7, 2, 7, 0)
+
+    with app.test_request_context('/api/rideshare/search?timezone=Invalid/Zone'):
+        start, end = _day_range('2026-07-01', user)
+    assert start == datetime(2026, 7, 1, 4, 0)
+    assert end == datetime(2026, 7, 2, 4, 0)
 
 
 def search(client, auth, user, **params):

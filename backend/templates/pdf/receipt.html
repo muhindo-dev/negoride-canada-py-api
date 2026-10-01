@@ -10,7 +10,7 @@
 <h2>Trip</h2>
 <table class="kv">
   <tr><td class="k">Ride ID</td><td>{{ r.ride_ref }}</td></tr>
-  <tr><td class="k">Rider</td><td>{{ r.rider_name }}</td></tr>
+  <tr><td class="k">Rider</td><td>{{ r.rider_name or r.rider_first }}</td></tr>
   <tr><td class="k">Driver</td><td>{{ r.driver_name }}{% if r.vehicle %} · {{ r.vehicle }}{% endif %}{% if r.plate %} · {{ r.plate }}{% endif %}</td></tr>
   <tr><td class="k">Pickup</td><td>{{ r.pickup_address }}{% if r.pickup_at %}<br><span class="muted">{{ local_time(r.pickup_at, tz) }}</span>{% endif %}</td></tr>
   <tr><td class="k">Drop-off</td><td>{{ r.dropoff_address }}{% if r.dropoff_at %}<br><span class="muted">{{ local_time(r.dropoff_at, tz) }}</span>{% endif %}</td></tr>
@@ -35,7 +35,7 @@
 
 <h2>Payment</h2>
 <table class="kv">
-  <tr><td class="k">Payment method</td><td>{{ t.payment_method }}</td></tr>
+  {% if t.payment_method %}<tr><td class="k">Payment method</td><td>{{ t.payment_method }}</td></tr>{% endif %}
   {% if t.authorized_at %}<tr><td class="k">Authorized</td><td>{{ local_time(t.authorized_at, tz) }}</td></tr>{% endif %}
   {% if t.captured_at %}<tr><td class="k">Charged</td><td>{{ local_time(t.captured_at, tz) }}</td></tr>{% endif %}
 </table>

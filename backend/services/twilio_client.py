@@ -66,11 +66,15 @@ def send_sms(to_e164, body):
     return res.get('sid')
 
 
-def verify_start(to_e164, channel='sms', locale=None):
+def verify_start(to_e164, channel='sms', locale=None, app_hash=None):
+    """Twilio Verify v2 Create Verification. `AppHash` (SMS only) appends the
+    Android SMS Retriever hash to the message so the app can read the code."""
     svc = os.getenv('TWILIO_VERIFY_SERVICE_SID', '')
     data = {'To': to_e164, 'Channel': channel}
     if locale:
         data['Locale'] = locale
+    if app_hash and channel == 'sms':
+        data['AppHash'] = app_hash
     return _req('POST', f'{VERIFY}/Services/{svc}/Verifications', data=data)
 
 

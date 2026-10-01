@@ -107,6 +107,122 @@ def compute_route(origin, destination):
     return res or estimate(origin, destination)
 
 
+# ── encoded polylines (Google format, precision 5) ─────────────────────────
+
+def encode_polyline(points):
+    out, plat, plng = [], 0, 0
+    for lat, lng in points:
+        ilat, ilng = int(round(lat * 1e5)), int(round(lng * 1e5))
+        for v in (ilat - plat, ilng - plng):
+            v = ~(v << 1) if v < 0 else (v << 1)
+            while v >= 0x20:
+                out.append(chr((0x20 | (v & 0x1f)) + 63))
+                v >>= 5
+            out.append(chr(v + 63))
+        plat, plng = ilat, ilng
+    return ''.join(out)
+
+
+def decode_polyline(text):
+    pts, i, lat, lng = [], 0, 0, 0
+    text = text or ''
+    n = len(text)
+    while i < n:
+        vals = []
+        for _ in range(2):
+            shift = result = 0
+            while True:
+                if i >= n:
+                    return pts
+                b = ord(text[i]) - 63
+                i += 1
+                result |= (b & 0x1f) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            vals.append(~(result >> 1) if result & 1 else result >> 1)
+        lat += vals[0]
+        lng += vals[1]
+        pts.append((lat / 1e5, lng / 1e5))
+    return pts
+
+
+def google_route_polyline(origin, destination):
+    """Routes API call that also returns the encoded polyline (planned route for
+    route-deviation checks). Returns {'polyline','seconds','distance_m','source'} or None."""
+    key = server_key()
+    if not key:
+        return None
+    import requests
+    CALLS.append((tuple(origin), tuple(destination)))
+    body = {
+        'origin': {'location': {'latLng': {'latitude': origin[0], 'longitude': origin[1]}}},
+        'destination': {'location': {'latLng': {'latitude': destination[0], 'longitude': destination[1]}}},
+        'travelMode': 'DRIVE', 'routingPreference': 'TRAFFIC_AWARE', 'polylineQuality': 'OVERVIEW',
+    }
+    try:
+        r = requests.post(ROUTES_URL, data=json.dumps(body), timeout=TIMEOUT_S, headers={
+            'Content-Type': 'application/json', 'X-Goog-Api-Key': key,
+            'X-Goog-FieldMask': FIELD_MASK + ',routes.polyline.encodedPolyline'})
+        if r.status_code != 200:
+            log.warning('Routes API (polyline) %s: %s', r.status_code, r.text[:300])
+            return None
+        routes = (r.json() or {}).get('routes') or []
+        poly = ((routes[0].get('polyline') or {}).get('encodedPolyline')) if routes else None
+        if not poly:
+            return None
+        return {'polyline': poly, 'seconds': _parse_duration(routes[0].get('duration')),
+                'distance_m': int(routes[0].get('distanceMeters') or 0), 'source': 'google_routes'}
+    except Exception as exc:
+        log.warning('Routes API (polyline) failed: %s', exc)
+        return None
+
+
+def planned_route(origin, destination):
+    """Google route polyline when a server key is set, else a straight line."""
+    res = google_route_polyline(origin, destination)
+    if res:
+        return res
+    est = estimate(origin, destination)
+    return {'polyline': encode_polyline([tuple(origin), tuple(destination)]), 'seconds': est['seconds'],
+            'distance_m': est['distance_m'], 'source': 'straight_line'}
+
+
+def snap_path_cached(cache_key, points, ttl_s=7 * 24 * 3600):
+    """Snap a recorded path (any length) to roads in ≤100-point requests, cached
+    (Redis or in-process) under `cache_key`. Returns (points, snapped: bool).
+    Without GOOGLE_MAPS_SERVER_KEY the input is returned unchanged."""
+    pts = [(float(a), float(b)) for a, b in points]
+    if not server_key() or len(pts) < 2:
+        return pts, False
+    from backend import jobs
+    rkey = 'negoride:snap:' + cache_key
+    r = jobs.get_redis()
+    if r is not None:
+        try:
+            raw = r.get(rkey)
+            if raw:
+                return [tuple(p) for p in json.loads(raw)], True
+        except Exception:
+            pass
+    with _cache_lock:
+        hit = _cache.get(rkey)
+        if hit and time.monotonic() - hit[0] < ttl_s:
+            return hit[1], True
+    out = []
+    for i in range(0, len(pts) - 1, 99):               # windows of 100 sharing 1 point (continuous path)
+        snapped = snap_to_roads(pts[i:i + 100])
+        out.extend(snapped[1:] if i and snapped else snapped)
+    if r is not None:
+        try:
+            r.set(rkey, json.dumps(out), ex=ttl_s)
+        except Exception:
+            pass
+    with _cache_lock:
+        _cache[rkey] = (time.monotonic(), out)
+    return out, True
+
+
 def snap_to_roads(points, interpolate=False):
     """Snap GPS points [(lat, lng), …] (≤ 100) to roads. Returns the input on failure / no key."""
     key = server_key()

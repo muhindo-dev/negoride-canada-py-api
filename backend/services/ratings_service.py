@@ -263,6 +263,56 @@ def _after_save(ride_type, ride_id, ratee_id, rater_role):
             log.exception('evaluate_rating_rules failed')
 
 
+# ── tip after the rating (independent of it) ───────────────────────────────
+
+def start_tip(user, ride_type, ride_id, amount_cents):
+    """Rider adds a tip after the ride (spec §13, §17) — with or without a rating,
+    within `tip.within_h` of the end. 100 % to the driver; a tip receipt
+    (NR-TIP-…) is emailed when it is paid. Returns the RidePayment (Checkout)."""
+    from backend.models.money import RidePayment
+    from backend.services.payments import payment_service as PS
+    rt = R.normalize_type(ride_type)
+    if rt not in RATEABLE_TYPES:
+        raise RatingError('Tips are added per seat booking, not for the whole trip.', code='not_tippable')
+    ride = R.load(rt, ride_id)
+    if R.role_of(user, rt, ride) != 'customer' or int(user.id) not in R.customer_ids(rt, ride):
+        raise RatingError('Only the rider can add a tip.', code='tip_not_allowed', status=403)
+    if R.current_stage(rt, ride) not in RATEABLE_STAGES:
+        raise RatingError('You can tip once the ride is completed.', code='not_completed', status=409)
+    end = ended_at(rt, ride) or datetime.utcnow()
+    if datetime.utcnow() > end + timedelta(hours=S.get_int('tip.within_h', 72)):
+        raise RatingError('The tipping window for this ride has closed.', code='tip_window_closed', status=410)
+    amount = _int(amount_cents, 'amount_cents', 50, S.get_int('tip.max_cents', 50000))
+    if amount is None:
+        raise RatingError('amount_cents is required (minimum $0.50).', code='bad_amount_cents')
+    driver = R.driver_id(rt, ride)
+    if not driver:
+        raise RatingError('There is no driver to tip on this ride.', code='no_driver', status=409)
+    tips = RidePayment.query.filter_by(ride_type=rt, ride_id=ride.id, purpose='tip', customer_id=user.id).all()
+    for t in tips:
+        if t.capture_status == 'pending' and t.checkout_url and int(t.fare_cents or 0) == amount:
+            return t, True                   # same tip still waiting for Checkout: reuse it
+    try:
+        rp = PS.start_extra_payment('tip', rt, ride.id, user, amount, driver_id=driver,
+                                    description=f'Tip for your NegoRide trip #{ride.id}')
+    except PS.PaymentError as e:
+        raise RatingError(e.message, code=e.code, status=e.status)
+    return rp, False
+
+
+def on_visibility_changed(rating):
+    """Admin hid / restored a rating: recompute the ratee's score and re-run the
+    automatic rating rules (§15 warning / suspension, or lifting them)."""
+    score = recompute_score(rating.ratee_id)
+    try:
+        from backend.services import account_service
+        if rating.role == 'customer' and hasattr(account_service, 'evaluate_rating_rules'):
+            account_service.evaluate_rating_rules(rating.ratee_id)
+    except Exception:
+        log.exception('evaluate_rating_rules failed after visibility change')
+    return score
+
+
 # ── views ───────────────────────────────────────────────────────────────────
 
 def _public(r, include_comment=True):

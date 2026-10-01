@@ -1,6 +1,7 @@
 """Ratings, reviews, tips and the driver profile card (spec §17).
 
     POST /api/rides/{type}/{id}/rating    party   {stars, tags[], comment, tip_cents?}
+    POST /api/rides/{type}/{id}/tip       rider   {amount_cents}  tip after the ride (no rating needed)
     GET  /api/rides/{type}/{id}/rating    party   my rating + other party status
     GET  /api/ratings/tags                any     fixed tag lists (EN/FR) per rater role
     GET  /api/drivers/{id}/profile-card   any     public driver card (first name only)
@@ -50,6 +51,22 @@ def rating_status(user, ride_type, ride_id):
         return success_response('Rating', RS.status_for(user, ride_type, ride_id))
     except (RS.RatingError, R.RideNotFound) as e:
         return _err(e)
+
+
+@ratings_bp.route('/api/rides/<ride_type>/<int:ride_id>/tip', methods=['POST'])
+@jwt_required_with_user
+@idempotent
+def tip(user, ride_type, ride_id):
+    """Add a tip after the ride, independent of the rating {amount_cents}."""
+    data = request.get_json(silent=True) or request.form or {}
+    try:
+        rp, reused = RS.start_tip(user, ride_type, ride_id, data.get('amount_cents'))
+    except (RS.RatingError, R.RideNotFound) as e:
+        return _err(e)
+    return success_response('Tip ready — complete the payment', {
+        'ride_payment_id': rp.id, 'amount_cents': int(rp.fare_cents or 0), 'currency': 'cad',
+        'status': rp.capture_status, 'checkout_url': rp.checkout_url if rp.capture_status == 'pending' else None,
+        'reused': reused}, status_code=200 if reused else 201)
 
 
 @ratings_bp.route('/api/ratings/tags', methods=['GET'])

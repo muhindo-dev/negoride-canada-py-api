@@ -16,11 +16,13 @@ safety_reviewer only. Every write and every personal-data access is audited.
     GET  /api/admin/safety/reports/<id>                   (+ attachment signed URLs, audited)
     POST /api/admin/safety/reports/<id>/review            {status: reviewing|resolved|dismissed, resolution?}
     GET  /api/admin/safety/recordings                     ?ride_type=&ride_id=&incident_id=&status=   safety_reviewer
-    GET  /api/admin/safety/recordings/<id>                chunk signed URLs (audited)              safety_reviewer
+    GET  /api/admin/safety/recordings/<id>                chunk signed URLs + stream_url (audited) safety_reviewer
+    GET  /api/admin/safety/recordings/<id>/chunks/<seq>   authenticated audio stream (Range), EVERY fetch audited
     POST /api/admin/safety/recordings/<id>/hold           {legal_hold: bool}                        safety_reviewer
     GET|POST /api/admin/safety/help-contacts ; PUT|DELETE /api/admin/safety/help-contacts/<id>
-    GET  /api/admin/live/drivers                          ?include_offline_active=1
-    GET  /api/admin/rides/<type>/<id>/route               breadcrumbs for replay
+    GET  /api/admin/live/drivers                          ?include_offline_active=1 (default 1)
+    GET  /api/admin/live/rides                            open requests, rideshare trips, open SOS positions
+    GET  /api/admin/rides/<type>/<id>/route               breadcrumbs for replay (?snap=1 → Roads API, cached)
 """
 from datetime import datetime, timedelta
 
@@ -396,7 +398,9 @@ def recording(admin, rid):
     if not rec:
         return _nf('Recording not found.')
     out = rec.to_dict()
-    out['chunks'] = RS.chunk_urls(rec, admin.id, ttl_s=SIGNED_TTL_S) if rec.status != 'deleted' else []
+    out['chunks'] = RS.chunk_urls(rec, admin.id, ttl_s=SIGNED_TTL_S,
+                                  stream_base=f'/api/admin/safety/recordings/{rec.id}/chunks') \
+        if rec.status != 'deleted' else []
     out['url_ttl_s'] = SIGNED_TTL_S
     if rec.ride_type and rec.ride_id:
         out['trip_events'] = [e.to_dict() for e in TripEvent.query.filter_by(
@@ -406,6 +410,59 @@ def recording(admin, rid):
                 'owner_id': rec.user_id})
     db.session.commit()
     return success_response('Success', out)
+
+
+def _range(header, size):
+    """(start, end) inclusive for a single `bytes=a-b` range, or None."""
+    import re
+    m = re.fullmatch(r'bytes=(\d*)-(\d*)', (header or '').strip())
+    if not m or (not m.group(1) and not m.group(2)):
+        return None
+    if m.group(1):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else size - 1
+    else:
+        start, end = max(0, size - int(m.group(2))), size - 1
+    if start >= size or start > end:
+        return 'invalid'
+    return start, min(end, size - 1)
+
+
+@admin_safety_bp.route('/api/admin/safety/recordings/<int:rid>/chunks/<int:seq>', methods=['GET'])
+@admin_role_required(*RECORDING_ROLES)
+def recording_chunk_stream(admin, rid, seq):
+    """Streams one decrypted audio chunk through the API (S3 or local), so
+    every play / seek / download is audited (`recording.chunk_streamed`)."""
+    from backend.models.safety import RecordingChunk
+    rec = db.session.get(Recording, rid)
+    if not rec or rec.status == 'deleted':
+        return _nf('Recording not found.')
+    c = RecordingChunk.query.filter_by(recording_id=rec.id, seq=seq).first()
+    if not c:
+        return _nf('Chunk not found.')
+    try:
+        data = PS.get(c.storage_key)
+    except PS.StorageError:
+        return _nf('Chunk not found.')
+    rng = _range(request.headers.get('Range'), len(data))
+    audit('recording.chunk_streamed', admin, 'recording', rec.id,
+          meta={'seq': seq, 'bytes': len(data), 'range': request.headers.get('Range'), 'owner_id': rec.user_id,
+                'ride_type': rec.ride_type, 'ride_id': rec.ride_id})
+    db.session.commit()
+    if rng == 'invalid':
+        resp = Response(status=416)
+        resp.headers['Content-Range'] = f'bytes */{len(data)}'
+    elif rng:
+        a, b = rng
+        resp = Response(data[a:b + 1], status=206, mimetype='audio/mp4')
+        resp.headers['Content-Range'] = f'bytes {a}-{b}/{len(data)}'
+    else:
+        resp = Response(data, mimetype='audio/mp4')
+    resp.headers['Accept-Ranges'] = 'bytes'
+    resp.headers['Content-Disposition'] = f'inline; filename="recording-{rec.id}-{seq:05d}.m4a"'
+    resp.headers['Cache-Control'] = 'private, no-store'
+    resp.headers['X-Robots-Tag'] = 'noindex'
+    return resp
 
 
 @admin_safety_bp.route('/api/admin/safety/recordings/<int:rid>/hold', methods=['POST'])
@@ -525,6 +582,11 @@ def live_drivers(admin):
     online = AdminUser.query.filter(AdminUser.ready_for_trip == 'Yes',
                                     AdminUser.user_type.in_(['Driver', 'Pending Driver'])).limit(3000).all()
     by_id = {u.id: u for u in online}
+    # Drivers on an active ride are shown even when they toggled offline
+    # (default); ?include_offline_active=0 shows online drivers only.
+    include_offline = str(request.args.get('include_offline_active', '1')).lower() not in ('0', 'false', 'no')
+    if not include_offline:
+        active = {k: v for k, v in active.items() if k in by_id}
     missing = [d for d in active if d not in by_id]
     if missing:
         for u in AdminUser.query.filter(AdminUser.id.in_(missing)).all():
@@ -563,6 +625,103 @@ def live_drivers(admin):
     return success_response('Success', {'drivers': items, 'counts': counts, 'generated_at': SS.iso(now)})
 
 
+def _pos_of(uid):
+    from backend.services import tracking
+    lt = tracking.latest(uid) if uid else None
+    if lt and lt.get('lat') is not None:
+        return {'lat': lt.get('lat'), 'lng': lt.get('lng'), 'heading': lt.get('heading'), 'at': lt.get('at'),
+                'source': 'live'}
+    u = db.session.get(AdminUser, uid) if uid else None
+    if u and u.current_latitude is not None and u.current_longitude is not None:
+        try:
+            return {'lat': float(u.current_latitude), 'lng': float(u.current_longitude), 'heading': None,
+                    'at': SS.iso(u.last_location_update), 'source': 'last_known'}
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _pt(lat, lng, address=None):
+    return {'lat': SS._f(lat) if lat not in (None, '') else None, 'lng': SS._f(lng) if lng not in (None, '') else None,
+            'address': address}
+
+
+REQUEST_OPEN = ('favourite', 'broadcasting')
+TRIP_LIVE = ('BOARDING', 'IN_PROGRESS')
+
+
+@admin_safety_bp.route('/api/admin/live/rides', methods=['GET'])
+@admin_role_required('ops', 'safety_reviewer', 'support', 'finance')
+def live_rides(admin):
+    """Admin live map layers besides drivers: unassigned car-hire demand,
+    running rideshare trips and every open SOS (customers / ride-less too)."""
+    from backend.models.experience import RideRequest
+    now = datetime.utcnow()
+    first = lambda uid: (R.user_card(uid) or {}).get('first_name') if uid else None  # noqa: E731
+
+    requests_out = []
+    for rr in (RideRequest.query.filter(RideRequest.status.in_(REQUEST_OPEN))
+               .filter((RideRequest.expires_at.is_(None)) | (RideRequest.expires_at > now))
+               .order_by(RideRequest.id.desc()).limit(500).all()):
+        requests_out.append({'kind': 'ride_request', 'id': rr.id, 'ride_type': 'carhire', 'status': rr.status,
+                             'mode': rr.mode, 'service_type': rr.service_type,
+                             'pickup': _pt(rr.pickup_lat, rr.pickup_lng, rr.pickup_address),
+                             'dropoff': _pt(rr.dropoff_lat, rr.dropoff_lng, rr.dropoff_address),
+                             'offer_cents': rr.offer_cents, 'customer': {'id': rr.customer_id,
+                                                                         'first_name': first(rr.customer_id)},
+                             'negotiation_id': rr.negotiation_id, 'created_at': SS.iso(rr.created_at),
+                             'expires_at': SS.iso(rr.expires_at)})
+    for n in (Negotiation.query.filter(Negotiation.trip_stage.in_(('REQUESTED', 'NEGOTIATING')),
+                                       Negotiation.pickup_lat.isnot(None), Negotiation.pickup_lat != '',
+                                       Negotiation.created_at >= now - timedelta(hours=24))
+              .order_by(Negotiation.id.desc()).limit(500).all()):
+        pp = _pt(n.pickup_lat, n.pickup_lng, n.pickup_address)
+        if pp['lat'] is None:
+            continue
+        requests_out.append({'kind': 'negotiation', 'id': n.id, 'ride_type': 'carhire', 'status': n.trip_stage,
+                             'service_type': n.service_type, 'pickup': pp,
+                             'dropoff': _pt(n.dropoff_lat, n.dropoff_lng, n.dropoff_address),
+                             'offer_cents': R.fare_cents('carhire', n) or None,
+                             'customer': {'id': n.customer_id, 'first_name': first(n.customer_id)},
+                             'driver_id': n.driver_id, 'created_at': SS.iso(n.created_at)})
+
+    trips_out = []
+    for t in (Trip.query.filter(Trip.trip_stage.in_(TRIP_LIVE), Trip.driver_id.isnot(None))
+              .order_by(Trip.id.desc()).limit(500).all()):
+        sp, ep = R.pickup_point('rideshare_trip', t), R.dropoff_point('rideshare_trip', t)
+        cids = R.customer_ids('rideshare_trip', t)
+        trips_out.append({'trip_id': t.id, 'ride_type': 'rideshare_trip', 'stage': t.trip_stage,
+                          'driver': {'id': int(t.driver_id), 'first_name': first(t.driver_id)},
+                          'position': _pos_of(int(t.driver_id)),
+                          'start': {'lat': sp[0] if sp else None, 'lng': sp[1] if sp else None,
+                                    'address': t.start_address or t.start_name},
+                          'end': {'lat': ep[0] if ep else None, 'lng': ep[1] if ep else None,
+                                  'address': t.end_address or t.end_name},
+                          'passengers': len(cids), 'seats': t.slots,
+                          'departure_at': SS.iso(t.departure_at), 'started_at': SS.iso(t.started_at)})
+
+    sos_out = []
+    for inc in (SafetyIncident.query.filter(SafetyIncident.status.in_(SS.OPEN_STATUSES))
+                .order_by(SafetyIncident.id.desc()).limit(500).all()):
+        lat = inc.last_lat if inc.last_lat is not None else inc.lat
+        lng = inc.last_lng if inc.last_lng is not None else inc.lng
+        pos = ({'lat': SS._f(lat), 'lng': SS._f(lng), 'at': SS.iso(inc.last_location_at or inc.created_at),
+                'accuracy_m': inc.accuracy_m, 'source': 'incident'} if lat is not None else None)
+        if pos is None:
+            pos = _pos_of(inc.user_id)
+        sos_out.append({'incident_id': inc.id, 'kind': inc.kind, 'status': inc.status, 'severity': inc.severity,
+                        'silent': bool(inc.silent), 'user': {'id': inc.user_id, 'first_name': first(inc.user_id),
+                                                             'role': inc.role},
+                        'ride_type': inc.ride_type, 'ride_id': inc.ride_id, 'position': pos,
+                        'battery_pct': inc.battery_pct, 'created_at': SS.iso(inc.created_at),
+                        'acknowledged_at': SS.iso(inc.acknowledged_at), 'escalated_at': SS.iso(inc.escalated_at)})
+    return success_response('Success', {
+        'requests': requests_out, 'rideshare_trips': trips_out, 'sos': sos_out,
+        'counts': {'requests': len(requests_out), 'rideshare_trips': len(trips_out), 'sos': len(sos_out)},
+        'generated_at': SS.iso(now), 'refresh_s': 10,
+    })
+
+
 @admin_safety_bp.route('/api/admin/rides/<ride_type>/<int:ride_id>/route', methods=['GET'])
 @admin_role_required('ops', 'safety_reviewer', 'support', 'finance')
 def ride_route(admin, ride_type, ride_id):
@@ -589,6 +748,16 @@ def ride_route(admin, ride_type, ride_id):
         dist += R.haversine_m((a['lat'], a['lng']), (b['lat'], b['lng'])) or 0
     pp, dp = R.pickup_point(rt, ride), R.dropoff_point(rt, ride)
     pa, da = R.addresses(rt, ride)
+    snapped = None
+    if request.args.get('snap') in ('1', 'true') and len(pts) > 1:
+        from backend.services import geo_routes as G
+        spts, ok = G.snap_path_cached(f'replay:{rt}:{ride.id}:{uid}:{len(pts)}:{pts[-1]["at"]}',
+                                      [(p['lat'], p['lng']) for p in pts])
+        snapped = {'snapped': ok, 'polyline': G.encode_polyline(spts) if ok else None,
+                   'points': [[round(a, 6), round(b, 6)] for a, b in spts] if ok else None}
+    from backend.services import safety_detection as SD
+    planned = {t: SD.planned_route(rt, ride.id, t) for t in ('pickup', 'dropoff')} \
+        if rt in ('carhire', 'scheduled') else {}
     events = TripEvent.query.filter_by(ride_type=rt, ride_id=ride.id).order_by(TripEvent.id).all()
     audit('ride.route_viewed', admin, 'ride', f'{rt}:{ride.id}', meta={'points': len(pts)})
     db.session.commit()
@@ -604,4 +773,8 @@ def ride_route(admin, ride_type, ride_id):
         'incidents': [SS.incident_dict(i) for i in
                       SafetyIncident.query.filter_by(ride_type=rt, ride_id=ride.id).all()],
         'is_terminal': TSM.is_terminal(rt, R.current_stage(rt, ride)),
+        'snapped': snapped,
+        'planned_routes': [{'target': t, 'polyline': r.polyline, 'distance_m': r.distance_m,
+                            'duration_s': r.duration_s, 'source': r.source, 'created_at': SS.iso(r.created_at)}
+                           for t, r in planned.items() if r is not None],
     })

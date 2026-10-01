@@ -274,17 +274,54 @@ def user_card(user_id, full=False):
     return card
 
 
-def vehicle_card(driver):
+PHOTO_STAGES = ('CONFIRMED', 'DRIVER_EN_ROUTE', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'IN_PROGRESS',
+                'PUBLISHED', 'BOARDING', 'CHECKED_IN', 'RIDING')
+PHOTO_TTL_S = 300
+
+
+def vehicle_card(driver, ride_type=None, ride=None, viewer=None):
     """Vehicle details from the latest approved driver application (falls back
-    to legacy user fields)."""
+    to legacy user fields).
+
+    Safety verification card (§8.4, owned by the safety agent): pass
+    `ride_type`, `ride` and `viewer` to also get `photo_url` — a short-lived
+    (5 min) signed URL of the approved application's `vehicle_front` photo. It is
+    only issued to a party (customer/driver) of that ride while the ride is
+    confirmed and not finished; otherwise `photo_url` is None."""
     if not driver:
         return None
     from backend.models.identity import DriverApplication
     app = DriverApplication.query.filter_by(user_id=driver.id).first()
     if app and (app.vehicle_plate or app.vehicle_make):
-        return {
+        card = {
             'make': app.vehicle_make, 'model': app.vehicle_model, 'year': app.vehicle_year,
             'color': app.vehicle_color, 'plate': app.vehicle_plate, 'seats': app.vehicle_seats,
         }
-    return {'make': None, 'model': driver.automobile, 'year': None, 'color': None,
-            'plate': None, 'seats': driver.max_passengers}
+    else:
+        card = {'make': None, 'model': driver.automobile, 'year': None, 'color': None,
+                'plate': None, 'seats': driver.max_passengers}
+    if ride is not None and viewer is not None:
+        card['photo_url'] = vehicle_photo_url(driver, app, ride_type, ride, viewer)
+    return card
+
+
+def vehicle_photo_url(driver, app, ride_type, ride, viewer):
+    if app is None or app.status != 'approved':
+        return None
+    if role_of(viewer, ride_type, ride) not in ('customer', 'driver'):
+        return None
+    if driver_id(ride_type, ride) != int(driver.id) or current_stage(ride_type, ride) not in PHOTO_STAGES:
+        return None
+    from backend.models.identity import DriverDocument
+    doc = (DriverDocument.query.filter(DriverDocument.application_id == app.id,
+                                       DriverDocument.type == 'vehicle_front',
+                                       DriverDocument.status == 'approved')
+           .order_by(DriverDocument.id.desc()).first())
+    if not doc or not doc.file_path:
+        return None
+    from backend.services import private_storage as PS
+    try:
+        return PS.signed_url(doc.file_path, ttl_s=PHOTO_TTL_S, content_type=doc.mime_type or 'image/jpeg',
+                             actor_id=viewer.id)
+    except Exception:
+        return None

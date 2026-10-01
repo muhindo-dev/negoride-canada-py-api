@@ -25,6 +25,7 @@ from datetime import datetime
 from functools import wraps
 
 from flask import Blueprint, jsonify, request
+from sqlalchemy.exc import IntegrityError
 
 from backend.models import db
 from backend.models.safety import (Recording, RideShareLink, SafetyCheck, SafetyIncident, SafetyReport,
@@ -208,18 +209,32 @@ def add_contact(user):
         return error_response(err, data={'error_code': 'invalid_phone'}, status_code=422)
     if (user.phone_e164 and user.phone_e164 == e164):
         return error_response("You can't add your own number.", data={'error_code': 'own_number'}, status_code=422)
-    count = TrustedContact.query.filter_by(user_id=user.id).count()
+    # Lock the owner's user row so two concurrent adds can't both pass the
+    # 5-contact limit (count + insert are serialised per user).
+    from backend.models.user import AdminUser
+    # (The count is a LOCKING read too: under REPEATABLE READ a plain read would
+    # use the snapshot taken before we waited for the lock.)
+    db.session.query(AdminUser.id).filter(AdminUser.id == user.id).with_for_update().first()
+    count = len(db.session.query(TrustedContact.id).filter(TrustedContact.user_id == user.id)
+                .with_for_update().all())
     limit = S.get_int('safety.max_trusted_contacts')
     if count >= limit:
+        db.session.rollback()
         return error_response(f'You can save up to {limit} trusted contacts.',
                               data={'error_code': 'limit_reached', 'max': limit}, status_code=422)
     if TrustedContact.query.filter_by(user_id=user.id, phone_e164=e164).first():
+        db.session.rollback()
         return error_response('This contact is already saved.', data={'error_code': 'duplicate'}, status_code=409)
+    # New contacts receive auto-shared trips by default (editable per contact).
     c = TrustedContact(user_id=user.id, name=name, phone_e164=e164,
                        relationship=(data.get('relationship') or '')[:40] or None,
-                       auto_share=_bool(data.get('auto_share', False)), created_at=datetime.utcnow())
+                       auto_share=_bool(data.get('auto_share', True)), created_at=datetime.utcnow())
     db.session.add(c)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return error_response('This contact is already saved.', data={'error_code': 'duplicate'}, status_code=409)
     return success_response('Trusted contact saved.', _contact_dict(c), status_code=201)
 
 
@@ -495,14 +510,15 @@ def toolkit(user):
     except SS.SafetyError as e:
         return _err(e)
     ride_out = share = None
-    rec_out = {'mine': None, 'other_party_recording': False, 'banner': None}
+    rec_out = {'mine': None, 'other_party_recording': False, 'banner': None, 'ever_recorded': False,
+               'recordings': []}
     if ride is not None:
         pickup, dropoff = R.addresses(rt, ride)
         pp, dp = R.pickup_point(rt, ride), R.dropoff_point(rt, ride)
         drv = R.driver_id(rt, ride)
         driver_card = R.user_card(drv) if drv else None
         from backend.models.user import AdminUser
-        veh = R.vehicle_card(db.session.get(AdminUser, drv)) if drv else None
+        veh = R.vehicle_card(db.session.get(AdminUser, drv), ride_type=rt, ride=ride, viewer=user) if drv else None
         cids = R.customer_ids(rt, ride)
         ride_out = {
             'ride_type': rt, 'ride_id': ride.id, 'stage': R.current_stage(rt, ride), 'my_role': role,
@@ -523,7 +539,8 @@ def toolkit(user):
         mine = Recording.query.filter_by(user_id=user.id, ride_type=rt, ride_id=ride.id,
                                          status='recording').first()
         rec_out = {'mine': ({**RS.to_dict(mine, user.id), 'upload': RS.upload_info(mine)} if mine else None),
-                   'other_party_recording': st['other_party_recording'], 'banner': st['banner']}
+                   'other_party_recording': st['other_party_recording'], 'banner': st['banner'],
+                   'ever_recorded': st['ever_recorded'], 'recordings': st['recordings']}
     prov = (request.args.get('province') or SS.province_for(user, rt, ride) or '').upper()[:2] or None
     open_inc = (SafetyIncident.query.filter_by(user_id=user.id).filter(SafetyIncident.status.in_(SS.OPEN_STATUSES))
                 .order_by(SafetyIncident.id.desc()).first())

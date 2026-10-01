@@ -190,3 +190,24 @@ def test_suspended_token_is_revoked_for_http(app, make_user, client, auth):
     u.token_version += 1
     db.session.commit()
     assert client.get('/api/users/me', headers=h).status_code == 401
+
+
+def test_postmark_webhook_tracks_opens_and_bounces(app, make_user, client, monkeypatch):
+    import base64
+    monkeypatch.setenv('POSTMARK_WEBHOOK_USER', 'pm')
+    monkeypatch.setenv('POSTMARK_WEBHOOK_PASSWORD', 'secret')
+    u = make_user('customer')
+    n = _send('refund.issued', u.id, {'amount': '$5.00'})
+    d = NotificationDelivery.query.filter_by(notification_id=n.id, channel='email').first()
+    assert d and d.provider_message_id
+    h = {'Authorization': 'Basic ' + base64.b64encode(b'pm:secret').decode()}
+    assert client.post('/api/webhooks/postmark', json={'RecordType': 'Open', 'MessageID': d.provider_message_id},
+                       headers={'Authorization': 'Basic ' + base64.b64encode(b'pm:bad').decode()}).status_code == 401
+    assert client.post('/api/webhooks/postmark', json={'RecordType': 'Open', 'MessageID': d.provider_message_id,
+                                                       'ReceivedAt': '2026-09-27T10:00:00Z'}, headers=h).status_code == 204
+    db.session.rollback()
+    assert db.session.get(NotificationDelivery, d.id).status == 'opened'
+    client.post('/api/webhooks/postmark', json={'RecordType': 'Bounce', 'MessageID': d.provider_message_id,
+                                                'ID': 1, 'Type': 'HardBounce'}, headers=h)
+    db.session.rollback()
+    assert db.session.get(NotificationDelivery, d.id).status == 'failed'

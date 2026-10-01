@@ -12,11 +12,14 @@ STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
 
 
 def _sensitive_guard(user, data):
-    """v4 clients must re-verify their phone (purpose=sensitive_action) before
-    changing the payout account (spec §11.2 #7). v3 clients are unaffected."""
+    """v4 clients (all clients once app.legacy_clients_allowed is off) must re-verify
+    their phone (purpose=sensitive_action) before changing the payout account or
+    opening a Stripe onboarding / dashboard link (spec §11.2 #7). Token in the body
+    `verification_token`, the `X-Verification-Token` header or (GET) ?verification_token=."""
     from backend.services import phone_verification as PV
     return PV.require_sensitive_action(user, (data or {}).get('verification_token')
-                                       or request.headers.get('X-Verification-Token'), data)
+                                       or request.headers.get('X-Verification-Token')
+                                       or request.args.get('verification_token'), data)
 
 
 
@@ -97,11 +100,14 @@ def onboarding_link(user):
     import stripe
     stripe.api_key = STRIPE_SECRET_KEY
 
+    data = request.get_json(silent=True) or request.form or {}
+    blocked = _sensitive_guard(user, data)
+    if blocked is not None:
+        return blocked
     account = PayoutAccount.query.filter_by(user_id=user.id).first()
     if not account or not account.stripe_account_id:
         return error_response("No Stripe account found. Create one first.")
 
-    data = request.get_json(silent=True) or request.form
     base_url = request.host_url.rstrip('/')
     return_url = data.get('return_url', f'{base_url}/api/payout-complete')
     refresh_url = data.get('refresh_url', f'{base_url}/api/payout-refresh')
@@ -128,6 +134,9 @@ def dashboard_link(user):
     """Get Stripe Express Dashboard login link."""
     import stripe
     stripe.api_key = STRIPE_SECRET_KEY
+    blocked = _sensitive_guard(user, request.args)
+    if blocked is not None:
+        return blocked
 
     account = PayoutAccount.query.filter_by(user_id=user.id).first()
     if not account or not account.stripe_account_id:

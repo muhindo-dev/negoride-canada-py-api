@@ -125,10 +125,25 @@ def test_sos_during_and_after_ride(client, auth, make_user, admins):
     # drivers can SOS too
     r = sos(client, auth, driver, key='drv', ride_type='carhire', ride_id=ride.id)
     assert body(r)['data']['incident']['role'] == 'driver'
-    # strangers cannot attach an SOS to someone else's ride
+    # SOS never fails (§8.5): a stranger can't attach an SOS to someone else's
+    # ride, but the SOS itself is still created (no ride) and the rejected ride
+    # is recorded for the safety team.
     stranger = make_user('customer')
     r = sos(client, auth, stranger, key='x', ride_type='carhire', ride_id=ride.id)
-    assert r.status_code == 403
+    assert r.status_code == 201, r.get_json()
+    inc = body(r)['data']['incident']
+    assert inc['ride_id'] is None and inc['status'] == 'open'
+    db.session.rollback()
+    row = db.session.get(SafetyIncident, inc['id'])
+    assert f'carhire#{ride.id}' in row.notes and 'forbidden' in row.notes
+    # unknown ride / garbage ids / unknown type → fall back to the caller's active ride
+    for i, (rt, rid) in enumerate((('carhire', 999999999), ('carhire', 'abc'), ('spaceship', 1), ('carhire', None))):
+        r = sos(client, auth, customer, key=f'fb-{i}', ride_type=rt, ride_id=rid)
+        assert r.status_code == 201, (rt, rid, r.get_json())
+    ride.trip_stage = 'IN_PROGRESS'
+    db.session.commit()
+    r = sos(client, auth, customer, key='fb-active', ride_type='carhire', ride_id=999999999)
+    assert body(r)['data']['incident']['ride_id'] == ride.id
 
 
 def test_incident_location_updates_and_cancel(client, auth, make_user, admins):
@@ -498,6 +513,7 @@ def test_retention_deletes_old_unheld_recordings(client, auth, make_user):
     db.session.add(old_loc)
     db.session.commit()
 
+    started = datetime.utcnow() - timedelta(seconds=5)
     stats = safety_jobs.retention_cleanup(scope_user_ids=[user.id])
     db.session.rollback()
     assert db.session.get(Recording, plain_id).status == 'deleted' and not PS.exists(plain_key)
@@ -506,7 +522,11 @@ def test_retention_deletes_old_unheld_recordings(client, auth, make_user):
     assert db.session.get(Recording, case_rec.id).status == 'stopped'   # open case
     assert stats['ride_locations_deleted'] >= 1
     assert RideLocation.query.filter_by(ride_id=987654321).count() == 0
-    assert AuditLog.query.filter_by(action='recording.retention_deleted', entity_id=str(plain_id)).count() == 1
+    # Scoped to this run: recording ids can be re-issued (MySQL 5.7 AUTO_INCREMENT
+    # reset) and audit rows of earlier runs are — correctly — never deleted.
+    assert AuditLog.query.filter(AuditLog.action == 'recording.retention_deleted',
+                                 AuditLog.entity_id == str(plain_id),
+                                 AuditLog.created_at >= started).count() == 1
 
 
 # ── admin ───────────────────────────────────────────────────────────────────

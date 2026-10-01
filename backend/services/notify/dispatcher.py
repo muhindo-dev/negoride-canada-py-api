@@ -34,6 +34,21 @@ ESCALATE_AFTER_S = 60
 _env = Environment(undefined=Undefined, autoescape=False)
 
 
+def template_for(spec, event_key, lang):
+    """(title, body) templates: an admin override (notification_template_overrides)
+    wins over the catalogue copy; empty override fields fall back."""
+    title, body = spec['title'].get(lang) or spec['title']['en'], spec['body'].get(lang) or spec['body']['en']
+    try:
+        from backend.models.notification import NotificationTemplateOverride as O
+        row = O.query.filter_by(event_key=event_key, lang=lang).first()
+        if row is not None:
+            title = row.title if row.title not in (None, '') else title
+            body = row.body if row.body not in (None, '') else body
+    except Exception:
+        db.session.rollback()
+    return title, body
+
+
 def render(template, context):
     if not template:
         return ''
@@ -126,8 +141,9 @@ def notify_now(event_key, user_ids, context, dedupe_key=None):
         per_user = ctx.pop('per_user', {}) or {}
         ctx.update(per_user.get(str(uid), per_user.get(uid, {})))
         lang = lang_of(user)
-        title = render(spec['title'][lang], ctx) or render(spec['title']['en'], ctx)
-        body = render(spec['body'][lang], ctx) or render(spec['body']['en'], ctx)
+        t_tpl, b_tpl = template_for(spec, event_key, lang)
+        title = render(t_tpl, ctx) or render(spec['title']['en'], ctx)
+        body = render(b_tpl, ctx) or render(spec['body']['en'], ctx)
         route = render(spec['route'] or '', ctx) or None
         data = {k: v for k, v in ctx.items() if isinstance(v, (str, int, float, bool)) or v is None}
         data.update({'event': event_key, 'route': route})
@@ -145,6 +161,10 @@ def notify_now(event_key, user_ids, context, dedupe_key=None):
         deliveries = [NotificationDelivery(notification_id=n.id, channel='inbox', status='delivered',
                                            attempts=1, sent_at=datetime.utcnow(), delivered_at=datetime.utcnow())]
         for ch in channels_for(spec, user, _prefs(uid)):
+            if ch == 'live_activity' and not _has_live_activity(uid, ctx):
+                continue       # only iOS riders with a registered activity for this ride
+            if ch == 'email' and getattr(user, 'email_bounced_at', None):
+                continue       # hard bounce / spam complaint → email suppressed (inbox still has it)
             deliveries.append(NotificationDelivery(notification_id=n.id, channel=ch, status='queued'))
         db.session.add_all(deliveries)
         db.session.commit()
@@ -152,11 +172,50 @@ def notify_now(event_key, user_ids, context, dedupe_key=None):
         for d in deliveries:
             if d.channel != 'inbox':
                 deliver(d.id)
-        if spec['critical'] and spec['sms_fallback'] and S.flag('sms_fallback') \
+        # Every critical event that goes out by push escalates to SMS when the
+        # push isn't opened in time (spec §5.2) — not only the sms_fallback ones.
+        if spec['critical'] and S.flag('sms_fallback') \
                 and any(d.channel == 'push' for d in deliveries) \
                 and not any(d.channel == 'sms' for d in deliveries):
             jobs.enqueue_in(ESCALATE_AFTER_S, escalate_if_unopened, n.id)
     return created
+
+
+def _has_live_activity(user_id, ctx):
+    from backend.services.notify import live_activity
+    return live_activity.enabled() and live_activity.has_active(user_id, ctx.get('ride_type'), ctx.get('ride_id'))
+
+
+def admin_ids(roles=('ops',)):
+    """Active admin users holding any of `roles` (super_admin always included;
+    legacy Admin / Super Admin users count as super_admin)."""
+    from sqlalchemy import or_
+    conds = [AdminUser.user_type.in_(('Admin', 'Super Admin')), AdminUser.admin_roles.like('%super_admin%')]
+    for r in roles or ():
+        conds.append(AdminUser.admin_roles.like(f'%{r}%'))
+    q = AdminUser.query.filter(or_(*conds), AdminUser.deleted_at.is_(None), AdminUser.status == 1)
+    out = []
+    for u in q.limit(500):
+        mine = u.get_admin_roles()
+        if 'super_admin' in mine or any(r in mine for r in (roles or ())):
+            out.append(u.id)
+    return out
+
+
+def notify_admins(event_key, context=None, roles=('ops',), *, dedupe_key=None, realtime_event=None):
+    """Notify the ops console: every admin with one of `roles` gets the catalogue
+    event (inbox + push + email per the catalogue), and the admin socket room
+    gets `realtime_event` (default: the event key). Queued after commit.
+
+        notify_admins('admin.background_check_review', {'user_id': 42, 'name': 'Sam',
+                      'result': 'consider', 'check_id': 7}, roles=('ops', 'safety_reviewer'))
+    """
+    ids = admin_ids(roles)
+    if ids:
+        notify(event_key, ids, context, dedupe_key=dedupe_key)
+    from backend.services import realtime
+    jobs.enqueue_after_commit(realtime.to_admins, realtime_event or event_key, dict(context or {}))
+    return ids
 
 
 def _deep_link(route, ctx):

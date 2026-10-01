@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # Start the coturn TURN/STUN server for WebRTC NAT traversal
 # Prerequisites: brew install coturn (macOS) or apt install coturn (Linux)

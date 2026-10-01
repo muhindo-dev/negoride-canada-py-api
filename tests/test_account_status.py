@@ -29,9 +29,12 @@ def test_suspension_revokes_existing_jwt_immediately(client, auth, make_user):
     realtime.SENT.clear()
     r = _suspend(client, auth, admin, u)
     assert body(r)['code'] == 1 and body(r)['data']['applied'] is True, body(r)
-    # the old token is dead everywhere, even on endpoints suspended users may call
-    assert client.get('/api/users/me', headers=old).status_code == 401
-    assert client.get('/api/account/status', headers=old).status_code == 401
+    # the old token is dead everywhere; because the account is now inactive the app gets
+    # the account_blocked payload (suspended screen) instead of a plain 401
+    for path in ('/api/users/me', '/api/account/status', '/api/wallet'):
+        r = client.get(path, headers=old)
+        assert r.status_code == 403 and body(r)['data']['error_code'] == 'account_blocked', (path, body(r))
+        assert body(r)['data']['account_status'] == 'suspended' and body(r)['data']['can_appeal'] is True
     assert any(ev == 'account.status_changed' and room == f'user:{u.id}' for ev, _d, room in realtime.SENT)
 
     db.session.rollback()
@@ -46,7 +49,11 @@ def test_suspension_revokes_existing_jwt_immediately(client, auth, make_user):
     r = client.post('/api/users/login', json={'email': u.email, 'password': 'Test1234!'})
     assert body(r)['code'] == 0 and body(r)['data']['account_status'] == 'suspended'
     r = client.post('/api/users/login', json={'email': u.email, 'password': 'Test1234!'}, headers=v4())
-    tok = {'Authorization': f"Bearer {body(r)['data']['token']}"}
+    b = body(r)
+    assert r.status_code == 403 and b['code'] == 0 and b['data']['error_code'] == 'account_blocked'
+    assert b['data']['restricted'] is True and b['data']['reason_code'] == 'harassment' and b['data']['suspended_until']
+    assert b['data']['can_appeal'] is True and b['data']['user']['id'] == u.id
+    tok = {'Authorization': f"Bearer {b['data']['token']}"}
     st = body(client.get('/api/account/status', headers=tok))['data']
     assert st['account_status'] == 'suspended' and st['can_appeal'] is True and st['reason_category'] == 'conduct'
     assert st['suspended_until']
@@ -65,6 +72,9 @@ def test_suspension_revokes_existing_jwt_immediately(client, auth, make_user):
                     json={'action': 'reactivate', 'reason_code': 'appeal_granted', 'reason_text': 'Appeal upheld'},
                     headers=auth(admin))
     assert body(r)['data']['account_status'] == 'active'
+    # the restricted token is void once the account is active again → log in again
+    r = client.get('/api/account/status', headers=tok)
+    assert r.status_code == 401 and body(r)['data']['error_code'] == 'session_revoked'
     db.session.rollback()
     u = db.session.get(AdminUser, u.id)
     assert u.status == 1 and u.suspended_until is None

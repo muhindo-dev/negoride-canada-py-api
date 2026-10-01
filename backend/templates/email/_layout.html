@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="{{ lang or 'en' }}" xmlns="http://www.w3.org/1999/xhtml">
+<html lang="{{ lang or 'en' }}" xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,6 +7,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="supported-color-schemes" content="light dark">
 <title>{{ title }}</title>
+<!--[if mso]><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml><![endif]-->
 <style>
   body{margin:0;padding:0;background:#f3f4f6;-webkit-text-size-adjust:100%;}
   table{border-collapse:collapse;}
@@ -32,8 +33,10 @@
   <tr><td align="center" style="padding:24px 12px">
     <table role="presentation" width="600" class="container" style="width:600px;max-width:600px">
       <tr><td style="padding:8px 4px 16px 4px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+        {% if logo_url %}<img src="{{ logo_url }}" width="180" height="48" alt="NegoRide Canada" style="display:block;border:0;outline:none;width:180px;height:48px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:20px;font-weight:800;line-height:48px;color:{{ brand_color }}">{% else %}
+        {# Wordmark fallback when no logo URL is configured #}
         <span style="display:inline-block;background:{{ brand_color }};color:#111;font-weight:800;border-radius:8px;padding:6px 10px;font-size:15px">NegoRide</span>
-        <span class="muted" style="font-size:13px;color:#6b7280;padding-left:6px">Canada</span>
+        <span class="muted" style="font-size:13px;color:#6b7280;padding-left:6px">Canada</span>{% endif %}
       </td></tr>
       <tr><td class="card px" style="background:#ffffff;border-radius:16px;padding:28px 32px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.55">
         {% block content %}{% endblock %}

@@ -149,6 +149,10 @@ def test_tax_exclusive_adds_on_top():
 
 def test_province_detection(make_user):
     _, _, neg, _ = paid_carhire(make_user, province=None, capture=False)
+    neg.pickup_province = None
+    neg.pickup_lat, neg.pickup_lng = '45.5019', '-73.5674'          # Montréal
+    assert RC.province_of('carhire', neg) == ('QC', 'geo')
+    neg.pickup_lat = neg.pickup_lng = None
     neg.pickup_address = '1 Rue Sainte-Catherine, Montréal, QC H2X 1Z4'
     assert RC.province_of('carhire', neg) == ('QC', 'address')
     neg.pickup_address = 'Somewhere'

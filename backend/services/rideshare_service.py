@@ -68,6 +68,10 @@ def is_bookable(trip):
 def create_booking(customer, trip_id, seats=1, offered_price_per_seat_cents=None, pickup=None, note=None,
                    commit=True):
     """Book seats on a published trip. Returns the TripBooking (PENDING_PAYMENT or REQUESTED)."""
+    from backend.services.phone_verification import PHONE_REQUIRED_MESSAGE, ride_phone_block
+    _pv_block = ride_phone_block(customer)   # ff.phone_required_signup (§11.2 #1)
+    if _pv_block is not None:
+        raise BookingError(PHONE_REQUIRED_MESSAGE, code='phone_verification_required', status=403)
     try:
         seats = int(seats or 1)
     except (TypeError, ValueError):

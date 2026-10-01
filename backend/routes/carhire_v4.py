@@ -3,15 +3,18 @@
 Customer
     GET    /api/carhire/nearby-drivers?lat&lng&service_type
     POST   /api/carhire/requests                 {mode, driver_id?, pickup{lat,lng,address}, dropoff{…}, offer_cents, service_type, note?}
-    GET    /api/carhire/requests/{id}
+    GET    /api/carhire/requests/{id}                 live offer list (`live_offers`) with per-offer expiry
     POST   /api/carhire/requests/{id}/cancel
+    POST   /api/carhire/requests/{id}/offers/{offer_id}/accept    take a driver's counter → PRICE_AGREED
+    POST   /api/carhire/requests/{id}/offers/{offer_id}/counter   {price_cents} counter back to that driver
     GET    /api/favourite-drivers
     POST   /api/favourite-drivers                {driver_id}
     DELETE /api/favourite-drivers/{driver_id}
     GET    /api/pricing/fair-range?from_lat&from_lng&to_lat&to_lng&service_type
 Driver
     GET    /api/carhire/requests/incoming
-    POST   /api/carhire/requests/{id}/accept     {counter_cents?}
+    POST   /api/carhire/requests/{id}/accept     {counter_cents?}  (no counter: take the rider's price /
+                                                  the rider's counter → match; counter: marketplace offer)
     POST   /api/carhire/requests/{id}/decline
     GET    /api/driver/demand-heatmap?lat&lng&radius_km
 Parties
@@ -90,6 +93,10 @@ def nearby_drivers(user):
 @jwt_required_with_user
 @idempotent
 def create_request(user):
+    from backend.services import phone_verification as PV
+    blocked = PV.require_phone_for_rides(user, _body())   # ff.phone_required_signup (§11.2 #1)
+    if blocked is not None:
+        return blocked
     try:
         req, res = M.create_request(user, _body())
     except (M.MatchError, R.RideNotFound) as e:
@@ -143,10 +150,43 @@ def accept_request(user, request_id):
     except Exception as e:  # MatchError / TransitionError
         return _err(e)
     db.session.rollback()
+    if neg is None:   # counter-offer: no match yet — the rider decides
+        o = RideRequestOffer.query.filter_by(request_id=req.id, driver_id=user.id).first()
+        return success_response('Counter-offer sent', {'request_id': req.id, 'negotiation': None,
+                                                       'offer': M.offer_card(o) if o else None})
     from backend.models.negotiation import Negotiation
     neg = db.session.get(Negotiation, neg.id)
-    return success_response('You got the ride' if neg.trip_stage != 'NEGOTIATING' else 'Counter-offer sent',
-                            {'request_id': req.id, 'negotiation': neg.to_dict()})
+    return success_response('You got the ride', {'request_id': req.id, 'negotiation': neg.to_dict()})
+
+
+@carhire_v4_bp.route('/api/carhire/requests/<int:request_id>/offers/<int:offer_id>/accept', methods=['POST'])
+@jwt_required_with_user
+@idempotent
+def customer_accept_offer(user, request_id, offer_id):
+    """Customer accepts a driver's counter-offer → negotiation at PRICE_AGREED
+    (agreed price = the counter), all other offers withdrawn."""
+    try:
+        req, neg = M.accept_offer(user, request_id, offer_id)
+    except Exception as e:  # MatchError / TransitionError
+        return _err(e)
+    db.session.rollback()
+    from backend.models.negotiation import Negotiation
+    neg = db.session.get(Negotiation, neg.id)
+    return success_response('Offer accepted', {'request': M.request_out(req), 'negotiation': neg.to_dict()})
+
+
+@carhire_v4_bp.route('/api/carhire/requests/<int:request_id>/offers/<int:offer_id>/counter', methods=['POST'])
+@jwt_required_with_user
+@idempotent
+def customer_counter_offer(user, request_id, offer_id):
+    """Customer counters one driver's counter-offer {price_cents}."""
+    data = _body()
+    try:
+        req, offer = M.customer_counter(user, request_id, offer_id, data.get('price_cents'))
+    except M.MatchError as e:
+        return _err(e)
+    return success_response('Counter-offer sent to the driver', {'request_id': req.id,
+                                                                  'offer': M.offer_card(offer)})
 
 
 @carhire_v4_bp.route('/api/carhire/requests/<int:request_id>/decline', methods=['POST'])
@@ -255,7 +295,7 @@ def places_popular():
 @carhire_v4_bp.route('/api/analytics/events', methods=['POST'])
 def analytics_events():
     user = get_current_user()   # optional auth
-    ip = (request.headers.get('X-Forwarded-For', '') or request.remote_addr or '').split(',')[0].strip()
+    ip = (request.remote_addr or '').strip()   # ProxyFix resolves the trusted hop (app.py)
     data = _body()
     events = data.get('events') if isinstance(data, dict) else None
     if events is None and isinstance(data, dict) and data.get('name'):

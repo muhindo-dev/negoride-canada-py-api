@@ -129,19 +129,22 @@ def refresh_status(user):
 @location_bp.route('/api/update-location', methods=['POST'])
 @jwt_required_with_user
 def update_location(user):
-    """Update user's GPS coordinates."""
-    data = request.get_json(silent=True) or request.form
-    lat = data.get('latitude', data.get('lati'))
-    lng = data.get('longitude', data.get('long'))
+    """Update user's GPS coordinates.
 
-    if lat is None or lng is None:
+    Body: a single point {latitude|lat, longitude|lng, speed?, heading?,
+    accuracy?, recorded_at?} and/or a batch `points: [{lat, lng, speed, heading,
+    accuracy, recorded_at}]` (offline catch-up, ≤ 500). Old / out-of-order points
+    are stored as breadcrumbs but don't move the live position."""
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+    has_point = data.get('latitude', data.get('lat', data.get('lati'))) is not None
+    if not has_point and not isinstance(data.get('points'), list):
         return error_response("latitude and longitude are required")
 
     # v4: one pipeline for every position (breadcrumbs, live map, ETA, arrival
     # detection, safety checks) — see services/tracking.py
     from backend.services import tracking
     try:
-        tracking.ingest(user, data)
+        _live, _ctx, stats = tracking.ingest_batch(user, data)
     except tracking.LocationError as e:
         db.session.rollback()
         return error_response(str(e))
@@ -151,6 +154,10 @@ def update_location(user):
         'longitude': user.current_longitude,
         'current_address': user.current_address,
         'updated_at': str(user.updated_at),
+        'points_received': stats['received'],
+        'points_stored': stats['stored'],
+        'points_rejected': stats['rejected'],
+        'live': stats['live'],
     })
 
 

@@ -338,9 +338,16 @@ paths:
     post:
       tags:
       - Admin
-      summary: Admin assigns driver to booking.
+      summary: Admin assigns (or reassigns) the driver — same rules as the v4 POST /api/admin/rides/scheduled/{id}/reassign
+        (before pickup only, approved active driver, audited, parties notified). A reason is requir
       operationId: admin.bookings_assign_driver_post
-      description: 'Admin assigns driver to booking.
+      description: 'Admin assigns (or reassigns) the driver — same rules as the v4
+
+        POST /api/admin/rides/scheduled/{id}/reassign (before pickup only, approved
+
+        active driver, audited, parties notified). A reason is required when
+
+        replacing an already-assigned driver.
 
 
         Auth: Admin (role-based).'
@@ -374,9 +381,9 @@ paths:
     post:
       tags:
       - Admin
-      summary: Admin cancels a booking.
+      summary: Admin cancels a scheduled booking (state machine + refund policy).
       operationId: admin.bookings_cancel_post
-      description: 'Admin cancels a booking.
+      description: 'Admin cancels a scheduled booking (state machine + refund policy).
 
 
         Auth: Admin (role-based).'
@@ -410,9 +417,14 @@ paths:
     post:
       tags:
       - Admin
-      summary: Admin force-marks booking as paid.
+      summary: 'Admin marks a booking paid outside Stripe (cash, e-transfer, comp): records an offline RidePayment (provider
+        ''offline'', captured) and confirms the booking through the state machine. Body: {amount_cent'
       operationId: admin.bookings_mark_paid_post
-      description: 'Admin force-marks booking as paid.
+      description: 'Admin marks a booking paid outside Stripe (cash, e-transfer, comp):
+
+        records an offline RidePayment (provider ''offline'', captured) and confirms
+
+        the booking through the state machine. Body: {amount_cents?, reason}.
 
 
         Auth: Admin (role-based).'
@@ -446,9 +458,9 @@ paths:
     post:
       tags:
       - Admin
-      summary: Admin updates booking status.
+      summary: Admin sets a scheduled booking's legacy status through the state machine.
       operationId: admin.bookings_update_status_post
-      description: 'Admin updates booking status.
+      description: 'Admin sets a scheduled booking''s legacy status through the state machine.
 
 
         Auth: Admin (role-based).'
@@ -1166,6 +1178,175 @@ paths:
                 $ref: '#/components/schemas/Envelope'
       security:
       - bearerAuth: []
+  /api/admin/finance/tax-rates:
+    get:
+      tags:
+      - Admin · Finance
+      summary: tax rates list
+      operationId: admin_finance.tax_rates_list_get
+      description: 'Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
+    post:
+      tags:
+      - Admin · Finance
+      summary: New effective-dated rate. To change a rate from a date, close the current row (PUT effective_to = day before)
+        and create the new one; rows of one province may not overlap.
+      operationId: admin_finance.tax_rates_create_post
+      description: 'New effective-dated rate. To change a rate from a date, close the current
+
+        row (PUT effective_to = day before) and create the new one; rows of one
+
+        province may not overlap.
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+  /api/admin/finance/tax-rates/{rate_id}:
+    patch:
+      tags:
+      - Admin · Finance
+      summary: tax rates update
+      operationId: admin_finance.tax_rates_update_patch
+      description: 'Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters: &id007
+      - name: rate_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+      security: &id008
+      - bearerAuth: []
+    put:
+      tags:
+      - Admin · Finance
+      summary: tax rates update
+      operationId: admin_finance.tax_rates_update_put
+      description: 'Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters: *id007
+      security: *id008
+  /api/admin/finance/tip-receipts:
+    get:
+      tags:
+      - Admin · Finance
+      summary: Tip receipts (NR-TIP-YYYY-NNNNNN) ?q=number&ride_type=&ride_id=&customer_id=&driver_id= (+csv/xlsx).
+      operationId: admin_finance.tip_receipts_list_get
+      description: 'Tip receipts (NR-TIP-YYYY-NNNNNN) ?q=number&ride_type=&ride_id=&customer_id=&driver_id= (+csv/xlsx).
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
+  /api/admin/finance/tip-receipts/{tip_receipt_id}/pdf:
+    get:
+      tags:
+      - Admin · Finance
+      summary: tip receipt pdf admin
+      operationId: admin_finance.tip_receipt_pdf_admin_get
+      description: 'Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: tip_receipt_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      security:
+      - bearerAuth: []
   /api/admin/legal/documents:
     get:
       tags:
@@ -1262,7 +1443,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id007
+      parameters: &id009
       - name: doc_id
         in: path
         required: true
@@ -1278,7 +1459,7 @@ paths:
         required: false
         schema:
           type: string
-      security: &id008
+      security: &id010
       - bearerAuth: []
     put:
       tags:
@@ -1299,8 +1480,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id007
-      security: *id008
+      parameters: *id009
+      security: *id010
   /api/admin/legal/documents/{doc_id}/acceptances:
     get:
       tags:
@@ -1349,7 +1530,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id009
+      parameters: &id011
       - name: doc_id
         in: path
         required: true
@@ -1360,7 +1541,7 @@ paths:
         required: false
         schema:
           type: string
-      security: &id010
+      security: &id012
       - bearerAuth: []
     post:
       tags:
@@ -1381,8 +1562,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id009
-      security: *id010
+      parameters: *id011
+      security: *id012
   /api/admin/legal/documents/{doc_id}/publish:
     post:
       tags:
@@ -1460,6 +1641,34 @@ paths:
                 $ref: '#/components/schemas/Envelope'
       security:
       - bearerAuth: []
+  /api/admin/live/rides:
+    get:
+      tags:
+      - Admin · Live map
+      summary: 'Admin live map layers besides drivers: unassigned car-hire demand, running rideshare trips and every open
+        SOS (customers / ride-less too).'
+      operationId: admin_safety.live_rides_get
+      description: 'Admin live map layers besides drivers: unassigned car-hire demand,
+
+        running rideshare trips and every open SOS (customers / ride-less too).
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
   /api/admin/negotiations:
     get:
       tags:
@@ -1520,9 +1729,9 @@ paths:
     post:
       tags:
       - Admin
-      summary: Admin cancels a negotiation.
+      summary: Admin cancels a negotiation (state machine + refund policy + notifications).
       operationId: admin.negotiations_cancel_post
-      description: 'Admin cancels a negotiation.
+      description: 'Admin cancels a negotiation (state machine + refund policy + notifications).
 
 
         Auth: Admin (role-based).'
@@ -1556,9 +1765,14 @@ paths:
     post:
       tags:
       - Admin
-      summary: Admin updates negotiation status.
+      summary: Admin sets a negotiation's legacy status. Routed through the v4 state machine (one trip_event per step, actor
+        admin, reason required) — never a raw column write. 'Cancelled' applies the §7 cancellatio
       operationId: admin.negotiations_update_status_post
-      description: 'Admin updates negotiation status.
+      description: 'Admin sets a negotiation''s legacy status. Routed through the v4 state
+
+        machine (one trip_event per step, actor admin, reason required) — never a
+
+        raw column write. ''Cancelled'' applies the §7 cancellation policy.
 
 
         Auth: Admin (role-based).'
@@ -1661,6 +1875,168 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
+  /api/admin/notifications/templates:
+    get:
+      tags:
+      - Admin
+      summary: 'The notification catalogue: copy in EN/FR, channels, groups, plus any admin overrides (PUT/DELETE /api/admin/notifications/templates/{event_key}).'
+      operationId: admin_v4.notification_templates_get
+      description: 'The notification catalogue: copy in EN/FR, channels, groups, plus any admin
+
+        overrides (PUT/DELETE /api/admin/notifications/templates/{event_key}).
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
+  /api/admin/notifications/templates/{event_key}:
+    get:
+      tags:
+      - Admin
+      summary: notification template get
+      operationId: admin_v4.notification_template_get_get
+      description: 'Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: event_key
+        in: path
+        required: true
+        schema:
+          type: string
+      security:
+      - bearerAuth: []
+    put:
+      tags:
+      - Admin
+      summary: 'Override the copy of one event {lang: en|fr, title?, body?} (Jinja2, the same variables as the catalogue).
+        Empty fields fall back to the default.'
+      operationId: admin_v4.notification_template_put_put
+      description: 'Override the copy of one event {lang: en|fr, title?, body?} (Jinja2, the
+
+        same variables as the catalogue). Empty fields fall back to the default.
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: event_key
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+      security:
+      - bearerAuth: []
+    delete:
+      tags:
+      - Admin
+      summary: Remove the override (?lang=en|fr, default both) — back to the catalogue copy.
+      operationId: admin_v4.notification_template_delete_delete
+      description: 'Remove the override (?lang=en|fr, default both) — back to the catalogue copy.
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: event_key
+        in: path
+        required: true
+        schema:
+          type: string
+      security:
+      - bearerAuth: []
+  /api/admin/notifications/templates/{event_key}/preview:
+    post:
+      tags:
+      - Admin
+      summary: Render {lang, title?, body?, context?} (unsaved draft or the effective template) with sample context — nothing
+        is sent.
+      operationId: admin_v4.notification_template_preview_post
+      description: 'Render {lang, title?, body?, context?} (unsaved draft or the effective
+
+        template) with sample context — nothing is sent.
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: event_key
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
       security:
       - bearerAuth: []
   /api/admin/onboarding/applications:
@@ -2250,6 +2626,31 @@ paths:
                 $ref: '#/components/schemas/Envelope'
       security:
       - bearerAuth: []
+  /api/admin/readiness:
+    get:
+      tags:
+      - Admin
+      summary: Launch blockers / warnings (configuration only, no vendor calls).
+      operationId: admin_v4.readiness_get
+      description: 'Launch blockers / warnings (configuration only, no vendor calls).
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
   /api/admin/receipts/{receipt_id}/resend:
     post:
       tags:
@@ -2588,6 +2989,137 @@ paths:
           type: string
       security:
       - bearerAuth: []
+  /api/admin/rides/{ride_type}/{ride_id}/chat:
+    get:
+      tags:
+      - Admin
+      summary: In-app chat between the ride's parties during the ride window. Only available when the ride is disputed or
+        has a safety incident (privacy); every view is audited.
+      operationId: admin_v4.ride_chat_log_get
+      description: 'In-app chat between the ride''s parties during the ride window. Only
+
+        available when the ride is disputed or has a safety incident (privacy);
+
+        every view is audited.
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: ride_type
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: ride_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      security:
+      - bearerAuth: []
+  /api/admin/rides/{ride_type}/{ride_id}/reassign:
+    post:
+      tags:
+      - Admin
+      summary: Reassign the driver before pickup (car hire / scheduled). Reason required, audited, both drivers and the customer
+        are notified in realtime.
+      operationId: admin_v4.ride_reassign_post
+      description: 'Reassign the driver before pickup (car hire / scheduled). Reason required,
+
+        audited, both drivers and the customer are notified in realtime.
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: ride_type
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: ride_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+      security:
+      - bearerAuth: []
+  /api/admin/rides/{ride_type}/{ride_id}/receipt/issue:
+    post:
+      tags:
+      - Admin
+      summary: Issue (and email) the receipt of a completed, paid ride now — for rides the sweeper would pick up anyway, or
+        after fixing a capture. Runs as a job (202); returns the receipt when it already exists / w
+      operationId: admin_v4.ride_issue_receipt_post
+      description: 'Issue (and email) the receipt of a completed, paid ride now — for rides
+
+        the sweeper would pick up anyway, or after fixing a capture. Runs as a job
+
+        (202); returns the receipt when it already exists / was issued.
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: ride_type
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: ride_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+      security:
+      - bearerAuth: []
   /api/admin/rides/{ride_type}/{ride_id}/route:
     get:
       tags:
@@ -2619,6 +3151,50 @@ paths:
         required: true
         schema:
           type: integer
+      security:
+      - bearerAuth: []
+  /api/admin/rides/{ride_type}/{ride_id}/settle-safety:
+    post:
+      tags:
+      - Admin
+      summary: 'Decide a safety-ended ride''s payment (§7.1): charge `amount_cents` (pro-rated, 0 = nothing) and release/refund
+        the rest. {amount_cents, reason}.'
+      operationId: admin_v4.ride_settle_safety_post
+      description: 'Decide a safety-ended ride''s payment (§7.1): charge `amount_cents`
+
+        (pro-rated, 0 = nothing) and release/refund the rest. {amount_cents, reason}.
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: ride_type
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: ride_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
       security:
       - bearerAuth: []
   /api/admin/rides/{ride_type}/{ride_id}/transition:
@@ -2737,7 +3313,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id011
+      parameters: &id013
       - name: stage_id
         in: path
         required: true
@@ -2753,7 +3329,7 @@ paths:
         required: false
         schema:
           type: string
-      security: &id012
+      security: &id014
       - bearerAuth: []
     put:
       tags:
@@ -2777,8 +3353,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id011
-      security: *id012
+      parameters: *id013
+      security: *id014
   /api/admin/route-stages/{stage_id}/delete:
     delete:
       tags:
@@ -2802,7 +3378,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id013
+      parameters: &id015
       - name: stage_id
         in: path
         required: true
@@ -2813,7 +3389,7 @@ paths:
         required: false
         schema:
           type: string
-      security: &id014
+      security: &id016
       - bearerAuth: []
     post:
       tags:
@@ -2837,8 +3413,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id013
-      security: *id014
+      parameters: *id015
+      security: *id016
   /api/admin/safety/checks:
     get:
       tags:
@@ -2930,7 +3506,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id015
+      parameters: &id017
       - name: hid
         in: path
         required: true
@@ -2946,7 +3522,7 @@ paths:
         required: false
         schema:
           type: string
-      security: &id016
+      security: &id018
       - bearerAuth: []
     put:
       tags:
@@ -2967,8 +3543,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id015
-      security: *id016
+      parameters: *id017
+      security: *id018
     delete:
       tags:
       - Admin · Safety
@@ -3284,6 +3860,45 @@ paths:
           type: integer
       security:
       - bearerAuth: []
+  /api/admin/safety/recordings/{rid}/chunks/{seq}:
+    get:
+      tags:
+      - Admin · Safety
+      summary: Streams one decrypted audio chunk through the API (S3 or local), so every play / seek / download is audited
+        (`recording.chunk_streamed`).
+      operationId: admin_safety.recording_chunk_stream_get
+      description: 'Streams one decrypted audio chunk through the API (S3 or local), so
+
+        every play / seek / download is audited (`recording.chunk_streamed`).
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: rid
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: seq
+        in: path
+        required: true
+        schema:
+          type: integer
+      security:
+      - bearerAuth: []
   /api/admin/safety/recordings/{rid}/hold:
     post:
       tags:
@@ -3441,7 +4056,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: &id017
+      security: &id019
       - bearerAuth: []
       parameters:
       - name: Idempotency-Key
@@ -3468,7 +4083,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: *id017
+      security: *id019
       parameters:
       - name: Idempotency-Key
         in: header
@@ -3784,9 +4399,12 @@ paths:
     post:
       tags:
       - Admin
-      summary: Admin cancels a trip.
+      summary: 'Admin cancels a rideshare trip: CANCELLED_BY_DRIVER cascade — every passenger is cancelled and refunded 100
+        %.'
       operationId: admin.trips_cancel_post
-      description: 'Admin cancels a trip.
+      description: 'Admin cancels a rideshare trip: CANCELLED_BY_DRIVER cascade — every
+
+        passenger is cancelled and refunded 100 %.
 
 
         Auth: Admin (role-based).'
@@ -3820,9 +4438,9 @@ paths:
     post:
       tags:
       - Admin
-      summary: Admin updates trip status.
+      summary: Admin sets a rideshare trip's legacy status through the state machine.
       operationId: admin.trips_update_status_post
-      description: 'Admin updates trip status.
+      description: 'Admin sets a rideshare trip''s legacy status through the state machine.
 
 
         Auth: Admin (role-based).'
@@ -4057,7 +4675,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id018
+      parameters: &id020
       - name: user_id
         in: path
         required: true
@@ -4068,7 +4686,7 @@ paths:
         required: false
         schema:
           type: string
-      security: &id019
+      security: &id021
       - bearerAuth: []
     post:
       tags:
@@ -4092,8 +4710,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id018
-      security: *id019
+      parameters: *id020
+      security: *id021
   /api/admin/users/{user_id}/history:
     get:
       tags:
@@ -4309,7 +4927,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id020
+      parameters: &id022
       - name: user_id
         in: path
         required: true
@@ -4325,7 +4943,7 @@ paths:
         required: false
         schema:
           type: string
-      security: &id021
+      security: &id023
       - bearerAuth: []
     put:
       tags:
@@ -4349,8 +4967,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id020
-      security: *id021
+      parameters: *id022
+      security: *id023
+  /api/admin/users/{user_id}/view-as:
+    get:
+      tags:
+      - Admin
+      summary: 'Impersonation-free ''view as'' (spec §19.1.5): what the user currently sees — profile, account status, active
+        ride (as that user), unread notifications, pending legal documents. Read-only; no token is i'
+      operationId: admin_v4.view_as_get
+      description: 'Impersonation-free ''view as'' (spec §19.1.5): what the user currently sees —
+
+        profile, account status, active ride (as that user), unread notifications,
+
+        pending legal documents. Read-only; no token is issued. Audited.
+
+
+        Auth: Admin (role-based).'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      security:
+      - bearerAuth: []
   /api/admin/users/{user_id}/wallet:
     get:
       tags:
@@ -5268,6 +5922,29 @@ paths:
           type: string
       security:
       - bearerAuth: []
+  /api/brand/logo.png:
+    get:
+      tags:
+      - Legacy
+      summary: Public email logo (EMAIL_LOGO_URL overrides it).
+      operationId: receipts.brand_logo_get
+      description: 'Public email logo (EMAIL_LOGO_URL overrides it).
+
+
+        Auth: Public / signature-verified.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
   /api/call/active:
     get:
       tags:
@@ -5587,6 +6264,91 @@ paths:
           type: string
       security:
       - bearerAuth: []
+  /api/carhire/requests/{request_id}/offers/{offer_id}/accept:
+    post:
+      tags:
+      - Car hire (v4)
+      summary: Customer accepts a driver's counter-offer → negotiation at PRICE_AGREED (agreed price = the counter), all other
+        offers withdrawn.
+      operationId: carhire_v4.customer_accept_offer_post
+      description: 'Customer accepts a driver''s counter-offer → negotiation at PRICE_AGREED
+
+        (agreed price = the counter), all other offers withdrawn.
+
+
+        Auth: User JWT.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: request_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: offer_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+      security:
+      - bearerAuth: []
+  /api/carhire/requests/{request_id}/offers/{offer_id}/counter:
+    post:
+      tags:
+      - Car hire (v4)
+      summary: Customer counters one driver's counter-offer {price_cents}.
+      operationId: carhire_v4.customer_counter_offer_post
+      description: 'Customer counters one driver''s counter-offer {price_cents}.
+
+
+        Auth: User JWT.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: request_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: offer_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+      security:
+      - bearerAuth: []
   /api/carhire/requests/incoming:
     get:
       tags:
@@ -5766,7 +6528,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id022
+      parameters: &id024
       - name: session_id
         in: path
         required: true
@@ -5791,7 +6553,74 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id022
+      parameters: *id024
+  /api/devices/live-activity:
+    post:
+      tags:
+      - Notifications
+      summary: 'The app started a Live Activity for a ride and registers its push token so the server can update it (stage,
+        ETA) and end it on a terminal stage. Body: {ride_type, ride_id, activity_id, push_token}.'
+      operationId: notifications.register_live_activity_post
+      description: 'The app started a Live Activity for a ride and registers its push token
+
+        so the server can update it (stage, ETA) and end it on a terminal stage.
+
+        Body: {ride_type, ride_id, activity_id, push_token}.
+
+
+        Auth: User JWT.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+  /api/devices/live-activity/{activity_id}:
+    delete:
+      tags:
+      - Notifications
+      summary: 'The user dismissed the Live Activity: stop pushing to it.'
+      operationId: notifications.end_live_activity_delete
+      description: 'The user dismissed the Live Activity: stop pushing to it.
+
+
+        Auth: User JWT.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: activity_id
+        in: path
+        required: true
+        schema:
+          type: string
+      security:
+      - bearerAuth: []
   /api/devices/register:
     post:
       tags:
@@ -5820,6 +6649,46 @@ paths:
         required: false
         schema:
           type: string
+  /api/docs:
+    get:
+      tags:
+      - Legacy
+      summary: docs page
+      operationId: docs.docs_page_get
+      description: 'Auth: Public / signature-verified.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+  /api/docs/openapi.yaml:
+    get:
+      tags:
+      - Legacy
+      summary: docs spec
+      operationId: docs.docs_spec_get
+      description: 'Auth: Public / signature-verified.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
   /api/driver/demand-heatmap:
     get:
       tags:
@@ -5914,6 +6783,40 @@ paths:
                 $ref: '#/components/schemas/Envelope'
       security:
       - bearerAuth: []
+  /api/driver/onboarding/background-check/cancel:
+    post:
+      tags:
+      - Driver onboarding
+      summary: Cancel before the check is submitted to Certn → full refund (card) or the pay-later deduction is waived. 409
+        `already_submitted` / `nothing_to_cancel`.
+      operationId: onboarding.bgc_cancel_post
+      description: 'Cancel before the check is submitted to Certn → full refund (card) or the
+
+        pay-later deduction is waived. 409 `already_submitted` / `nothing_to_cancel`.
+
+
+        Auth: User JWT.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
   /api/driver/onboarding/background-check/consent:
     post:
       tags:
@@ -6144,7 +7047,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: &id023
+      security: &id025
       - bearerAuth: []
       parameters:
       - name: Idempotency-Key
@@ -6171,7 +7074,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: *id023
+      security: *id025
       parameters:
       - name: Idempotency-Key
         in: header
@@ -6344,6 +7247,32 @@ paths:
       summary: Resend verification email to a registered but unverified user.
       operationId: auth.resend_verification_post
       description: 'Resend verification email to a registered but unverified user.
+
+
+        Auth: Public / signature-verified.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+  /api/email/verify:
+    post:
+      tags:
+      - Legacy
+      summary: 'Website landing page `{PUBLIC_WEB_BASE_URL}/verify-email?token=…&email=…` posts {token, email} here. → {verified:
+        true, already_verified} | 400 invalid_token | 410 token_expired.'
+      operationId: auth.verify_email_json_post
+      description: 'Website landing page `{PUBLIC_WEB_BASE_URL}/verify-email?token=…&email=…` posts
+
+        {token, email} here. → {verified: true, already_verified} | 400 invalid_token | 410 token_expired.
 
 
         Auth: Public / signature-verified.'
@@ -6556,7 +7485,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: &id024
+      security: &id026
       - bearerAuth: []
     post:
       tags:
@@ -6580,7 +7509,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: *id024
+      security: *id026
       parameters:
       - name: Idempotency-Key
         in: header
@@ -7141,6 +8070,39 @@ paths:
                 $ref: '#/components/schemas/Envelope'
       security:
       - bearerAuth: []
+  /api/negotiations-verify:
+    post:
+      tags:
+      - Legacy · Car hire
+      summary: Reconcile the app's locally cached negotiations with the server in ONE call.
+      operationId: negotiations.verify_cached_post
+      description: "Reconcile the app's locally cached negotiations with the server in ONE call.\n\nBody: {\"ids\": [104,\
+        \ 105, ...]} (JSON list or comma-separated string, max 200).\nFor each id the server answers:\n  active  – exists,\
+        \ the caller is a participant and it is still open\n  ended   – exists but is finished (Completed / Cancelled / …):\
+        \ keep as history\n  gone    – does not exist on this server, or does not belong to the caller:\n            the app\
+        \ must drop it from its cache and never show it\nAlso returns `active_ids`: every open negotiation the caller really\
+        \ has, so\nthe app can discover rows its cache is missing.\n\nAuth: User JWT."
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
   /api/negotiations/{neg_id}/set-agreed-price:
     post:
       tags:
@@ -7249,7 +8211,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: &id025
+      security: &id027
       - bearerAuth: []
       parameters:
       - name: Idempotency-Key
@@ -7276,7 +8238,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: *id025
+      security: *id027
       parameters:
       - name: Idempotency-Key
         in: header
@@ -8185,7 +9147,11 @@ paths:
 
         verified phone and the OLD number receives an SMS ("your number was changed").
 
-        v4 clients must verify; v3 clients keep the legacy unverified update.
+        v4 clients (and every client once app.legacy_clients_allowed is off) must verify.
+
+        Legacy (v3) clients may still set an UNVERIFIED number: phone_e164 /
+
+        phone_verified_at are cleared and the old number gets the same SMS.
 
 
         Auth: User JWT.'
@@ -8307,6 +9273,34 @@ paths:
         schema:
           type: integer
       - name: cn_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      security:
+      - bearerAuth: []
+  /api/receipts/tips/{tip_receipt_id}.pdf:
+    get:
+      tags:
+      - Receipts
+      summary: tip receipt pdf
+      operationId: receipts.tip_receipt_pdf_get
+      description: 'Auth: User JWT.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: tip_receipt_id
         in: path
         required: true
         schema:
@@ -9334,6 +10328,47 @@ paths:
           type: integer
       security:
       - bearerAuth: []
+  /api/rides/{ride_type}/{ride_id}/tip:
+    post:
+      tags:
+      - Rides (v4)
+      summary: Add a tip after the ride, independent of the rating {amount_cents}.
+      operationId: ratings_v4.tip_post
+      description: 'Add a tip after the ride, independent of the rating {amount_cents}.
+
+
+        Auth: User JWT.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      parameters:
+      - name: ride_type
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: ride_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+      security:
+      - bearerAuth: []
   /api/rides/active:
     get:
       tags:
@@ -9341,6 +10376,36 @@ paths:
       summary: active
       operationId: rides.active_get
       description: 'Auth: User JWT.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+      security:
+      - bearerAuth: []
+  /api/rides/history:
+    get:
+      tags:
+      - Rides (v4)
+      summary: 'Unified trips history across car hire, scheduled bookings, rideshare seats (as customer) and rideshare trips
+        (as driver). Query: page, per_page, type (comma list), status=active|completed|cancelled.'
+      operationId: rides.history_get
+      description: 'Unified trips history across car hire, scheduled bookings, rideshare seats
+
+        (as customer) and rideshare trips (as driver). Query: page, per_page,
+
+        type (comma list), status=active|completed|cancelled.
+
+
+        Auth: User JWT.'
       responses:
         '200':
           description: Envelope
@@ -9542,7 +10607,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id026
+      parameters: &id028
       - name: trip_id
         in: path
         required: true
@@ -9558,7 +10623,7 @@ paths:
         required: false
         schema:
           type: string
-      security: &id027
+      security: &id029
       - bearerAuth: []
     put:
       tags:
@@ -9579,8 +10644,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id026
-      security: *id027
+      parameters: *id028
+      security: *id029
   /api/route-stages:
     get:
       tags:
@@ -9942,7 +11007,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: &id028
+      security: &id030
       - bearerAuth: []
       parameters:
       - name: Idempotency-Key
@@ -9969,7 +11034,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: *id028
+      security: *id030
       parameters:
       - name: Idempotency-Key
         in: header
@@ -9995,7 +11060,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      security: *id028
+      security: *id030
       parameters:
       - name: Idempotency-Key
         in: header
@@ -10109,7 +11174,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: &id029
+      parameters: &id031
       - name: cid
         in: path
         required: true
@@ -10125,7 +11190,7 @@ paths:
         required: false
         schema:
           type: string
-      security: &id030
+      security: &id032
       - bearerAuth: []
     put:
       tags:
@@ -10146,8 +11211,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Envelope'
-      parameters: *id029
-      security: *id030
+      parameters: *id031
+      security: *id032
     delete:
       tags:
       - Safety
@@ -10611,9 +11676,11 @@ paths:
     post:
       tags:
       - Legacy · Rideshare
-      summary: Create (publish) a rideshare trip. Approved drivers only.
+      summary: Create a rideshare trip — published at once, or a DRAFT with publish=false. Approved drivers only.
       operationId: trips.create_post
-      description: 'Create (publish) a rideshare trip. Approved drivers only.
+      description: 'Create a rideshare trip — published at once, or a DRAFT with publish=false.
+
+        Approved drivers only.
 
 
         Auth: User JWT.'
@@ -10732,6 +11799,15 @@ paths:
       summary: Update user's GPS coordinates.
       operationId: location.update_location_post
       description: 'Update user''s GPS coordinates.
+
+
+        Body: a single point {latitude|lat, longitude|lng, speed?, heading?,
+
+        accuracy?, recorded_at?} and/or a batch `points: [{lat, lng, speed, heading,
+
+        accuracy, recorded_at}]` (offline catch-up, ≤ 500). Old / out-of-order points
+
+        are stored as breadcrumbs but don''t move the live position.
 
 
         Auth: User JWT.'
@@ -11081,6 +12157,36 @@ paths:
       summary: certn webhook
       operationId: onboarding.certn_webhook_post
       description: 'Auth: Public / signature-verified.'
+      responses:
+        '200':
+          description: Envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        4XX:
+          description: Error envelope (code 0, data.error_code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+  /api/webhooks/postmark:
+    post:
+      tags:
+      - Webhooks
+      summary: Postmark Delivery / Open / Bounce / SpamComplaint webhooks. Protected by HTTP basic auth credentials configured
+        on the webhook URL (POSTMARK_WEBHOOK_USER / POSTMARK_WEBHOOK_PASSWORD). Hard bounces and
+      operationId: notifications.postmark_webhook_post
+      description: 'Postmark Delivery / Open / Bounce / SpamComplaint webhooks. Protected by
+
+        HTTP basic auth credentials configured on the webhook URL
+
+        (POSTMARK_WEBHOOK_USER / POSTMARK_WEBHOOK_PASSWORD). Hard bounces and spam
+
+        complaints suppress email for the user (users.email_bounced_at).
+
+
+        Auth: Public / signature-verified.'
       responses:
         '200':
           description: Envelope

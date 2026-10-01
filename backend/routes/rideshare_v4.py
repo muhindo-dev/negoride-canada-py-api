@@ -68,10 +68,18 @@ def _day_range(text, user):
         day = datetime.strptime(text[:10], '%Y-%m-%d')
     except ValueError:
         raise RS.BookingError('date must be YYYY-MM-DD.', code='bad_date')
+    # The search date is selected in the device's current local timezone.
+    # Device registration may still be in flight on the first Home visit, so
+    # accept a validated IANA zone on this read endpoint before falling back
+    # to the saved account timezone.
+    requested_tz = (request.args.get('timezone') or '').strip()[:80]
     try:
-        tz = ZoneInfo(user.timezone or 'America/Toronto')
+        tz = ZoneInfo(requested_tz or user.timezone or 'America/Toronto')
     except Exception:
-        tz = ZoneInfo('America/Toronto')
+        try:
+            tz = ZoneInfo(user.timezone or 'America/Toronto')
+        except Exception:
+            tz = ZoneInfo('America/Toronto')
     utc = ZoneInfo('UTC')
     start = day.replace(tzinfo=tz).astimezone(utc).replace(tzinfo=None)
     return start, start + timedelta(days=1)
@@ -115,6 +123,9 @@ def _trip_or_404(trip_id):
 def trip_detail(user, trip_id):
     try:
         trip = _trip_or_404(trip_id)
+        if (trip.trip_stage or R.derive_stage('rideshare_trip', trip)) == 'DRAFT' and trip.driver_id != user.id \
+                and not user.get_admin_roles():
+            raise R.RideNotFound('Trip not found')     # drafts are private to their driver
     except R.RideNotFound as e:
         return _err(e)
     card = RS.trip_card(trip)

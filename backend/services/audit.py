@@ -27,7 +27,9 @@ def audit(action, actor=None, entity_type=None, entity_id=None, before=None, aft
             actor_type = 'user'
     ip = ua = None
     if has_request_context():
-        ip = (request.headers.get('X-Forwarded-For', '') or request.remote_addr or '').split(',')[0].strip()
+        # ProxyFix (app.py, TRUSTED_PROXY_COUNT) already resolved the real client
+        # address into remote_addr; never trust the raw, client-controlled header.
+        ip = (request.remote_addr or '')[:64]
         ua = (request.headers.get('User-Agent') or '')[:500]
     row = AuditLog(
         actor_id=actor_id, actor_type=actor_type, action=action,

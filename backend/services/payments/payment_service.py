@@ -16,7 +16,7 @@ import logging
 from datetime import datetime, timedelta
 
 from backend.models import db
-from backend.models.money import Refund, RidePayment
+from backend.models.money import CAPTURED_STATES, Refund, RidePayment, refund_overlay_status
 from backend.models.user import AdminUser
 from backend.services import rides as R
 from backend.services import settings_service as S
@@ -183,6 +183,12 @@ def record_intent(rp, intent):
     elif status in ('requires_payment_method', 'canceled') and rp.capture_status == 'pending':
         rp.capture_status = 'failed' if status != 'canceled' else 'canceled'
         rp.failure_reason = intent.get('last_payment_error') or status
+        rp.meta = {**(rp.meta or {}), 'decline_code': intent.get('decline_code')}
+    elif status == 'requires_action' and rp.capture_status == 'pending':
+        # 3-D Secure / bank authentication still outstanding: the hold is not in
+        # place yet. Stay pending (the same Checkout can finish), tell the rider.
+        rp.failure_reason = 'authentication_required'
+        rp.meta = {**(rp.meta or {}), 'requires_action': True}
 
     if rp.purpose != 'ride':
         db.session.commit()
@@ -207,11 +213,36 @@ def record_intent(rp, intent):
                 confirmed = True
             except TransitionError as e:
                 log.warning('Payment authorized but ride %s/%s not confirmed: %s', rp.ride_type, ride.id, e)
-    elif rp.capture_status == 'failed':
-        from backend.services.notify import notify
-        notify('payment.failed', [rp.customer_id], {'ride_type': rp.ride_type, 'ride_id': rp.ride_id})
+    elif rp.capture_status == 'failed' or (rp.capture_status == 'pending' and status == 'requires_action'):
+        _notify_payment_failed(rp, action_required=(status == 'requires_action'))
     db.session.commit()
     return confirmed
+
+
+FAILURE_TEXT = {
+    'insufficient_funds': 'Your card has insufficient funds.',
+    'card_declined': 'Your card was declined.',
+    'expired_card': 'Your card has expired.',
+    'incorrect_cvc': 'The security code was incorrect.',
+    'authentication_required': 'Your bank needs you to confirm this payment.',
+}
+
+
+def failure_text(rp):
+    code = (rp.meta or {}).get('decline_code') or rp.failure_reason
+    return FAILURE_TEXT.get(code or '', '')
+
+
+def _notify_payment_failed(rp, action_required=False):
+    """payment.failed to the customer — once per payment attempt (dedupe), with
+    the retry deep link. The ride stays AWAITING_PAYMENT / PENDING_PAYMENT until it
+    expires, and POST /api/rides/{type}/{id}/pay {force_new: true} starts a new attempt."""
+    from backend.services.notify import notify
+    notify('payment.failed', [rp.customer_id],
+           {'ride_type': rp.ride_type, 'ride_id': rp.ride_id, 'ride_payment_id': rp.id,
+            'reason': FAILURE_TEXT['authentication_required'] if action_required else failure_text(rp),
+            'action_required': bool(action_required)},
+           dedupe_key=f"payment-{'action' if action_required else 'failed'}-{rp.id}")
 
 
 def sync_from_provider(rp):
@@ -237,6 +268,12 @@ def _on_non_ride_paid(rp):
         wallet_service.credit(rp.driver_id, wallet_service.cents_to_dollars(rp.amount_captured_cents or rp.amount_authorized_cents),
                               'tip', f'tip-{rp.id}', f'Tip for ride #{rp.ride_id} (100 % to driver)',
                               negotiation_id=rp.ride_id if rp.ride_type == 'carhire' else None)
+        if rp.ride_type in ('carhire', 'scheduled', 'rideshare_booking'):
+            ride = R.load(rp.ride_type, rp.ride_id)
+            if hasattr(ride, 'tip_cents'):
+                ride.tip_cents = int(ride.tip_cents or 0) + int(rp.amount_captured_cents or 0)
+        from backend import jobs
+        jobs.enqueue_after_commit('backend.services.receipts.issue_tip_receipt_safe', rp.id)
         db.session.commit()
     elif rp.purpose == 'background_check':
         try:
@@ -323,6 +360,20 @@ def settle_cancellation(ride_type, ride_id, decision):
     fee = int(decision.get('fee_cents') or 0)
     released = refunded = 0
 
+    if decision.get('rule_id') == 'safety_review' and rp is not None and (rp.took_money or rp.is_secured):
+        # Trip ended for safety (§7.1): keep the money where it is until an admin
+        # decides (pro-rated capture or full release) within safety.settle_hold_h;
+        # auto_release_safety_holds() releases it after that.
+        if rp.settlement_status != 'safety_review':
+            rp.settlement_status = 'safety_review'
+            rp.settle_due_at = datetime.utcnow() + timedelta(hours=S.get_int('safety.settle_hold_h'))
+            db.session.commit()
+            from backend.services import realtime
+            realtime.to_admins('payment.safety_review', {'ride_type': ride_type, 'ride_id': ride.id,
+                                                         'ride_payment_id': rp.id,
+                                                         'settle_due_at': rp.settle_due_at.strftime('%Y-%m-%dT%H:%M:%SZ')})
+        return {'fee_cents': 0, 'released_cents': 0, 'refunded_cents': 0, 'held_for_review': True}
+
     if rp and rp.capture_status == 'pending':
         if rp.checkout_session_id:
             get_gateway().expire_session(rp.checkout_session_id)
@@ -344,7 +395,7 @@ def settle_cancellation(ride_type, ride_id, decision):
         if released > 0:
             _refund_row(rp, released, 'release', decision.get('rule_id'), decision.get('explanation'),
                         key=f'rp-{rp.id}-release', provider_id=rp.intent_id)
-    elif rp and rp.capture_status in ('captured', 'partially_captured'):
+    elif rp and rp.capture_status in CAPTURED_STATES:
         refund_amount = max(0, rp.amount_captured_cents - rp.amount_refunded_cents - fee)
         if refund_amount > 0:
             refunded = _provider_refund(rp, refund_amount, decision.get('rule_id'), decision.get('explanation'),
@@ -391,13 +442,30 @@ def _provider_refund(rp, amount, rule_id, reason, key, actor=None, actor_type='s
     existing = Refund.query.filter_by(idempotency_key=key).first()
     if existing:
         return 0
-    res = get_gateway().refund(rp.intent_id, amount, idempotency_key=key, reason='requested_by_customer')
+    if rp.provider == 'offline':
+        # Paid outside Stripe (admin mark-paid): nothing to call — ops returns the
+        # money the same way it was received. Recorded so totals stay right.
+        res = {'id': f'offline-{key}'[:191]}
+    else:
+        res = get_gateway().refund(rp.intent_id, amount, idempotency_key=key, reason='requested_by_customer')
     r = _refund_row(rp, amount, 'refund', rule_id, reason, key, provider_id=res.get('id'), actor=actor,
                     actor_type=actor_type)
     rp.amount_refunded_cents = (rp.amount_refunded_cents or 0) + int(amount)
+    _apply_refund_overlay(rp)
     _mark_legacy_refunded(rp)
     _issue_credit_note(r.id)
     return int(amount)
+
+
+def _apply_refund_overlay(rp):
+    """Payment overlay (§4.1 REFUNDED / PARTIALLY_REFUNDED): capture_status becomes
+    `partially_refunded` / `refunded`; the pre-refund status is kept in meta."""
+    new = refund_overlay_status(rp.amount_captured_cents, rp.amount_refunded_cents, rp.capture_status)
+    if new != rp.capture_status:
+        meta = dict(rp.meta or {})
+        meta.setdefault('capture_status_before_refund', rp.capture_status)
+        rp.meta = meta
+        rp.capture_status = new
 
 
 def _mark_legacy_refunded(rp):
@@ -419,7 +487,7 @@ def _release_or_refund_full(rp, reason):
         rp.canceled_at = datetime.utcnow()
         _refund_row(rp, rp.amount_authorized_cents, 'release', reason, 'Payment arrived after the ride ended',
                     key=f'rp-{rp.id}-release')
-    elif rp.capture_status in ('captured', 'partially_captured'):
+    elif rp.capture_status in CAPTURED_STATES and rp.amount_captured_cents > rp.amount_refunded_cents:
         _provider_refund(rp, rp.amount_captured_cents - rp.amount_refunded_cents, reason,
                          'Payment arrived after the ride ended', key=f'rp-{rp.id}-late-refund')
     db.session.commit()
@@ -518,13 +586,197 @@ def handle_stripe_event(event):
             db.session.commit()
             record_intent(rp, get_gateway().get_intent(intent_id))
     elif etype in ('payment_intent.amount_capturable_updated', 'payment_intent.succeeded',
-                   'payment_intent.payment_failed', 'payment_intent.canceled'):
+                   'payment_intent.payment_failed', 'payment_intent.canceled', 'payment_intent.requires_action'):
         record_intent(rp, {'id': obj.get('id'), 'status': obj.get('status'), 'amount': obj.get('amount'),
                            'amount_capturable': obj.get('amount_capturable'),
                            'amount_received': obj.get('amount_received'),
-                           'last_payment_error': ((obj.get('last_payment_error') or {}).get('message'))})
+                           'last_payment_error': ((obj.get('last_payment_error') or {}).get('message')),
+                           'decline_code': ((obj.get('last_payment_error') or {}).get('decline_code')
+                                            or (obj.get('last_payment_error') or {}).get('code'))})
     elif etype == 'checkout.session.expired':
         if rp.capture_status == 'pending':
             rp.capture_status = 'expired'
             db.session.commit()
     return True
+
+
+# ── safety endings: hold until an admin decides (§7.1 "pro-rated or $0") ───
+
+def settle_safety(ride_type, ride_id, amount_cents, reason, actor):
+    """Admin decision for a ride ended for safety: charge `amount_cents`
+    (pro-rated, ≤ what is held) and release/refund the rest. Audited."""
+    from backend.services.audit import audit
+    if not reason or len(reason.strip()) < 5:
+        raise PaymentError('A reason (at least 5 characters) is required.', code='reason_required')
+    try:
+        amount_cents = int(amount_cents)
+    except (TypeError, ValueError):
+        raise PaymentError('amount_cents must be an integer.', code='bad_amount')
+    rp = latest_payment(ride_type, ride_id)
+    if rp is not None:
+        rp = RidePayment.query.filter_by(id=rp.id).with_for_update().populate_existing().one()
+    if rp is None or rp.settlement_status != 'safety_review':
+        raise PaymentError('This ride has no payment waiting for a safety decision.', code='not_in_review',
+                           status=409)
+    held = held_cents(rp)
+    if amount_cents < 0 or amount_cents > held:
+        raise PaymentError(f'Amount must be between $0.00 and {fmt(held)}.', code='bad_amount')
+    before = rp.to_dict()
+    out = _settle_safety(rp, amount_cents, reason.strip(), actor, 'settled')
+    audit('payment.safety_settlement', actor, 'ride_payment', rp.id, before=before,
+          after=db.session.get(RidePayment, rp.id).to_dict(),
+          meta={'ride_type': ride_type, 'ride_id': ride_id, 'amount_cents': amount_cents, 'reason': reason,
+                **out})
+    db.session.commit()
+    return out
+
+
+def held_cents(rp):
+    if rp.capture_status == 'authorized':
+        return int(rp.amount_authorized_cents or 0)
+    if rp.capture_status in CAPTURED_STATES:
+        return int(rp.amount_captured_cents or 0) - int(rp.amount_refunded_cents or 0)
+    return 0
+
+
+def _settle_safety(rp, amount, reason, actor, final_status):
+    from backend import jobs
+    from backend.services.notify import notify
+    ride = R.load(rp.ride_type, rp.ride_id)
+    gw = get_gateway()
+    released = refunded = 0
+    if rp.capture_status == 'authorized':
+        if amount > 0:
+            intent = gw.capture(rp.intent_id, amount, idempotency_key=f'rp-{rp.id}-safety-capture')
+            rp.amount_captured_cents = int(intent.get('amount_received') or amount)
+            rp.capture_status = 'captured' if amount >= rp.amount_authorized_cents else 'partially_captured'
+            rp.captured_at = datetime.utcnow()
+        else:
+            gw.cancel(rp.intent_id, idempotency_key=f'rp-{rp.id}-cancel')
+            rp.capture_status = 'canceled'
+            rp.canceled_at = datetime.utcnow()
+        released = rp.amount_authorized_cents - amount
+        if released > 0:
+            _refund_row(rp, released, 'release', 'safety_review', reason, key=f'rp-{rp.id}-safety-release',
+                        provider_id=rp.intent_id, actor=actor, actor_type='admin' if actor else 'system')
+    elif rp.capture_status in CAPTURED_STATES:
+        back = held_cents(rp) - amount
+        if back > 0:
+            refunded = _provider_refund(rp, back, 'safety_review', reason, key=f'rp-{rp.id}-safety-refund',
+                                        actor=actor, actor_type='admin' if actor else 'system')
+    rp.settlement_status = final_status
+    rp.meta = {**(rp.meta or {}), 'safety_settlement': {
+        'amount_cents': amount, 'reason': reason, 'by': getattr(actor, 'id', None),
+        'at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}}
+    db.session.commit()
+    if amount > 0:
+        _credit_driver_fare(rp.ride_type, ride, rp, fare_cents=min(amount, int(rp.fare_cents or amount)))
+        db.session.commit()
+        jobs.enqueue_after_commit('backend.services.trip_effects.issue_receipt_safe', rp.ride_type, rp.ride_id)
+    back = released + refunded
+    if back > 0:
+        notify('refund.issued', [rp.customer_id], {'amount': fmt(back), 'released': released > 0 and not refunded,
+                                                   'ride_type': rp.ride_type, 'ride_id': rp.ride_id})
+    db.session.commit()
+    return {'charged_cents': amount, 'released_cents': released, 'refunded_cents': refunded}
+
+
+def auto_release_safety_holds(now=None):
+    """Periodic: safety holds nobody decided within `safety.settle_hold_h` are
+    released in full (the customer pays nothing)."""
+    now = now or datetime.utcnow()
+    n = 0
+    for row in (RidePayment.query.filter(RidePayment.settlement_status == 'safety_review',
+                                         RidePayment.settle_due_at <= now).limit(100).all()):
+        try:
+            rp = RidePayment.query.filter_by(id=row.id).with_for_update().populate_existing().one()
+            if rp.settlement_status != 'safety_review':
+                db.session.rollback()
+                continue
+            out = _settle_safety(rp, 0, 'No admin decision within the review window — released in full.', None,
+                                 'auto_released')
+            from backend.services.audit import audit
+            audit('payment.safety_auto_release', None, 'ride_payment', rp.id, actor_type='system', meta=out)
+            db.session.commit()
+            n += 1
+        except Exception:
+            db.session.rollback()
+            log.exception('auto release of safety hold %s failed', row.id)
+    return n
+
+
+# ── admin / offline payments ────────────────────────────────────────────────
+
+def record_offline_payment(ride_type, ride, actor, amount_cents=None, note=None):
+    """Admin 'mark paid' (cash / e-transfer / comp): an offline RidePayment
+    (provider 'offline', capture_status 'captured') so the §6 guard, capture,
+    driver credit, receipts and reports see real money. Caller transitions."""
+    from backend.services.trip_state_machine import payment_secured
+    existing = latest_payment(ride_type, ride.id)
+    if (existing and existing.is_secured) or payment_secured(ride_type, ride):
+        raise PaymentError('This ride is already paid.', code='already_paid', status=409)
+    fare, fees = amounts_for(ride_type, ride)
+    total = int(amount_cents) if amount_cents not in (None, '') else fare + fees
+    if total <= 0:
+        raise PaymentError('The ride has no agreed price yet — set a price before marking it paid.',
+                           code='no_price', status=409)
+    if existing and existing.capture_status == 'pending' and existing.checkout_session_id:
+        get_gateway().expire_session(existing.checkout_session_id)
+        existing.capture_status = 'canceled'
+        existing.canceled_at = datetime.utcnow()
+    now = datetime.utcnow()
+    cid = (R.customer_ids(ride_type, ride) or [None])[0]
+    rp = RidePayment(ride_type=ride_type, ride_id=ride.id, customer_id=cid or 0, driver_id=R.driver_id(ride_type, ride),
+                     purpose='ride', provider='offline', capture_method='offline',
+                     fare_cents=min(fare, total) if fare else total, fees_cents=max(0, total - fare) if fare else 0,
+                     amount_authorized_cents=total, amount_captured_cents=total, capture_status='captured',
+                     authorized_at=now, captured_at=now, payment_method_brand='offline',
+                     meta={'amount': total, 'marked_paid_by': getattr(actor, 'id', None), 'note': note})
+    db.session.add(rp)
+    _sync_legacy_paid(ride_type, ride, rp)
+    db.session.flush()
+    return rp
+
+
+# ── Stripe Connect (driver payouts) ─────────────────────────────────────────
+
+def handle_connect_event(event):
+    """transfer.* (platform → driver's connected account) and payout.paid
+    (connected account → bank). Emits `payout.sent` once per movement."""
+    from backend.models.payout_account import PayoutAccount
+    from backend.models.payout_request import PayoutRequest
+    from backend.services.notify import notify
+    etype = event.get('type', '')
+    obj = (event.get('data') or {}).get('object') or {}
+    if etype in ('transfer.created', 'transfer.paid', 'transfer.updated'):
+        pid = (obj.get('metadata') or {}).get('payout_id')
+        pr = None
+        if pid:
+            pr = db.session.get(PayoutRequest, int(pid))
+        if pr is None and obj.get('id'):
+            pr = PayoutRequest.query.filter_by(stripe_transfer_id=obj.get('id')).first()
+        if pr is None:
+            return False
+        pr.stripe_transfer_id = pr.stripe_transfer_id or obj.get('id')
+        amount = int(obj.get('amount') or 0) or int(round(float(pr.net_amount or pr.amount or 0) * 100))
+        notify('payout.sent', [pr.user_id], {'amount': fmt(amount), 'id': pr.id}, dedupe_key=f'payout-{pr.id}')
+        db.session.commit()
+        return True
+    if etype == 'transfer.reversed':
+        pr = PayoutRequest.query.filter_by(stripe_transfer_id=obj.get('id')).first()
+        if pr is None:
+            return False
+        pr.failure_reason = 'Transfer reversed by Stripe'
+        db.session.commit()
+        return True
+    if etype in ('payout.paid', 'payout.failed'):
+        acct = event.get('account')
+        pa = PayoutAccount.query.filter_by(stripe_account_id=acct).first() if acct else None
+        if pa is None:
+            return False
+        if etype == 'payout.paid':
+            notify('payout.sent', [pa.user_id], {'amount': fmt(int(obj.get('amount') or 0)), 'id': obj.get('id'),
+                                                 'bank': True}, dedupe_key=f"stripe-payout-{obj.get('id')}")
+            db.session.commit()
+        return True
+    return False

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { adminAPI } from '../services/api';
+import { isTerminal, LegacyActionModal, StageCell, StageSection } from './legacyActions';
 import {
   FiSearch, FiChevronLeft, FiChevronRight, FiX, FiEye, FiXCircle, FiAlertTriangle,
 } from 'react-icons/fi';
@@ -91,16 +92,17 @@ function NegDrawer({ neg, onClose, onAction }) {
               <div className="d-row"><span className="dk">Status</span><span className="dv"><span className={`badge badge-${neg.payment.status}`}>{neg.payment.status}</span></span></div>
             </div>
           )}
-          {!['Completed', 'Cancelled'].includes(neg.status) && (
+          <StageSection type="carhire" ride={neg} />
+          {!isTerminal(neg.trip_stage, neg.status) && (
             <div className="d-section">
               <h4>Update Status</h4>
               <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
                 <select className="d-select" value={newStatus} onChange={e => setNewStatus(e.target.value)}>
                   {['Pending', 'Accepted', 'Started', 'Completed', 'Cancelled'].map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
-                <button className="btn btn-sm btn-accent" disabled={saving || newStatus === neg.status} onClick={() => act('status', { status: newStatus })}>Save</button>
+                <button className="btn btn-sm btn-accent" disabled={saving || newStatus === neg.status} onClick={() => act('status', { status: newStatus })}>Save…</button>
               </div>
-              <button className="btn btn-sm btn-danger" disabled={saving} onClick={() => act('cancel')}><FiXCircle /> Cancel Negotiation</button>
+              <button className="btn btn-sm btn-danger" disabled={saving} onClick={() => act('cancel')}><FiXCircle /> Cancel Negotiation…</button>
             </div>
           )}
         </div>
@@ -120,6 +122,7 @@ export default function NegotiationsPage() {
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
   const [confirm, setConfirm] = useState(null);
+  const [action, setAction] = useState(null);
   const perPage = 20;
   const totalPages = Math.ceil(total / perPage);
 
@@ -145,14 +148,28 @@ export default function NegotiationsPage() {
     catch { setSelected(item); }
   };
 
-  const doAction = async (id, action, params = {}) => {
+  const refreshAfter = async (id) => {
     try {
-      if (action === 'status') await adminAPI.negotiationStatus(id, params);
-      else if (action === 'cancel') await adminAPI.negotiationCancel(id);
       const { data } = await adminAPI.negotiationShow(id);
-      if (data.code === 1) setSelected(data.data);
-      load(page, search, filter, payFilter);
-    } catch {}
+      if (data.code === 1) setSelected((cur) => (cur && cur.id === id ? data.data : cur));
+    } catch { /* list reload below still runs */ }
+    load(page, search, filter, payFilter);
+  };
+
+  // Every action needs a reason and runs through the v4 state machine.
+  const doAction = async (id, kind, params = {}) => {
+    if (kind === 'status') {
+      setAction({
+        id, title: `Set negotiation #${id} to “${params.status}”`, url: `/admin/negotiations/${id}/update-status`, body: { status: params.status },
+        policy: params.status === 'Cancelled', confirmLabel: 'Apply', color: 'orange', successMessage: `Negotiation #${id} → ${params.status}`,
+        description: 'The ride is walked step by step through the state machine (one timeline event per step). Unpaid rides cannot be confirmed/started (402).',
+      });
+    } else if (kind === 'cancel') {
+      setAction({
+        id, title: `Cancel negotiation #${id}`, url: `/admin/negotiations/${id}/cancel`, policy: true, confirmLabel: 'Cancel ride', color: 'red',
+        successMessage: `Negotiation #${id} cancelled`, description: 'Applies the §7 cancellation policy (fee or refund), releases holds and notifies both parties.',
+      });
+    }
   };
 
   const fd = v => v != null ? `$${Number(v).toFixed(2)}` : '—';
@@ -160,7 +177,8 @@ export default function NegotiationsPage() {
 
   return (
     <div className="page-negotiations">
-      {selected && <NegDrawer neg={selected} onClose={() => setSelected(null)} onAction={doAction} />}
+      {selected && <NegDrawer key={`${selected.id}-${selected.status}-${selected.trip_stage}`} neg={selected} onClose={() => setSelected(null)} onAction={doAction} />}
+      {action && <LegacyActionModal action={action} onClose={() => setAction(null)} onDone={() => refreshAfter(action.id)} />}
       {confirm && <Confirm message={confirm.msg} onCancel={() => setConfirm(null)}
         onConfirm={() => { doAction(confirm.id, confirm.action); setConfirm(null); }} />}
 
@@ -197,7 +215,7 @@ export default function NegotiationsPage() {
             <thead>
               <tr>
                 <th>ID</th><th>Customer</th><th>Driver</th><th>Route</th>
-                <th>Price</th><th>Status</th><th>Payment</th><th>Date</th><th>Actions</th>
+                <th>Price</th><th>Status</th><th>Stage</th><th>Payment</th><th>Date</th><th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -211,18 +229,19 @@ export default function NegotiationsPage() {
                   </td>
                   <td>{n.agreed_price != null ? fd(n.agreed_price) : fc(n.initial_price)}</td>
                   <td><span className={`badge badge-${n.status?.toLowerCase()}`}>{n.status}</span></td>
+                  <td><StageCell stage={n.trip_stage} /></td>
                   <td><span className={`badge badge-${n.payment_status === 'paid' ? 'success' : 'warning'}`}>{n.payment_status || 'unpaid'}</span></td>
                   <td>{n.created_at?.slice(0, 10)}</td>
                   <td className="actions">
                     <button className="btn btn-xs" title="View / Manage" onClick={() => openDetail(n)}><FiEye /></button>
-                    {!['Completed', 'Cancelled'].includes(n.status) && (
-                      <button className="btn btn-xs btn-danger" title="Cancel"
-                        onClick={() => setConfirm({ id: n.id, action: 'cancel', msg: `Cancel negotiation #${n.id}?` })}><FiXCircle /></button>
+                    {!isTerminal(n.trip_stage, n.status) && (
+                      <button className="btn btn-xs btn-danger" title="Cancel (reason required)"
+                        onClick={() => doAction(n.id, 'cancel')}><FiXCircle /></button>
                     )}
                   </td>
                 </tr>
               ))}
-              {!items.length && <tr><td colSpan="9" className="empty-state">No negotiations found</td></tr>}
+              {!items.length && <tr><td colSpan="10" className="empty-state">No negotiations found</td></tr>}
             </tbody>
           </table>
         </div>

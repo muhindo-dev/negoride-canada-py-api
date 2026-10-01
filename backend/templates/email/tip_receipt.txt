@@ -1,0 +1,14 @@
+Tip receipt {{ number }}
+
+Hi {{ first_name }},
+
+Thank you! Your tip of {{ money(t.amount_cents) }} went 100 % to {{ r.driver_first or 'your driver' }}.
+
+Ride: {{ r.ride_ref }} ({{ r.pickup_address }} → {{ r.dropoff_address }})
+Paid with: {{ t.payment_method }}
+TOTAL CHARGED: {{ money(t.amount_cents) }} CAD (tips are not subject to GST/HST)
+
+The PDF is attached. View the ride receipt: {{ receipt_url }}
+--
+{{ company_legal_name }} · {{ company_address }}
+Support: {{ support_email }}

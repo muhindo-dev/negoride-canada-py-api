@@ -1,6 +1,8 @@
 """Phone verification API (spec §11) + Twilio inbound SMS webhook (STOP/HELP, §11.2 #13).
 
-POST /api/verify/phone/start   {phone, purpose, channel?, step_up_ticket?, locale?}
+POST /api/verify/phone/start   {phone, purpose, channel?, step_up_ticket?, locale?, app_hash?}
+                               app_hash = Android SMS Retriever hash (11 chars); falls back to
+                               TWILIO_ANDROID_APP_HASH; forwarded to Twilio Verify as AppHash (SMS only)
 POST /api/verify/phone/check   {phone, purpose, code, step_up_ticket?}
 POST /api/webhooks/twilio/inbound   (Twilio, X-Twilio-Signature)
 
@@ -18,6 +20,7 @@ import os
 from datetime import datetime
 
 from flask import Blueprint, Response, request
+from sqlalchemy.exc import IntegrityError
 
 from backend import jobs
 from backend.models import db
@@ -57,7 +60,8 @@ def start_response(data, user):
         res = PV.start(data.get('phone') or data.get('phone_number'), data.get('purpose') or 'signup',
                        data.get('channel') or 'sms', user=user, step_up_ticket=data.get('step_up_ticket'),
                        device_id=device_id(data), ip=client_ip(),
-                       locale=(data.get('locale') or (user.preferred_language if user else None) or None))
+                       locale=(data.get('locale') or (user.preferred_language if user else None) or None),
+                       app_hash=data.get('app_hash') or request.headers.get('X-App-Hash'))
     except PV.VerifyError as e:
         return _err(e)
     msg = {'call': 'We are calling you with your code.', 'whatsapp': 'We sent your code on WhatsApp.'}.get(
@@ -83,7 +87,15 @@ def check_response(data, user):
             from backend.services.audit import audit
             audit('user.phone_verified', user, 'user', user.id, after={'phone': row.phone, 'purpose': row.purpose},
                   actor_type='user')
-            db.session.commit()
+            from backend.services import onboarding_service
+            onboarding_service.queue_progress_refresh(user.id)
+            try:
+                db.session.commit()
+            except IntegrityError as exc:
+                db.session.rollback()
+                if PV.is_verified_phone_conflict(exc):
+                    return PV.phone_in_use_response()
+                raise
             res['applied'] = True
             res['verification_token'] = None
             res['user'] = user.to_dict()
@@ -168,6 +180,9 @@ def process_twilio_inbound(webhook_event_id):
         for u in users:
             if word in STOP_WORDS:
                 u.sms_opt_out_at = datetime.utcnow()
+                if u.marketing_opt_in:
+                    from backend.services import legal_service
+                    legal_service.record_marketing_consent(u, False, 'sms_stop', channels='sms,email')
                 u.marketing_opt_in = False
             else:
                 u.sms_opt_out_at = None

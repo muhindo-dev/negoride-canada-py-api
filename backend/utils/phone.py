@@ -2,8 +2,19 @@
 (NANP). Other countries are accepted only if listed in otp.allowed_countries."""
 import re
 
-# NANP premium-rate / non-geographic area codes that must never receive OTPs.
-PREMIUM_NANP = ('900', '976')
+# NANP premium-rate / personal / non-geographic area codes that must never receive OTPs
+# (SMS-pumping / toll-fraud targets — spec §11.2 #10).
+PREMIUM_NANP = ('500', '533', '544', '566', '577', '588', '700', '710', '900', '976')
+# +1 area codes that are NOT Canada or the US mainland (Caribbean, Atlantic and
+# Pacific territories). They share +1 but are billed internationally and are the
+# classic SMS-pumping targets, so they are refused unless the region is listed in
+# otp.allowed_countries (ISO code) or otp.allowed_nanp_regions (area code / ISO).
+NANP_OTHER = {
+    '242': 'BS', '246': 'BB', '264': 'AI', '268': 'AG', '284': 'VG', '340': 'VI', '345': 'KY', '441': 'BM',
+    '473': 'GD', '649': 'TC', '658': 'JM', '664': 'MS', '670': 'MP', '671': 'GU', '684': 'AS', '721': 'SX',
+    '758': 'LC', '767': 'DM', '784': 'VC', '787': 'PR', '809': 'DO', '829': 'DO', '849': 'DO', '868': 'TT',
+    '869': 'KN', '876': 'JM', '939': 'PR',
+}
 COUNTRY_PREFIX = {'CA': '+1', 'US': '+1', 'UG': '+256', 'NG': '+234', 'GB': '+44'}
 
 
@@ -43,7 +54,7 @@ def normalize(raw, default_country='CA'):
 
 def country_of(e164):
     if e164.startswith('+1'):
-        return 'CA'  # NANP (CA/US) — both allowed by default
+        return NANP_OTHER.get(e164[2:5], 'CA')  # NANP: CA/US unless a Caribbean/territory area code
     for c, p in COUNTRY_PREFIX.items():
         if e164.startswith(p):
             return c
@@ -54,9 +65,13 @@ def is_premium(e164):
     return e164.startswith('+1') and e164[2:5] in PREMIUM_NANP
 
 
-def is_allowed_country(e164, allowed_csv='CA,US'):
+def is_allowed_country(e164, allowed_csv='CA,US', extra_nanp_csv=''):
     allowed = {c.strip().upper() for c in (allowed_csv or '').split(',') if c.strip()}
     if e164.startswith('+1'):
+        area = e164[2:5]
+        if area in NANP_OTHER:
+            extra = {c.strip().upper() for c in (extra_nanp_csv or '').split(',') if c.strip()}
+            return area in extra or NANP_OTHER[area] in extra or NANP_OTHER[area] in allowed
         return bool(allowed & {'CA', 'US'})
     c = country_of(e164)
     return c in allowed if c else False

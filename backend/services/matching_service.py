@@ -12,10 +12,19 @@ row:
   broadcast        offered to the nearest `carhire.broadcast_max_drivers` online,
                    approved drivers within `carhire.broadcast_radius_km`
 
-The FIRST driver who accepts (or counter-offers) wins: the request row is locked
-(SELECT … FOR UPDATE), a negotiation is created with that driver, the request
-becomes `matched` and every other open offer is `withdrawn`. Unanswered
-broadcasts expire after `carhire.broadcast_timeout_s`.
+Counter-offer marketplace (§21.2.2):
+  • a driver who ACCEPTS the customer's price wins at once (first acceptor wins):
+    the request row is locked (SELECT … FOR UPDATE), a negotiation is created at
+    PRICE_AGREED, the request becomes `matched`, every other offer `withdrawn`;
+  • a driver COUNTER does not match: the offer becomes `countered`
+    (counter_cents, counter_expires_at = now + carhire.counter_offer_ttl_s) and
+    the customer gets `carhire.request_countered`; the request stays open for
+    other drivers. The customer accepts one counter
+    (POST …/offers/{id}/accept → PRICE_AGREED at the counter price) or counters
+    back (…/counter → `customer_countered`, driver gets
+    `carhire.customer_countered` and accepts/counters via the driver endpoints).
+Unanswered broadcasts expire after `carhire.broadcast_timeout_s`; live counters
+extend the request's expiry and expire on their own.
 
 Privacy before confirmation: first names only, no phone numbers, and driver
 positions snapped to a ~200 m grid.
@@ -80,6 +89,11 @@ def first_name(u):
 
 # ── supply ──────────────────────────────────────────────────────────────────
 
+def _account_active_clause():
+    from backend.services.account_service import active_account_clause
+    return active_account_clause()
+
+
 def online_drivers(lat, lng, service_type='car', radius_km=None, exclude_ids=(), limit=50):
     """Online, approved, active, not-busy drivers within radius → [(distance_m, driver)] nearest first."""
     service_type = normalize_service(service_type)
@@ -90,8 +104,7 @@ def online_drivers(lat, lng, service_type='car', radius_km=None, exclude_ids=(),
     dlng = radius_km / (111.0 * max(0.1, math.cos(math.radians(lat))))
     stale = datetime.utcnow() - timedelta(minutes=30)
     q = AdminUser.query.filter(
-        AdminUser.ready_for_trip == 'Yes', AdminUser.status == 1, AdminUser.deleted_at.is_(None),
-        (AdminUser.account_status.is_(None)) | (AdminUser.account_status == 'active'),
+        AdminUser.ready_for_trip == 'Yes', _account_active_clause(),   # effective account status (§15)
         getattr(AdminUser, approved_key) == 'Yes',
         AdminUser.current_latitude.between(lat - dlat, lat + dlat),
         AdminUser.current_longitude.between(lng - dlng, lng + dlng),
@@ -385,70 +398,219 @@ def _lock_request(request_id):
     return req
 
 
+LIVE_OFFER = ('offered', 'customer_countered')          # the driver may act
+COUNTER_LIVE = ('countered', 'customer_countered')       # a counter is on the table
+
+
+def _ttl():
+    return S.get_int('carhire.counter_offer_ttl_s', 90)
+
+
+def _price(v, name='price_cents'):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        raise MatchError(f'Invalid {name}.', code='bad_counter')
+    if v < 50 or v > 10_000_00:
+        raise MatchError('The price must be between $0.50 and $10,000.', code='bad_counter')
+    return v
+
+
+def _counter_expired(o, now):
+    return o.status in COUNTER_LIVE and o.counter_expires_at is not None and o.counter_expires_at <= now
+
+
 def respond(driver, request_id, accept=True, counter_cents=None):
-    """Driver accepts (or counter-offers) — first one wins. Returns (request, negotiation)."""
+    """Driver answers an offer. Returns (request, negotiation|None).
+
+    • accept (no counter) on an `offered` offer → the customer's price is taken:
+      match immediately (first acceptor wins, others withdrawn).
+    • accept on a `customer_countered` offer → the customer's counter is taken: match.
+    • counter_cents → the offer becomes `countered`; the customer sees it in the
+      live offer list (`carhire.request_countered`) and the request STAYS OPEN
+      for other drivers (spec §21.2.2 counter-offer marketplace).
+    • decline → `declined` (favourite declines broadcast at once)."""
     req = _lock_request(request_id)
     offer = (RideRequestOffer.query.filter_by(request_id=req.id, driver_id=driver.id)
              .with_for_update().populate_existing().first())
     if not offer:
         raise MatchError('This request was not offered to you.', code='forbidden', status=403)
-    if req.status not in OPEN or offer.status != 'offered':
-        taken = req.status == 'matched' and req.matched_driver_id != driver.id
-        raise MatchError('Another driver already took this request.' if taken
-                         else 'This request is no longer available.',
-                         code='already_taken' if taken else 'not_available', status=409)
     now = datetime.utcnow()
+    if _counter_expired(offer, now):
+        offer.status = 'expired'
+        db.session.commit()
+    if req.status not in OPEN or offer.status not in LIVE_OFFER:
+        taken = req.status == 'matched' and req.matched_driver_id != driver.id
+        if taken:
+            raise MatchError('Another driver already took this request.', code='already_taken', status=409)
+        if req.status in OPEN and offer.status == 'countered':
+            raise MatchError('Your counter-offer is waiting for the rider.', code='awaiting_customer', status=409,
+                             data={'counter_cents': int(offer.counter_cents or 0)})
+        raise MatchError('This request is no longer available.', code='not_available', status=409)
+
     if not accept:
         offer.status = 'declined'
         offer.responded_at = now
         db.session.flush()
-        open_left = RideRequestOffer.query.filter_by(request_id=req.id, status='offered').count()
+        open_left = RideRequestOffer.query.filter(RideRequestOffer.request_id == req.id,
+                                                  RideRequestOffer.status.in_(LIVE_OFFER + COUNTER_LIVE)).count()
         if req.status == 'favourite' and offer.is_favourite:
             broadcast(req, now)
         elif req.status == 'broadcasting' and not open_left:
             _expire(req, now, reason='All nearby drivers declined.')
+        if offer.counter_round:
+            jobs.enqueue_after_commit('backend.services.matching_service.emit_offer_update', req.id, offer.id)
         db.session.commit()
         return req, None
 
     if counter_cents not in (None, ''):
-        try:
-            counter_cents = int(counter_cents)
-        except (TypeError, ValueError):
-            raise MatchError('Invalid counter_cents.', code='bad_counter')
-        if counter_cents < 50:
-            raise MatchError('Minimum price is $0.50.', code='bad_counter')
-        if counter_cents == int(req.offer_cents):
-            counter_cents = None
+        counter_cents = _price(counter_cents, 'counter_cents')
+        on_table = int(offer.customer_counter_cents) if offer.status == 'customer_countered' \
+            else int(req.offer_cents)
+        if counter_cents != on_table:
+            _driver_counter(req, offer, driver, counter_cents, now)
+            db.session.commit()
+            return req, None
+    agreed = int(offer.customer_counter_cents) if offer.status == 'customer_countered' else int(req.offer_cents)
+    neg = _match(req, offer, driver, agreed, now, accepted_by=driver)
+    return req, neg
+
+
+def _driver_counter(req, offer, driver, counter_cents, now):
+    from backend.services.notify import notify
+    from backend.utils.money import fmt
+    offer.status, offer.counter_by, offer.counter_cents = 'countered', 'driver', counter_cents
+    offer.counter_round = int(offer.counter_round or 0) + 1
+    offer.responded_at = now
+    offer.counter_expires_at = now + timedelta(seconds=_ttl())
+    if req.expires_at is None or req.expires_at < offer.counter_expires_at:
+        req.expires_at = offer.counter_expires_at        # keep the request open while a counter is live
+    db.session.flush()
+    card = offer_card(offer, driver)
+    notify('carhire.request_countered', [req.customer_id],
+           {'id': req.id, 'request_id': req.id, 'offer_id': offer.id, 'price': fmt(counter_cents),
+            'driver_first': card['driver']['first_name'], 'rating': card['driver']['rating'],
+            'eta_min': card['eta_min'], 'counter_cents': counter_cents},
+           dedupe_key=f'rr-counter-{offer.id}-{offer.counter_round}')
+    jobs.enqueue_after_commit('backend.services.matching_service.emit_countered', req.id, offer.id)
+
+
+def emit_countered(request_id, offer_id):
+    o = db.session.get(RideRequestOffer, offer_id)
+    req = db.session.get(RideRequest, request_id)
+    if o and req and o.status == 'countered':
+        payload = offer_card(o)
+        realtime.to_user(req.customer_id, 'carhire.request_countered', {'request_id': req.id, **payload})
+
+
+def emit_offer_update(request_id, offer_id):
+    o = db.session.get(RideRequestOffer, offer_id)
+    req = db.session.get(RideRequest, request_id)
+    if o and req:
+        realtime.to_user(req.customer_id, 'carhire.offer_updated', {'request_id': req.id, **offer_card(o)})
+
+
+def customer_counter(customer, request_id, offer_id, price_cents):
+    """Customer counters one driver's counter-offer. The driver gets
+    `carhire.customer_countered` and may accept or counter again."""
+    from backend.services.notify import notify
+    from backend.utils.money import fmt
+    req = _lock_request(request_id)
+    if req.customer_id != customer.id:
+        raise MatchError('Request not found.', code='not_found', status=404)
+    price = _price(price_cents)
+    offer = (RideRequestOffer.query.filter_by(id=int(offer_id), request_id=req.id)
+             .with_for_update().populate_existing().first())
+    if not offer:
+        raise MatchError('Offer not found.', code='not_found', status=404)
+    now = datetime.utcnow()
+    if req.status not in OPEN:
+        raise MatchError('This request is no longer open.', code='not_open', status=409)
+    if _counter_expired(offer, now):
+        offer.status = 'expired'
+        db.session.commit()
+        raise MatchError('This offer has expired.', code='offer_expired', status=409)
+    if offer.status != 'countered':
+        raise MatchError('You can counter only a driver\'s live counter-offer.', code='not_counterable',
+                         status=409)
+    if price == int(offer.counter_cents or 0):
+        raise MatchError('That is the driver\'s price — accept the offer instead.', code='same_price')
+    offer.status, offer.counter_by, offer.customer_counter_cents = 'customer_countered', 'customer', price
+    offer.counter_round = int(offer.counter_round or 0) + 1
+    offer.counter_expires_at = now + timedelta(seconds=_ttl())
+    if req.expires_at is None or req.expires_at < offer.counter_expires_at:
+        req.expires_at = offer.counter_expires_at
+    db.session.flush()
+    notify('carhire.customer_countered', [offer.driver_id],
+           {'id': req.id, 'request_id': req.id, 'offer_id': offer.id, 'price': fmt(price),
+            'customer_first': first_name(customer), 'price_cents': price},
+           dedupe_key=f'rr-ccounter-{offer.id}-{offer.counter_round}')
+    jobs.enqueue_after_commit('backend.services.matching_service.emit_customer_countered', req.id, offer.driver_id)
+    db.session.commit()
+    return req, offer
+
+
+def emit_customer_countered(request_id, driver_id):
+    req = db.session.get(RideRequest, request_id)
+    if req and req.status in OPEN:
+        realtime.to_user(driver_id, 'carhire.customer_countered', incoming_card(req, driver_id))
+
+
+def accept_offer(customer, request_id, offer_id):
+    """Customer accepts a driver's counter-offer: negotiation with that driver at
+    PRICE_AGREED (agreed price = the counter), every other offer withdrawn."""
+    req = _lock_request(request_id)
+    if req.customer_id != customer.id:
+        raise MatchError('Request not found.', code='not_found', status=404)
+    offer = (RideRequestOffer.query.filter_by(id=int(offer_id), request_id=req.id)
+             .with_for_update().populate_existing().first())
+    if not offer:
+        raise MatchError('Offer not found.', code='not_found', status=404)
+    now = datetime.utcnow()
+    if req.status not in OPEN:
+        raise MatchError('This request is no longer open.', code='not_open', status=409,
+                         data={'negotiation_id': req.negotiation_id})
+    if _counter_expired(offer, now):
+        offer.status = 'expired'
+        db.session.commit()
+        raise MatchError('This offer has expired.', code='offer_expired', status=409)
+    if offer.status != 'countered':
+        raise MatchError('Only a driver\'s live counter-offer can be accepted.', code='not_acceptable',
+                         status=409)
+    driver = db.session.get(AdminUser, offer.driver_id)
+    if not driver or not driver.is_account_active():
+        raise MatchError('This driver is no longer available.', code='driver_unavailable', status=409)
+    neg = _match(req, offer, driver, int(offer.counter_cents), now, accepted_by=customer)
+    return req, neg
+
+
+def _match(req, offer, driver, agreed, now, accepted_by):
+    """Create the negotiation at PRICE_AGREED with `driver` and close the request."""
     customer = db.session.get(AdminUser, req.customer_id)
     neg = create_negotiation(customer, driver, req, stage='NEGOTIATING')
-    if counter_cents:
+    if agreed != int(req.offer_cents):
+        by_driver = offer.counter_by != 'customer'
         db.session.add(NegotiationRecord(
-            negotiation_id=neg.id, customer_id=customer.id, driver_id=driver.id, last_negotiator_id=driver.id,
-            first_negotiator_id=customer.id, price=counter_cents, price_accepted='No', message_type='Negotiation'))
-        offer.status, offer.counter_cents = 'countered', counter_cents
-        from backend.services.notify import notify
-        from backend.utils.money import fmt
-        notify('negotiation.counter_offer', [customer.id], {'ride_type': 'carhire', 'ride_id': neg.id,
-                                                            'price': fmt(counter_cents), 'from_name': first_name(driver)})
-    else:
-        agreed = int(req.offer_cents)
-        neg.agreed_price = agreed
-        neg.agreed_price_cents = agreed
-        neg.customer_accepted = 'Accepted'
-        neg.customer_driver = 'Accepted'
-        offer.status = 'accepted'
-        db.session.flush()
-        TSM.transition('carhire', neg.id, 'PRICE_AGREED', actor=driver, ride=neg, commit=False,
-                       meta={'agreed_price_cents': agreed, 'ride_request_id': req.id})
+            negotiation_id=neg.id, customer_id=customer.id, driver_id=driver.id,
+            last_negotiator_id=driver.id if by_driver else customer.id, first_negotiator_id=customer.id,
+            price=agreed, price_accepted='Yes', message_type='Negotiation'))
+    neg.agreed_price = agreed
+    neg.agreed_price_cents = agreed
+    neg.customer_accepted = 'Accepted'
+    neg.customer_driver = 'Accepted'
+    offer.status = 'accepted'
     offer.responded_at = now
+    db.session.flush()
+    TSM.transition('carhire', neg.id, 'PRICE_AGREED', actor=accepted_by, ride=neg, commit=False,
+                   meta={'agreed_price_cents': agreed, 'ride_request_id': req.id, 'offer_id': offer.id,
+                         'counter_round': int(offer.counter_round or 0)})
     req.status = 'matched'
     req.matched_driver_id = driver.id
     req.matched_at = now
     req.negotiation_id = neg.id
     withdrawn = []
-    for o in RideRequestOffer.query.filter(RideRequestOffer.request_id == req.id,
-                                           RideRequestOffer.id != offer.id,
-                                           RideRequestOffer.status == 'offered'):
+    for o in RideRequestOffer.query.filter(RideRequestOffer.request_id == req.id, RideRequestOffer.id != offer.id,
+                                           RideRequestOffer.status.in_(LIVE_OFFER + COUNTER_LIVE)):
         o.status = 'withdrawn'
         o.responded_at = now
         withdrawn.append(o.driver_id)
@@ -456,9 +618,11 @@ def respond(driver, request_id, accept=True, counter_cents=None):
     for d in withdrawn:
         realtime.to_user(d, 'carhire.request_withdrawn', {'request_id': req.id, 'reason': 'taken'})
     realtime.to_user(req.customer_id, 'carhire.request_matched', {
-        'request_id': req.id, 'negotiation_id': neg.id, 'counter_cents': counter_cents,
-        'agreed': not counter_cents, 'driver': driver_card(driver)})
-    return req, neg
+        'request_id': req.id, 'negotiation_id': neg.id, 'offer_id': offer.id, 'agreed_cents': agreed,
+        'counter_cents': offer.counter_cents, 'agreed': True, 'driver': driver_card(driver)})
+    realtime.to_user(driver.id, 'carhire.request_matched', {'request_id': req.id, 'negotiation_id': neg.id,
+                                                            'agreed_cents': agreed})
+    return neg
 
 
 def cancel(customer, request_id):
@@ -479,7 +643,9 @@ def cancel(customer, request_id):
 
 def _close_offers(req, status, now):
     ids = []
-    for o in RideRequestOffer.query.filter_by(request_id=req.id, status='offered'):
+    for o in RideRequestOffer.query.filter(RideRequestOffer.request_id == req.id,
+                                           RideRequestOffer.status.in_(('offered', 'countered',
+                                                                        'customer_countered'))):
         o.status = status
         o.responded_at = now
         ids.append(o.driver_id)
@@ -525,6 +691,7 @@ def tick(now=None):
         except Exception:
             db.session.rollback()
             log.exception('favourite timeout failed for request %s', r.id)
+    done['counters_expired'] = expire_counters(now)
     for r in RideRequest.query.filter(RideRequest.status == 'broadcasting',
                                       RideRequest.expires_at <= now).limit(200).all():
         try:
@@ -537,6 +704,25 @@ def tick(now=None):
             db.session.rollback()
             log.exception('expire failed for request %s', r.id)
     return done
+
+
+def expire_counters(now=None):
+    """Counters nobody answered within carhire.counter_offer_ttl_s expire; the
+    request stays open for other drivers."""
+    now = now or datetime.utcnow()
+    n = 0
+    rows = (RideRequestOffer.query.filter(RideRequestOffer.status.in_(COUNTER_LIVE),
+                                          RideRequestOffer.counter_expires_at <= now).limit(200).all())
+    for o in rows:
+        o.status = 'expired'
+        o.responded_at = now
+        req = db.session.get(RideRequest, o.request_id)
+        if req is not None:
+            jobs.enqueue_after_commit('backend.services.matching_service.emit_offer_update', req.id, o.id)
+            jobs.enqueue_after_commit('backend.services.matching_service.emit_withdrawn', req.id, o.driver_id)
+        n += 1
+    db.session.commit()
+    return n
 
 
 # ── views ───────────────────────────────────────────────────────────────────
@@ -565,8 +751,39 @@ def request_out(req):
         'favourite_until': _iso(req.favourite_until), 'broadcast_at': _iso(req.broadcast_at),
         'expires_at': _iso(req.expires_at), 'negotiation_id': req.negotiation_id,
         'matched_driver': _mini_user(req.matched_driver_id), 'matched_at': _iso(req.matched_at),
-        'offers': {'sent': len(offers), 'open': counts.get('offered', 0), 'declined': counts.get('declined', 0)},
+        'offers': {'sent': len(offers), 'open': counts.get('offered', 0), 'declined': counts.get('declined', 0),
+                   'countered': counts.get('countered', 0) + counts.get('customer_countered', 0)},
+        # The live marketplace: every driver counter (and the customer's counter
+        # back), newest first, with a per-offer expiry.
+        'live_offers': [offer_card(o) for o in sorted(offers, key=lambda o: o.responded_at or o.offered_at,
+                                                        reverse=True)
+                        if o.status in COUNTER_LIVE and not _counter_expired(o, datetime.utcnow())],
+        'counter_offer_ttl_s': _ttl(),
         'created_at': _iso(req.created_at),
+    }
+
+
+def offer_card(o, driver=None):
+    """One driver's offer as the customer sees it (first name only, no phone)."""
+    d = driver or db.session.get(AdminUser, o.driver_id)
+    veh = (R.vehicle_card(d) or {}) if d else {}
+    turn = 'customer' if o.status == 'countered' else ('driver' if o.status in ('customer_countered', 'offered')
+                                                       else None)
+    return {
+        'offer_id': o.id, 'status': o.status, 'turn': turn,
+        'driver': {'id': d.id if d else o.driver_id, 'first_name': first_name(d) if d else 'Driver',
+                   'avatar': resolve_media_url(d.avatar) if d else None,
+                   'rating': float(d.rating) if (d and d.rating) else None,
+                   'rating_count': (d.rating_count or 0) if d else 0,
+                   'vehicle': {k: veh.get(k) for k in ('make', 'model', 'color', 'year')}},
+        'counter_cents': int(o.counter_cents) if o.counter_cents is not None else None,
+        'customer_counter_cents': int(o.customer_counter_cents) if o.customer_counter_cents is not None else None,
+        'counter_round': int(o.counter_round or 0),
+        'eta_min': max(1, round(o.eta_s / 60)) if o.eta_s else None,
+        'distance_m': o.distance_m,
+        'expires_at': _iso(o.counter_expires_at),
+        'accept_endpoint': f'/api/carhire/requests/{o.request_id}/offers/{o.id}/accept',
+        'counter_endpoint': f'/api/carhire/requests/{o.request_id}/offers/{o.id}/counter',
     }
 
 
@@ -585,12 +802,16 @@ def incoming_card(req, driver_id):
         'respond_by': _iso(req.favourite_until if req.status == 'favourite' else req.expires_at),
         'customer': _mini_user(req.customer_id),
         'offer_status': o.status if o else None,
+        'my_counter_cents': int(o.counter_cents) if (o and o.counter_cents is not None) else None,
+        'customer_counter_cents': int(o.customer_counter_cents) if (o and o.customer_counter_cents is not None)
+        else None,
+        'counter_expires_at': _iso(o.counter_expires_at) if o else None,
     }
 
 
 def incoming(driver):
     rows = (db.session.query(RideRequest).join(RideRequestOffer, RideRequestOffer.request_id == RideRequest.id)
-            .filter(RideRequestOffer.driver_id == driver.id, RideRequestOffer.status == 'offered',
+            .filter(RideRequestOffer.driver_id == driver.id, RideRequestOffer.status.in_(LIVE_OFFER),
                     RideRequest.status.in_(OPEN))
             .order_by(RideRequest.id.desc()).limit(50).all())
     return [incoming_card(r, driver.id) for r in rows]

@@ -4,6 +4,16 @@
    inline styles, dark-mode classes from _layout.html. #}
 {% set tz = r.timezone %}
 {% block content %}
+<style>
+  /* dark variants (Apple Mail, iOS, Outlook.com [data-ogsc]) */
+  @media (prefers-color-scheme: dark){
+    .save-box{background:#2a2112 !important;border-color:#7a5a1e !important;color:#f6c56b !important;}
+    .total-row td{border-top-color:#e5e7eb !important;}
+    a.btn{color:#111111 !important;}
+  }
+  [data-ogsc] .save-box{background:#2a2112 !important;border-color:#7a5a1e !important;color:#f6c56b !important;}
+  [data-ogsc] .total-row td{border-top-color:#e5e7eb !important;}
+</style>
 {% if show_thanks %}
 <h1 class="ink" style="margin:0 0 6px 0;font-size:24px;line-height:1.25;color:#111827">Thanks for riding, {{ first_name }}!</h1>
 <p class="muted" style="margin:0 0 20px 0;color:#6b7280;font-size:14px">{{ local_time(r.dropoff_at or t.captured_at, tz) }}</p>
@@ -42,7 +52,7 @@
 
 {% if t.negotiation and t.negotiation.saved_cents %}
 <table role="presentation" width="100%" style="margin:0 0 18px 0"><tr>
-  <td style="background:#fff7e6;border:1px solid #f6c56b;border-radius:12px;padding:14px 16px;color:#7a4a00;font-size:15px">
+  <td class="save-box" style="background:#fff7e6;border:1px solid #f6c56b;border-radius:12px;padding:14px 16px;color:#7a4a00;font-size:15px">
     🤝 <strong>You negotiated and saved {{ money(t.negotiation.saved_cents) }}</strong> vs. the initial ask of {{ money(t.negotiation.initial_ask_cents) }}.
   </td>
 </tr></table>
@@ -54,7 +64,14 @@
 </tr></table>
 
 <table role="presentation" style="margin:0 0 22px 0"><tr>
-  <td style="padding-right:10px"><a class="btn" href="{{ tip_url }}" style="background:{{ brand_color }};color:#111111;text-decoration:none;font-weight:700;border-radius:10px;padding:12px 20px;display:inline-block">Add a tip</a></td>
+  <td style="padding-right:10px">
+    <!--[if mso]>
+    <v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="{{ tip_url }}" style="height:44px;v-text-anchor:middle;width:140px;" arcsize="23%" stroke="f" fillcolor="{{ brand_color }}">
+      <w:anchorlock/><center style="color:#111111;font-family:Arial,sans-serif;font-size:15px;font-weight:bold;">Add a tip</center>
+    </v:roundrect>
+    <![endif]-->
+    <!--[if !mso]><!-- --><a class="btn" href="{{ tip_url }}" style="background:{{ brand_color }};color:#111111;text-decoration:none;font-weight:700;border-radius:10px;padding:12px 20px;display:inline-block;mso-hide:all">Add a tip</a><!--<![endif]-->
+  </td>
   <td><a href="{{ receipt_url }}" class="ink" style="color:#111827;font-weight:600;text-decoration:underline">View in app</a></td>
 </tr></table>
 {% endif %}
@@ -73,7 +90,7 @@
   {% if t.tip_cents %}
   <tr><td class="ink" style="padding:5px 0;color:#111827">Tip (100% to your driver, not taxed)</td><td align="right" class="ink" style="padding:5px 0;color:#111827">{{ money(t.tip_cents) }}</td></tr>
   {% endif %}
-  <tr><td class="ink line" style="padding:10px 0;border-top:2px solid #111827;color:#111827;font-size:17px;font-weight:800">Total charged</td><td align="right" class="ink line" style="padding:10px 0;border-top:2px solid #111827;color:#111827;font-size:17px;font-weight:800">{{ money(t.total_cents) }} CAD</td></tr>
+  <tr class="total-row"><td class="ink line" style="padding:10px 0;border-top:2px solid #111827;color:#111827;font-size:17px;font-weight:800">Total charged</td><td align="right" class="ink line" style="padding:10px 0;border-top:2px solid #111827;color:#111827;font-size:17px;font-weight:800">{{ money(t.total_cents) }} CAD</td></tr>
 </table>
 <p class="muted" style="margin:0 0 4px 0;color:#6b7280;font-size:13px">{{ t.payment_method }}{% if t.authorized_at %} · authorized {{ local_time(t.authorized_at, tz) }}{% endif %}{% if t.captured_at %} · charged {{ local_time(t.captured_at, tz) }}{% endif %}</p>
 {% if t.registration.gst_hst %}<p class="muted" style="margin:0 0 4px 0;color:#6b7280;font-size:12px">GST/HST reg. no. {{ t.registration.gst_hst }}{% if t.registration.qst and t.province == 'QC' %} · QST reg. no. {{ t.registration.qst }}{% endif %}</p>{% endif %}

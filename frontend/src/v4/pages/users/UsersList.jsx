@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { Avatar, Badge, Group, Select, Text, TextInput } from '@mantine/core';
+import { Avatar, Badge, Button, Group, Select, Text, TextInput } from '@mantine/core';
 import { useDebouncedValue } from '@mantine/hooks';
 import { FiSearch } from 'react-icons/fi';
 import { http, page } from '../../lib/api';
@@ -13,9 +13,10 @@ export default function UsersList() {
   const [search, setSearch] = useState('');
   const [type, setType] = useState('');
   const [status, setStatus] = useState('');
+  const [acct, setAcct] = useState('');
   const [p, setP] = useState(1);
   const [dq] = useDebouncedValue(search, 350);
-  const params = { search: dq, user_type: type, status, page: p, per_page: 25 };
+  const params = { search: dq, user_type: type, status, account_status: acct, page: p, per_page: 25 };
   const q = useQuery({ queryKey: ['users', params], queryFn: () => http.get('/admin/users', params) });
   const pg = page(q.data);
   return (
@@ -24,7 +25,9 @@ export default function UsersList() {
       <Group mb="sm" gap="xs" wrap="wrap">
         <TextInput size="xs" leftSection={<FiSearch />} placeholder="Name, email, phone, username" value={search} onChange={(e) => { setSearch(e.currentTarget.value); setP(1); }} w={280} />
         <Select size="xs" placeholder="All types" clearable value={type} onChange={(v) => { setType(v || ''); setP(1); }} data={['Customer', 'Driver', 'Pending Driver', 'Admin']} w={160} />
-        <Select size="xs" placeholder="Any status" clearable value={status} onChange={(v) => { setStatus(v || ''); setP(1); }} data={[{ value: '1', label: 'Active (1)' }, { value: '0', label: 'Inactive (0)' }]} w={150} />
+        <Select size="xs" placeholder="Any account status" clearable value={acct} onChange={(v) => { setAcct(v || ''); setP(1); }} data-testid="acct-filter"
+          data={['active', 'suspended', 'deactivated', 'banned', 'pending_review'].map((v) => ({ value: v, label: v.replace('_', ' ').replace(/^./, (c) => c.toUpperCase()) }))} w={190} />
+        <Select size="xs" placeholder="Legacy status flag" clearable value={status} onChange={(v) => { setStatus(v || ''); setP(1); }} data={[{ value: '1', label: 'Active (1)' }, { value: '0', label: 'Inactive (0)' }]} w={150} />
       </Group>
       <DataTable
         loading={q.isLoading} error={q.error} rows={pg.items} pageInfo={pg} onPage={setP} minWidth={900}
@@ -51,6 +54,11 @@ export default function UsersList() {
           { key: 'rating', label: 'Rating', render: (u) => (u.rating ? `★ ${Number(u.rating).toFixed(2)} (${u.rating_count || 0})` : '—') },
           { key: 'province', label: 'Prov.', render: (u) => u.province || '—' },
           { key: 'created_at', label: 'Joined', render: (u) => <Time value={u.created_at} /> },
+          { key: 'actions', label: 'Actions', render: (u) => (
+            <Button size="compact-xs" variant="light" onClick={(event) => { event.stopPropagation(); nav(`/users/${u.id}`); }}>
+              Edit account
+            </Button>
+          ) },
         ]}
       />
     </>

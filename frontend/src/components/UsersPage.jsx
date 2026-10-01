@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { adminAPI } from '../services/api';
+import { AccountToggleModal, useAccountReasons } from './legacyActions';
 import {
   FiCheck, FiX, FiToggleLeft, FiToggleRight, FiSearch, FiChevronLeft,
   FiChevronRight, FiEdit2, FiTrash2, FiUser, FiAlertTriangle,
@@ -523,6 +524,29 @@ function FieldInput({ field, value, onChange }) {
   );
 }
 
+const inputStyle = {
+  width: '100%', padding: '9px 10px', fontSize: 13, border: '1.5px solid #ccc', outline: 'none', fontFamily: 'inherit', background: '#fff',
+};
+
+/** Reason fields shown when the editor changes the account status (backend requires reason_code + reason_text). */
+function StatusReasonFields({ form, set }) {
+  const { reasons, loading, error } = useAccountReasons();
+  return (
+    <div style={{ gridColumn: '1 / -1', background: '#fff8e1', border: '1px solid #ffe082', padding: 12 }} data-testid="editor-status-reason">
+      <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>A reason is required to change the account status</div>
+      {error && <div style={{ color: '#d32f2f', fontSize: 12, marginBottom: 6 }}>Could not load reasons: {error}</div>}
+      <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#666', marginBottom: 4 }}>Reason</label>
+      <select value={form.reason_code || ''} onChange={(e) => set('reason_code', e.target.value)} style={{ ...inputStyle, marginBottom: 8 }} data-testid="editor-reason-code">
+        <option value="">{loading ? 'Loading…' : 'Choose a reason…'}</option>
+        {reasons.map((r) => <option key={r.code} value={r.code}>{r.label}{r.category ? ` (${r.category.replace(/_/g, ' ')})` : ''}</option>)}
+      </select>
+      <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#666', marginBottom: 4 }}>Explanation</label>
+      <textarea rows={2} value={form.reason_text || ''} onChange={(e) => set('reason_text', e.target.value)} style={{ ...inputStyle, resize: 'vertical' }} data-testid="editor-reason-text" />
+      <p style={{ fontSize: 11, color: '#888', marginTop: 6 }}>Deactivation revokes every session and notifies the user; stored in the audit log.</p>
+    </div>
+  );
+}
+
 function EditDrawer({ user, onClose, onSave }) {
   const [form, setForm] = useState({});
   const [activeTab, setActiveTab] = useState(0);
@@ -556,8 +580,20 @@ function EditDrawer({ user, onClose, onSave }) {
     setMsg(null);
     try {
       const payload = { ...form };
-      // keep status as int
-      if (payload.status !== undefined) payload.status = parseInt(payload.status, 10);
+      const origStatus = user.status === 'active' ? '1' : '0';
+      if (payload.status === origStatus) {
+        delete payload.status;          // unchanged → no reason needed
+        delete payload.reason_code;
+        delete payload.reason_text;
+      } else {
+        if (!payload.reason_code || !String(payload.reason_text || '').trim()) {
+          setMsg({ type: 'error', text: 'Choose a reason and add an explanation to change the account status.' });
+          setActiveTab(0);
+          setSaving(false);
+          return;
+        }
+        payload.status = parseInt(payload.status, 10);
+      }
       const { data } = await adminAPI.userUpdate(user.id, payload);
       if (data.code === 1) {
         setMsg({ type: 'success', text: 'Saved successfully' });
@@ -565,8 +601,8 @@ function EditDrawer({ user, onClose, onSave }) {
       } else {
         setMsg({ type: 'error', text: data.message || 'Save failed' });
       }
-    } catch {
-      setMsg({ type: 'error', text: 'Network error' });
+    } catch (e) {
+      setMsg({ type: 'error', text: e?.response?.data?.message || 'Network error' });
     } finally {
       setSaving(false);
     }
@@ -622,6 +658,15 @@ function EditDrawer({ user, onClose, onSave }) {
                 <FieldInput field={field} value={form[field.key]} onChange={(v) => set(field.key, v)} />
               </div>
             ))}
+            {group.title === 'Account Settings' && form.status !== undefined && form.status !== (user.status === 'active' ? '1' : '0') && (
+              <StatusReasonFields form={form} set={set} />
+            )}
+            {group.title === 'Account Settings' && (
+              <div style={{ gridColumn: '1 / -1', fontSize: 12, color: '#666' }} data-testid="editor-online-readonly">
+                Online for trips: <b>{user.ready_for_trip || 'No'}</b> — read-only. Drivers go online from the app, which checks
+                documents, background check and account status.
+              </div>
+            )}
           </div>
         </div>
       ))}
@@ -872,6 +917,7 @@ export default function UsersPage() {
   const [editing, setEditing]   = useState(null);
   const [driverReview, setDriverReview] = useState(null); // NEW: driver application review
   const [confirm, setConfirm]   = useState(null); // { id, action, label }
+  const [toggling, setToggling] = useState(null); // user whose status is being changed (reason modal)
   const [actionLoading, setActionLoading] = useState({});
 
   const perPage = 20;
@@ -918,7 +964,7 @@ export default function UsersPage() {
     try {
       if (action === 'approve') await adminAPI.approveDriver(id);
       else if (action === 'reject') await adminAPI.rejectDriver(id);
-      else if (action === 'toggle') await adminAPI.toggleStatus(id);
+      else if (action === 'toggle') { setToggling(users.find((x) => x.id === id) || { id }); return; }
       else if (action === 'delete') await adminAPI.userDelete(id);
       load(page, search, filterType);
     } catch {
@@ -1167,6 +1213,15 @@ export default function UsersPage() {
           onClose={() => setDriverReview(null)}
           onApproved={(updated) => { onSaveUser(updated); setDriverReview(null); load(page, search, filterType); }}
           onRejected={(updated) => { onSaveUser(updated); setDriverReview(null); load(page, search, filterType); }}
+        />
+      )}
+
+      {/* account status change — reason required */}
+      {toggling && (
+        <AccountToggleModal
+          user={toggling}
+          onClose={() => setToggling(null)}
+          onDone={(updated) => { if (updated?.id) onSaveUser(updated); load(page, search, filterType); }}
         />
       )}
 

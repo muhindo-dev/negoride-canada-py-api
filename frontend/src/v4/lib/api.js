@@ -44,6 +44,7 @@ export const http = {
   get: (url, params) => call(() => api.get(url, { params: clean(params) })),
   post: (url, body, headers) => call(() => api.post(url, body ?? {}, headers ? { headers } : undefined)),
   put: (url, body) => call(() => api.put(url, body ?? {})),
+  patch: (url, body) => call(() => api.patch(url, body ?? {})),
   del: (url) => call(() => api.delete(url)),
   /** Full envelope (message too) — for actions whose message matters. */
   postFull: async (url, body, headers) => {
@@ -128,4 +129,37 @@ export async function openBlob(url, params) {
 export function idemKey(prefix = 'admin') {
   const rnd = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`);
   return `${prefix}-${rnd}`;
+}
+
+// Human text for the state-machine / payment error codes the admin actions
+// return (reason_required 400, payment_required 402, invalid_transition /
+// terminal / bad_stage 409 with data.stage, …). Falls back to the server message.
+const ERROR_HINTS = {
+  reason_required: 'A reason of at least 5 characters is required.',
+  reason_text_required: 'Add a short explanation (reason text).',
+  payment_required: 'The ride is not paid yet — mark it paid (offline payment) or let the customer pay first.',
+  invalid_transition: 'The state machine does not allow this change from the current stage.',
+  terminal: 'The ride has already ended and cannot change.',
+  bad_stage: 'Not possible at the ride’s current stage.',
+  already_paid: 'This booking is already paid.',
+  already_assigned: 'That driver is already assigned.',
+  driver_unavailable: 'That driver cannot take rides right now (not approved, inactive or offline).',
+  no_price: 'The booking has no agreed price — pass an amount.',
+  not_in_review: 'This ride has no payment waiting for a safety decision.',
+  bad_amount: 'The amount is out of range.',
+  gateway_error: 'Stripe refused the operation.',
+  not_completed: 'The ride is not completed yet.',
+};
+
+export function describeError(e) {
+  if (!e) return '';
+  const code = e.code || e.data?.error_code;
+  const stage = e.data?.stage;
+  const msg = e.message || String(e);
+  const hint = code && ERROR_HINTS[code];
+  const parts = [msg];
+  // Server messages are usually explicit already; add the hint only to terse ones.
+  if (hint && msg.length < 40) parts.push(hint);
+  if (stage && !msg.includes(stage)) parts.push(`Current stage: ${stage}.`);
+  return parts.join(' ');
 }

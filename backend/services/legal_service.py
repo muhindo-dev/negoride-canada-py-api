@@ -291,6 +291,7 @@ def publish(doc, admin, requires_reacceptance=False, what_changed=None, effectiv
                  'requires_reacceptance': doc.requires_reacceptance})
     if doc.requires_reacceptance:
         jobs.enqueue_after_commit('backend.services.legal_service.notify_policy_update', doc.id)
+    invalidate_gate_cache()
     return previous
 
 
@@ -318,6 +319,29 @@ def notify_policy_update(doc_id):
     return len(ids)
 
 
+DRIVER_TYPES = ('Driver', 'Pending Driver')
+
+
+def _audience_counts():
+    """{(is_driver, is_fr): n} over live accounts — one grouped query."""
+    from sqlalchemy import case, func
+    is_drv = case((AdminUser.user_type.in_(DRIVER_TYPES), 1), else_=0)
+    is_fr = case((AdminUser.preferred_language == 'fr', 1), else_=0)
+    rows = (db.session.query(is_drv, is_fr, func.count(AdminUser.id))
+            .filter(AdminUser.deleted_at.is_(None)).group_by(is_drv, is_fr).all())
+    return {(int(a), int(b)): int(n) for a, b, n in rows}
+
+
+def audience_size(doc, counts=None):
+    """Users a document applies to: its audience (all|customer|driver) AND its language
+    (FR documents → users whose preferred language is French; EN → everyone else)."""
+    counts = counts if counts is not None else _audience_counts()
+    fr = 1 if doc.language == 'fr' else 0
+    drivers = counts.get((1, fr), 0)
+    customers = counts.get((0, fr), 0)
+    return {'driver': drivers, 'customer': customers}.get(doc.audience, drivers + customers)
+
+
 def acceptance_stats(doc_type=None):
     from sqlalchemy import func
     q = LegalDocument.query
@@ -327,13 +351,128 @@ def acceptance_stats(doc_type=None):
     counts = dict(db.session.query(LegalAcceptance.document_id, func.count(LegalAcceptance.id))
                   .filter(LegalAcceptance.document_id.in_([d.id for d in docs] or [0]))
                   .group_by(LegalAcceptance.document_id).all())
-    total_users = AdminUser.query.filter(AdminUser.deleted_at.is_(None)).count()
+    aud = _audience_counts()
+    total_users = sum(aud.values())
     out = []
     for d in docs:
         n = int(counts.get(d.id, 0))
+        denom = audience_size(d, aud)
         out.append({**summary_of(d), 'status': d.status, 'published_at': _iso(d.published_at),
-                    'acceptances': n, 'acceptance_rate_pct': round(100.0 * n / total_users, 1) if total_users else 0.0})
+                    'acceptances': n, 'audience_users': denom,
+                    'acceptance_rate_pct': min(100.0, round(100.0 * n / denom, 1)) if denom else 0.0})
     return {'total_users': total_users, 'items': out}
+
+
+# ── re-acceptance gate (spec §12) ───────────────────────────────────────────
+# Exempt API prefixes: the user must still be able to read / accept the policy,
+# see their account, finish a ride in progress, reach support and raise an SOS.
+REACCEPT_EXEMPT_PREFIXES = (
+    '/api/legal', '/api/users/me', '/api/account', '/api/app/config', '/api/notifications',
+    '/api/notification-preferences', '/api/devices', '/api/rides/', '/api/support', '/api/safety',
+    '/api/sos', '/api/update-location', '/api/tracking', '/api/verify', '/api/profile/delete-account',
+    '/api/stream', '/api/calls',
+)
+_GATE_TTL_S = 30.0
+_gate_cache = {'at': 0.0, 'docs': None}
+
+
+def invalidate_gate_cache():
+    _gate_cache['at'] = 0.0
+    _gate_cache['docs'] = None
+
+
+def _reaccept_docs():
+    """Current published documents flagged requires_reacceptance → [(type, version, audience, language)].
+    Cached per process for a few seconds (publish() clears it in-process)."""
+    import time
+    now = time.monotonic()
+    if _gate_cache['docs'] is not None and now - _gate_cache['at'] < _GATE_TTL_S:
+        return _gate_cache['docs']
+    rows = (db.session.query(LegalDocument.type, LegalDocument.version, LegalDocument.audience,
+                             LegalDocument.language)
+            .filter(LegalDocument.status == 'published', LegalDocument.requires_reacceptance.is_(True)).all())
+    docs = [(t, v, a, lg) for t, v, a, lg in rows if t != BGC_CONSENT]
+    _gate_cache.update(at=now, docs=docs)
+    return docs
+
+
+def blocking_for(user):
+    """Pending documents that BLOCK the API for this user (requires_reacceptance). Cheap in
+    the common case: no flagged document → no query; all flagged versions accepted → one query."""
+    docs = _reaccept_docs()
+    if not docs:
+        return []
+    driverish = None
+    relevant = []
+    for t, v, a, lg in docs:
+        if a != 'all':
+            if driverish is None:
+                driverish = user.user_type in DRIVER_TYPES
+            if (a == 'driver') != driverish:
+                continue
+        relevant.append((t, v))
+    if not relevant:
+        return []
+    accepted = {(t, v) for t, v in db.session.query(LegalAcceptance.document_type, LegalAcceptance.version)
+                .filter(LegalAcceptance.user_id == user.id,
+                        LegalAcceptance.document_type.in_({t for t, _ in relevant})).all()}
+    if all(r in accepted for r in relevant):
+        return []
+    return [p for p in pending_for(user, user.preferred_language) if p.get('requires_reacceptance')]
+
+
+def gate_response(user):
+    """None, or the 403 legal_pending response for a non-exempt v4 request (spec §12)."""
+    from flask import has_request_context, jsonify, request
+    if not has_request_context():
+        return None
+    path = request.path or ''
+    if not path.startswith('/api/') or path.startswith('/api/admin') \
+            or any(path.startswith(p) for p in REACCEPT_EXEMPT_PREFIXES):
+        return None
+    try:
+        if not S.get('legal.enforce_reacceptance'):
+            return None
+    except Exception:
+        return None
+    from backend.utils.client_info import is_v4_client
+    if not is_v4_client():
+        return None   # v3 builds cannot show the modal (unless legacy clients are disallowed)
+    cache_key = f'negoride.legal_blocking.{user.id}'   # per request (the app context may be shared)
+    cached = request.environ.get(cache_key)
+    if cached is None:
+        cached = blocking_for(user)
+        request.environ[cache_key] = cached
+    if not cached:
+        return None
+    return jsonify({'code': 0, 'message': 'Please review and accept the updated policies to continue.',
+                    'data': {'error_code': 'legal_pending', 'blocking': True, 'items': cached,
+                             'pending': cached}}), 403
+
+
+# ── CASL marketing consent proof ────────────────────────────────────────────
+
+def marketing_wording(lang='en'):
+    lang = normalize_lang(lang)
+    text = S.get('legal.marketing_consent_text_fr') if lang == 'fr' else S.get('legal.marketing_consent_text')
+    return S.get('legal.marketing_consent_version'), text
+
+
+def record_marketing_consent(user, granted, source, ip=None, user_agent=None, app_version=None, lang=None,
+                             wording_version=None, channels='email,sms'):
+    """Append a CASL proof row (grant or withdraw). Caller commits."""
+    from backend.models.identity import MarketingConsent
+    lang = normalize_lang(lang or user.preferred_language)
+    version, text = marketing_wording(lang)
+    if wording_version and str(wording_version) != str(version):
+        text = None   # the client showed another wording version — keep its tag, don't claim our text
+        version = str(wording_version)[:40]
+    row = MarketingConsent(user_id=user.id, action='grant' if granted else 'withdraw', channels=channels,
+                           source=source[:40], wording_version=version, wording_text=text if granted else None,
+                           language=lang, ip=ip, user_agent=(user_agent or '')[:500] or None,
+                           app_version=app_version, created_at=datetime.utcnow())
+    db.session.add(row)
+    return row
 
 
 # ── seed (migration v4_0202) ────────────────────────────────────────────────

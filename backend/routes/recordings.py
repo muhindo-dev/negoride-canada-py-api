@@ -126,6 +126,12 @@ def get_recording(user, rec_id):
                               data={'error_code': 'forbidden'}, status_code=403)
     out = RS.to_dict(rec, user.id)
     out['chunks'] = RS.chunk_urls(rec, user.id, ttl_s=300) if rec.status != 'deleted' else []
+    if out['chunks']:
+        # Every URL handout is audited, also to the owner (spec §10.1).
+        audit('recording.access', user, 'recording', rec.id,
+              meta={'by': 'owner', 'chunks': len(out['chunks']), 'ride_type': rec.ride_type,
+                    'ride_id': rec.ride_id}, actor_type='user')
+        db.session.commit()
     return success_response('Success', out)
 
 

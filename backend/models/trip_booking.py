@@ -52,6 +52,7 @@ class TripBooking(db.Model):
     pickup_lat = db.Column(db.Numeric(10, 7), nullable=True)
     pickup_lng = db.Column(db.Numeric(10, 7), nullable=True)
     pickup_address = db.Column(db.String(500), nullable=True)
+    pickup_province = db.Column(db.String(4), nullable=True)
     confirmed_at = db.Column(db.DateTime, nullable=True)
     driver_arrived_at = db.Column(db.DateTime, nullable=True)
     checked_in_at = db.Column(db.DateTime, nullable=True)
@@ -61,6 +62,7 @@ class TripBooking(db.Model):
     cancel_reason_code = db.Column(db.String(40), nullable=True)
     awaiting_payment_since = db.Column(db.DateTime, nullable=True)
     disputed_at = db.Column(db.DateTime, nullable=True)
+    dispute_resolved_at = db.Column(db.DateTime, nullable=True)   # safety_service.mark_dispute_resolved (v4_0101)
 
     # Relationships
     customer = db.relationship('AdminUser', backref='trip_bookings',

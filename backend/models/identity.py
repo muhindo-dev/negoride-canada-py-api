@@ -146,6 +146,12 @@ class DriverDocument(SerializeMixin, db.Model):
     reviewed_by = db.Column(db.Integer)
     reviewed_at = db.Column(db.DateTime)
     reminders_sent = db.Column(db.JSON)
+    meta = db.Column(db.JSON)                       # e.g. {"attestation_rideshare_endorsement": true, "province": "ON"}
+    face_match_status = db.Column(db.String(20))    # selfie: pending|match|no_match|manual_review|error
+    face_match_score = db.Column(db.Numeric(5, 2))  # 0-100 similarity (provider), advisory only
+    face_match_provider = db.Column(db.String(30))
+    face_match_checked_at = db.Column(db.DateTime)
+    face_match_detail = db.Column(db.String(500))
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
     updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
@@ -182,6 +188,13 @@ class BackgroundCheck(SerializeMixin, db.Model):
     deduction_settled_at = db.Column(db.DateTime)
     recheck_reminded_at = db.Column(db.DateTime)
     provider_score = db.Column(db.String(30))     # Certn overall_score (CLEAR|REVIEW|REJECT|…)
+    consent_evidence = db.Column(db.JSON)          # per-check e-signature proof (name, at, ip, ua, document, check id)
+    start_after = db.Column(db.DateTime)           # Certn is ordered after this (cancel + refund window)
+    refunded_cents = db.Column(db.BigInteger, nullable=False, default=0)
+    refunded_at = db.Column(db.DateTime)
+    cancelled_at = db.Column(db.DateTime)
+    deducted_cents = db.Column(db.BigInteger, nullable=False, default=0)   # pay-later: recovered so far
+    receipt_emailed_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
     updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
@@ -217,4 +230,22 @@ class SupportTicketMessage(SerializeMixin, db.Model):
     author_type = db.Column(db.String(20), nullable=False, default='user')
     body = db.Column(db.Text, nullable=False)
     attachments = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+
+
+class MarketingConsent(SerializeMixin, db.Model):
+    """CASL proof of express consent (and its withdrawal) for marketing email/SMS."""
+    __tablename__ = 'marketing_consents'
+
+    id = db.Column(db.BigInteger, primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False)
+    action = db.Column(db.String(10), nullable=False)          # grant|withdraw
+    channels = db.Column(db.String(40), nullable=False, default='email,sms')
+    source = db.Column(db.String(40), nullable=False)          # registration|preferences|sms_stop|sms_start|admin
+    wording_version = db.Column(db.String(40))
+    wording_text = db.Column(db.Text)
+    language = db.Column(db.String(5))
+    ip = db.Column(db.String(64))
+    user_agent = db.Column(db.String(500))
+    app_version = db.Column(db.String(30))
     created_at = db.Column(db.DateTime, nullable=False, default=utcnow)

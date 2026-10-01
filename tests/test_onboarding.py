@@ -25,6 +25,7 @@ SECRET = 'certn_whsec_test'
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
+    setting(monkeypatch, 'onboarding.bgc_start_delay_min', 0)   # start Certn at once (cancel window tested separately)
     PSTORE.configure(root=str(tmp_path / 'private'), key='test-key')
     fake = CC.FakeCertnClient()
     CC.set_client(fake)
@@ -59,6 +60,8 @@ def upload(client, auth, u, doc_type, expires=None):
     data = {'type': doc_type, 'file': (io.BytesIO(PNG), f'{doc_type}.png', 'image/png')}
     if expires:
         data['expires_at'] = expires
+    if doc_type == 'insurance':
+        data['attestation_rideshare_endorsement'] = 'true'
     return client.post('/api/driver/onboarding/documents', data=data, headers=auth(u),
                        content_type='multipart/form-data')
 

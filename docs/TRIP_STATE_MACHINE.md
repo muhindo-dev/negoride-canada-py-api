@@ -139,3 +139,31 @@ request-to-book (30 min), detect DRIVER_NO_SHOW, auto DRIVER_ARRIVING, auto-clos
 `GET /api/rides/active` · `GET /api/rides/{type}/{id}` · `GET …/timeline` · `POST …/en-route | arrived | start |
 complete | cancel | no-show | driver-no-show | pay | payment/sync | dispute | publish | boarding` · `GET …/cancel-preview`.
 `{type}` = `carhire | scheduled | rideshare_trip | rideshare_booking`.
+
+
+## Admin changes (legacy admin pages included)
+
+Every admin stage change goes through the state machine with `actor_type='admin'` (guards bypassed, graph enforced,
+one `trip_events` row per step, reason required and audited):
+
+| Endpoint | What it does |
+|---|---|
+| `POST /api/admin/rides/{type}/{id}/transition` `{to_stage, reason}` | one graph step |
+| `POST /api/admin/rides/{type}/{id}/cancel` `{reason, policy_reason}` | `ride_actions.cancel(actor_type='admin')` |
+| legacy `POST /api/admin/negotiations/{id}/update-status`, `/api/admin/trips/{id}/update-status`, `/api/admin/bookings/{id}/update-status` `{status, reason}` | legacy status → target stage (`Accepted` → PRICE_AGREED, or CONFIRMED when paid; `Started`/`Ongoing`/`in_progress` → IN_PROGRESS; `Completed` → COMPLETED; `confirmed` → CONFIRMED; `Active` → PUBLISHED; cancelled → cancel) and `walk_to()`; unpaid payment-gated targets → 402 `payment_required`; unreachable → 409 `invalid_transition` with `data.stage` |
+| legacy `POST /api/admin/{negotiations,trips,bookings}/{id}/cancel` `{reason}` | policy cancellation (hold released / fee captured in a job, parties notified) |
+| legacy `POST /api/admin/bookings/{id}/mark-paid` `{reason}` | offline `RidePayment` (captured) + walk to CONFIRMED |
+| legacy `POST /api/admin/bookings/{id}/assign-driver` | `ride_actions.reassign_driver()` (same as v4 reassign) |
+
+The legacy Stripe `checkout.session.completed` handler for pre-v4 seat bookings also confirms through `walk_to()`.
+
+## Drafts, province, tests
+
+* `POST /api/trips-create` with `publish=false` creates a **DRAFT** (not searchable, not bookable, trip detail
+  404 for other users) — publish with `POST /api/rides/rideshare_trip/{id}/publish`.
+* `record_creation()` stamps `pickup_province` from the pickup point (`utils/province.py`, offline polygons) for
+  every ride type — used for sales tax on receipts.
+* `tests/test_state_machine_matrix.py` walks the full (from, to) matrix of all four graphs through `transition()` on
+  real rows (legal pairs pass, illegal → `invalid_transition` 409, same stage → `already_in_stage`, unlisted actors
+  → `forbidden_actor`), cancellation before payment and after arrival (fee + waiting time) over HTTP, and one
+  end-to-end ride from the request to CLOSED (counter-offer → pay → PIN → capture → receipt → both rated).

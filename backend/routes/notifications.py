@@ -9,7 +9,10 @@
     PUT  /api/notification-preferences           {groups: {negotiation: {push, sms, email}}, quiet_start, quiet_end}
     POST /api/devices/register                   {device_id, platform, app_version, onesignal_subscription_id, locale, timezone}
     GET  /api/app/config                         public settings / feature flags (no auth)
-    POST /api/webhooks/twilio/status             Twilio message status callback (signed)
+    POST /api/devices/live-activity              {ride_type, ride_id, activity_id, push_token} (iOS Live Activity)
+    DELETE /api/devices/live-activity/{activity_id}
+    POST /api/webhooks/twilio/status             Twilio message status callback (signed) → job
+    POST /api/webhooks/postmark                  Postmark delivery/open/bounce/spam (basic auth) → job
 """
 import base64
 import hashlib
@@ -132,9 +135,16 @@ def put_prefs(user):
         if 'quiet_start' in data:
             p.quiet_start, p.quiet_end = (qs or None), (qe or None)
     if 'marketing_opt_in' in data:
-        opt = bool(data.get('marketing_opt_in'))
+        opt = data.get('marketing_opt_in') in (True, 'true', '1', 1, 'yes', 'on')
         if opt and not user.marketing_opt_in:
             user.marketing_opt_in_at = datetime.utcnow()
+        if opt != bool(user.marketing_opt_in):
+            # CASL proof: every grant / withdrawal with ip, user agent, wording version + text
+            from backend.services import legal_service
+            from backend.utils.client_info import app_version, client_ip, user_agent
+            legal_service.record_marketing_consent(user, opt, 'preferences', ip=client_ip(), user_agent=user_agent(),
+                                                   app_version=app_version(data), lang=user.preferred_language,
+                                                   wording_version=data.get('marketing_consent_version'))
         user.marketing_opt_in = opt
     db.session.commit()
     return success_response('Preferences saved', _prefs_payload(user))
@@ -174,6 +184,7 @@ def app_config():
         'flags': {k[3:]: v for k, v in cfg.items() if k.startswith('ff.')},
         'notification_groups': {'mandatory': list(C.MANDATORY_GROUPS), 'mutable': list(C.MUTABLE_GROUPS)},
         'android_channels': list(C.ANDROID_CHANNELS),
+        'services': S.enabled_services(),
         'server_time': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
         'socket': {'namespace': '/rt', 'path': '/socket.io'},
     })
@@ -192,25 +203,80 @@ def _twilio_signature_ok():
     return hmac.compare_digest(digest, sig)
 
 
+def _persist_and_enqueue(provider, event_id, event_type, payload, processor):
+    """Spec §2.5: persist the raw event first (unique id → replays are no-ops),
+    then process it in a job. Failures retry via platform_jobs."""
+    import json
+    from backend import jobs
+    from backend.models.platform import WebhookEvent
+    event_id = (event_id or '')[:191]
+    if WebhookEvent.query.filter_by(provider=provider, event_id=event_id).first():
+        return
+    row = WebhookEvent(provider=provider, event_id=event_id, event_type=(event_type or '')[:120],
+                       payload=json.dumps(payload), signature_valid=True, status='received',
+                       received_at=datetime.utcnow())
+    db.session.add(row)
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()   # concurrent duplicate
+        return
+    jobs.enqueue(processor, row.id)
+
+
 @notifications_bp.route('/api/webhooks/twilio/status', methods=['POST'])
 def twilio_status():
-    from backend.models.platform import WebhookEvent
     if not _twilio_signature_ok():
         return error_response('Invalid signature', status_code=403)
     sid = request.form.get('MessageSid', '')
     status = request.form.get('MessageStatus', '')
-    ev_id = f'{sid}:{status}'
-    if not WebhookEvent.query.filter_by(provider='twilio', event_id=ev_id).first():
-        import json
-        db.session.add(WebhookEvent(provider='twilio', event_id=ev_id, event_type='message.status',
-                                    payload=json.dumps(dict(request.form)), status='processed',
-                                    processed_at=datetime.utcnow()))
-    d = NotificationDelivery.query.filter_by(provider_message_id=sid).first()
-    if d:
-        if status == 'delivered':
-            d.status, d.delivered_at = 'delivered', datetime.utcnow()
-        elif status in ('failed', 'undelivered'):
-            d.status, d.failed_at = 'failed', datetime.utcnow()
-            d.error = request.form.get('ErrorCode')
-    db.session.commit()
+    _persist_and_enqueue('twilio_status', f'{sid}:{status}', 'message.status', dict(request.form),
+                         'backend.services.notify.email_status.process_twilio_status')
     return '', 204
+
+
+# ── Email provider webhooks (opens / deliveries / bounces — spec §13.1) ─────
+
+@notifications_bp.route('/api/webhooks/postmark', methods=['POST'])
+def postmark_webhook():
+    """Postmark Delivery / Open / Bounce / SpamComplaint webhooks. Protected by
+    HTTP basic auth credentials configured on the webhook URL
+    (POSTMARK_WEBHOOK_USER / POSTMARK_WEBHOOK_PASSWORD). Hard bounces and spam
+    complaints suppress email for the user (users.email_bounced_at)."""
+    user, pwd = os.getenv('POSTMARK_WEBHOOK_USER', ''), os.getenv('POSTMARK_WEBHOOK_PASSWORD', '')
+    auth = request.authorization
+    if not user or not auth or not (hmac.compare_digest(auth.username or '', user)
+                                    and hmac.compare_digest(auth.password or '', pwd)):
+        return error_response('Unauthorized', status_code=401)
+    ev = request.get_json(silent=True) or {}
+    kind = ev.get('RecordType', '')
+    mid = ev.get('MessageID', '')
+    ev_id = f"{mid}:{kind}:{ev.get('ID') or ev.get('ReceivedAt') or ev.get('DeliveredAt') or ev.get('BouncedAt') or ''}"
+    _persist_and_enqueue('postmark', ev_id, kind, ev, 'backend.services.notify.email_status.process_postmark_event')
+    return '', 204
+
+
+# ── iOS Live Activities (spec §5.1) ─────────────────────────────────────────
+
+@notifications_bp.route('/api/devices/live-activity', methods=['POST'])
+@jwt_required_with_user
+def register_live_activity(user):
+    """The app started a Live Activity for a ride and registers its push token
+    so the server can update it (stage, ETA) and end it on a terminal stage.
+    Body: {ride_type, ride_id, activity_id, push_token}."""
+    from backend.services.notify import live_activity as LA
+    try:
+        row = LA.register(user, _body())
+    except LA.LiveActivityError as e:
+        db.session.rollback()
+        return error_response(e.message, data={'error_code': e.code}, status_code=e.status)
+    return success_response('Live Activity registered', row.to_dict(), status_code=201)
+
+
+@notifications_bp.route('/api/devices/live-activity/<activity_id>', methods=['DELETE'])
+@jwt_required_with_user
+def end_live_activity(user, activity_id):
+    """The user dismissed the Live Activity: stop pushing to it."""
+    from backend.services.notify import live_activity as LA
+    n = LA.unregister(user, activity_id)
+    return success_response('Live Activity removed', {'removed': n})

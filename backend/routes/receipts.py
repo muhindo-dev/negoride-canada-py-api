@@ -4,6 +4,8 @@
     GET /api/rides/{type}/{id}/receipt.pdf    the private PDF (ride parties only)
     GET /api/receipts?page=&per_page=         my receipts (as rider), newest first
     GET /api/receipts/{id}/credit-notes/{cn}.pdf   a credit note PDF (the rider)
+    GET /api/receipts/tips/{id}.pdf           a tip receipt PDF (the rider)
+    GET /api/brand/logo.png                   public email logo
     GET /api/driver/statements                my weekly earnings statements (driver)
     GET /api/driver/statements/{id}.pdf       statement PDF (owner only)
 """
@@ -77,7 +79,31 @@ def ride_receipt_pdf(user, ride_type, ride_id):
     receipt, role, err = _receipt_for(user, ride_type, ride_id)
     if err:
         return err
+    if role == 'driver':   # driver copy: rider first name only, no payment method
+        return _pdf(RC.render_receipt_pdf(receipt, viewer='driver'), f'NegoRide-receipt-{receipt.number}-driver.pdf')
     return _pdf(RC.ensure_pdf(receipt), f'NegoRide-receipt-{receipt.number}.pdf')
+
+
+@receipts_bp.route('/api/receipts/tips/<int:tip_receipt_id>.pdf', methods=['GET'])
+@jwt_required_with_user
+def tip_receipt_pdf(user, tip_receipt_id):
+    from backend.models.money import TipReceipt
+    tr = db.session.get(TipReceipt, tip_receipt_id)
+    if tr is None:
+        return error_response('Tip receipt not found', data={'error_code': 'not_found'}, status_code=404)
+    if int(tr.customer_id) != int(user.id):
+        return error_response('Forbidden', data={'error_code': 'forbidden'}, status_code=403)
+    return _pdf(RC.ensure_tip_pdf(tr), f'NegoRide-tip-{tr.number}.pdf')
+
+
+@receipts_bp.route('/api/brand/logo.png', methods=['GET'])
+def brand_logo():
+    """Public email logo (EMAIL_LOGO_URL overrides it)."""
+    import os
+    from flask import send_file
+    path = os.path.join(RC.BACKEND_DIR, 'static', 'brand', 'logo.png')
+    resp = send_file(path, mimetype='image/png', max_age=86400)
+    return resp
 
 
 @receipts_bp.route('/api/receipts', methods=['GET'])

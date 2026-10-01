@@ -100,7 +100,8 @@ def documents(user):
 def upload(user):
     f = request.files.get('file') or request.files.get('document') or request.files.get('photo')
     try:
-        doc = O.upload_document(user, (request.form.get('type') or '').strip(), f, request.form.get('expires_at'))
+        doc = O.upload_document(user, (request.form.get('type') or '').strip(), f, request.form.get('expires_at'),
+                                attestation_rideshare_endorsement=request.form.get('attestation_rideshare_endorsement'))
     except O.OnboardingError as e:
         db.session.rollback()
         return _err(e)
@@ -150,6 +151,22 @@ def bgc_pay(user):
                else 'Complete the payment to start your check.', user, extra)
 
 
+@onboarding_bp.route('/api/driver/onboarding/background-check/cancel', methods=['POST'])
+@jwt_required_with_user
+@idempotent
+def bgc_cancel(user):
+    """Cancel before the check is submitted to Certn → full refund (card) or the
+    pay-later deduction is waived. 409 `already_submitted` / `nothing_to_cancel`."""
+    d = _body()
+    try:
+        b, refunded = O.cancel_background_check(user, d.get('reason'))
+    except O.OnboardingError as e:
+        db.session.rollback()
+        return _err(e)
+    return _ok('Your background check was cancelled' + (' and the fee refunded.' if refunded else '.'), user,
+               {'background_check': O.bgc_public(b), 'refunded_cents': refunded})
+
+
 @onboarding_bp.route('/api/driver/onboarding/background-check/sync', methods=['POST'])
 @jwt_required_with_user
 def bgc_sync(user):
@@ -179,7 +196,7 @@ def orientation_get(user):
 @jwt_required_with_user
 def orientation_post(user):
     try:
-        res = O.complete_orientation(user, _body().get('answers'))
+        res = O.complete_orientation(user, _body().get('answers'), _lang(user))
     except O.OnboardingError as e:
         db.session.rollback()
         return _err(e)

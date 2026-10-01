@@ -31,6 +31,7 @@ from backend.services.audit import audit
 log = logging.getLogger('negoride.account')
 
 STATUSES = ('active', 'suspended', 'deactivated', 'banned', 'pending_review')
+APPEALABLE = ('suspended', 'deactivated', 'banned', 'pending_review')
 ACTIONS = {'activate': 'active', 'reactivate': 'active', 'suspend': 'suspended', 'deactivate': 'deactivated',
            'ban': 'banned', 'pending_review': 'pending_review'}
 STATUS_FR = {'active': 'actif', 'suspended': 'suspendu', 'deactivated': 'désactivé', 'banned': 'banni',
@@ -71,6 +72,16 @@ class AccountError(Exception):
         self.message, self.code, self.status = message, code, status
 
 
+def validate_admin_reason(data):
+    """(message, error_code) when an admin status change lacks a listed reason_code
+    or a free-text reason_text (spec §15: mandatory reason); None when valid."""
+    if (data or {}).get('reason_code') not in REASONS:
+        return 'Choose a reason from the list (reason_code).', 'reason_required'
+    if not str((data or {}).get('reason_text') or '').strip():
+        return 'Add a short explanation (reason_text).', 'reason_text_required'
+    return None
+
+
 def reason_label(code, lang='en'):
     r = REASONS.get(code or '', None)
     if not r:
@@ -100,10 +111,21 @@ def active_ride(user):
     return None, None
 
 
+def _local_until(user, until):
+    """Suspension end in the user's local time zone (users.timezone → device → province →
+    America/Toronto), e.g. '2026-10-02 18:00 EDT'."""
+    if not until:
+        return ''
+    try:
+        return trip_effects.local_dt(user.id if user else None, until, '%Y-%m-%d %H:%M %Z')
+    except Exception:
+        return until.strftime('%Y-%m-%d %H:%M UTC')
+
+
 def message_context(user, status, reason_code=None, reason_text=None, until=None):
     lang = (user.preferred_language or 'en')[:2]
     return {'status': status.replace('_', ' '), 'status_fr': STATUS_FR.get(status, status),
-            'until': until.strftime('%Y-%m-%d %H:%M UTC') if until else '',
+            'until': _local_until(user, until),
             'reason': reason_label(reason_code, lang) or '', 'reason_code': reason_code or '',
             'reason_category': reason_category(reason_code) or '', 'can_appeal': status != 'active'}
 
@@ -193,15 +215,39 @@ def _notify(user, status, reason_code, until):
             'per_user': {str(user.id): {'reason': reason_label(reason_code, (user.preferred_language or 'en')[:2]) or ''}}})
 
 
+def status_changed_payload(user, status=None):
+    """Realtime `account.status_changed` payload (room user:{id})."""
+    st = user.effective_account_status() if user else status
+    lang = ((user.preferred_language if user else None) or 'en')[:2]
+    code = user.status_reason_code if user and st != 'active' else None
+    return {'account_status': st, 'is_active': st == 'active', 'reason_code': code,
+            'reason_category': reason_category(code) if code else None,
+            'reason_label': reason_label(code, lang) if code else None,
+            'suspended_until': _iso(user.suspended_until) if user and st == 'suspended' else None,
+            'can_appeal': st in APPEALABLE,
+            'pending_account_status': user.pending_account_status if user else None}
+
+
 def after_commit_effects(user_id, status):
-    """Tell connected clients and drop their sockets (best effort, in-process).
-    Revoked tokens also make any reconnect fail at the /rt handshake."""
+    """Tell connected clients and drop their sockets (best effort, in-process):
+    the /rt realtime socket(s) and the WebRTC call-signalling socket (namespace /).
+    Revoked tokens also make any reconnect fail at the handshake."""
     from backend.services import realtime
-    realtime.to_user(user_id, 'account.status_changed', {'account_status': status})
+    user = db.session.get(AdminUser, user_id)
+    realtime.to_user(user_id, 'account.status_changed', status_changed_payload(user, status))
     if status == 'active':
         return
+    disconnect_user_sockets(user_id)
+
+
+def disconnect_user_sockets(user_id):
+    """Disconnect realtime and call sockets after explicit session revocation."""
     try:
         from backend.app import socketio
+    except Exception:
+        log.debug('socket disconnect skipped (no socketio)', exc_info=True)
+        return
+    try:
         from backend.sockets import realtime_events as RE
         for sid, uid in list(RE._sid_user.items()):
             if uid == user_id:
@@ -211,7 +257,37 @@ def after_commit_effects(user_id, status):
                     pass
                 RE._sid_user.pop(sid, None)
     except Exception:
-        log.debug('socket disconnect skipped', exc_info=True)
+        log.debug('rt socket disconnect skipped', exc_info=True)
+    try:
+        from backend.sockets import call_events as CE
+        with CE.state_lock:
+            sid = CE.user_sockets.pop(user_id, None)
+            if sid:
+                CE.user_sockets_reverse.pop(sid, None)
+        if sid:
+            try:
+                socketio.server.disconnect(sid, namespace='/')
+            except Exception:
+                pass
+    except Exception:
+        log.debug('call socket disconnect skipped', exc_info=True)
+
+
+def active_account_clause(now=None):
+    """SQL filter: accounts whose EFFECTIVE status is active (mirrors
+    AdminUser.effective_account_status): account_status active, or unset with the
+    legacy integer status 1, or a temporary suspension whose end has passed — and
+    no status change pending after the current ride."""
+    now = now or datetime.utcnow()
+    return db.and_(
+        AdminUser.deleted_at.is_(None),
+        AdminUser.pending_account_status.is_(None),
+        db.or_(
+            AdminUser.account_status == 'active',
+            db.and_(AdminUser.account_status.is_(None),
+                    db.or_(AdminUser.status.is_(None), AdminUser.status == 1)),
+            db.and_(AdminUser.account_status == 'suspended', AdminUser.suspended_until.isnot(None),
+                    AdminUser.suspended_until <= now)))
 
 
 def apply_pending(user, commit=True):
@@ -395,7 +471,7 @@ def status_payload(user):
         'suspended_until': _iso(user.suspended_until) if st == 'suspended' else None,
         'changed_at': _iso(user.status_changed_at),
         'pending_account_status': user.pending_account_status,
-        'can_appeal': st in ('suspended', 'deactivated', 'banned', 'pending_review'),
+        'can_appeal': st in APPEALABLE,
         'can_go_online': ok,
         'go_online_block_reason': why,
         'support_email': S.get('safety.support_email'),

@@ -124,9 +124,18 @@ def _f(v):
     return float(v) if v is not None else None
 
 
-def _latest_driver_point(ride_type, ride, driver_id):
+def _latest_driver_point(ride_type, ride, driver_id, ended=False):
+    """Driver position for the public page. While the ride runs: the live
+    position (tracking.latest → Redis) first; after it ended only the ride's
+    last breadcrumb (never where the driver went afterwards)."""
     if not driver_id:
         return None
+    if not ended:
+        from backend.services import tracking
+        lt = tracking.latest(driver_id)
+        if lt and lt.get('lat') is not None:
+            return {'lat': _f(lt['lat']), 'lng': _f(lt['lng']), 'heading': lt.get('heading'),
+                    'speed_mps': _f(lt.get('speed')), 'at': lt.get('at')}
     ids = [ride.id]
     types = [ride_type]
     if ride_type == 'rideshare_booking':      # the driver streams against the trip
@@ -138,6 +147,8 @@ def _latest_driver_point(ride_type, ride, driver_id):
     if row:
         return {'lat': _f(row.lat), 'lng': _f(row.lng), 'heading': row.heading,
                 'speed_mps': _f(row.speed_mps), 'at': _iso(row.recorded_at)}
+    if ended:
+        return None
     d = db.session.get(AdminUser, driver_id)
     if d and d.current_latitude is not None and d.current_longitude is not None:
         return {'lat': _f(d.current_latitude), 'lng': _f(d.current_longitude), 'heading': None,
@@ -161,17 +172,8 @@ def breadcrumbs(ride_type, ride, user_id, limit=300, since=None):
 
 def encode_polyline(points):
     """Google encoded polyline (precision 5)."""
-    out, plat, plng = [], 0, 0
-    for lat, lng in points:
-        ilat, ilng = int(round(lat * 1e5)), int(round(lng * 1e5))
-        for v in (ilat - plat, ilng - plng):
-            v = ~(v << 1) if v < 0 else (v << 1)
-            while v >= 0x20:
-                out.append(chr((0x20 | (v & 0x1f)) + 63))
-                v >>= 5
-            out.append(chr(v + 63))
-        plat, plng = ilat, ilng
-    return ''.join(out)
+    from backend.services.geo_routes import encode_polyline as _enc
+    return _enc(points)
 
 
 def eta_for(ride_type, ride, stage, driver_pt):
@@ -183,7 +185,7 @@ def eta_for(ride_type, ride, stage, driver_pt):
         remaining = max(0, (arrives - now).total_seconds())
         return {'minutes': int(math.ceil(remaining / 60)), 'arrives_at': _iso(arrives),
                 'target': getattr(ride, 'eta_target', None) or ('pickup' if stage in PRE_PICKUP else 'dropoff'),
-                'source': 'live'}
+                'distance_m': getattr(ride, 'eta_distance_m', None), 'source': 'live'}
     if not driver_pt:
         return None
     target = 'pickup' if stage in PRE_PICKUP else 'dropoff'
@@ -193,7 +195,7 @@ def eta_for(ride_type, ride, stage, driver_pt):
     dist = R.haversine_m((driver_pt['lat'], driver_pt['lng']), dest) or 0
     seconds = dist * 1.35 / 8.33          # road factor, ~30 km/h city average
     return {'minutes': int(math.ceil(seconds / 60)), 'arrives_at': _iso(now + timedelta(seconds=seconds)),
-            'target': target, 'source': 'estimate'}
+            'target': target, 'distance_m': int(dist * 1.35), 'source': 'estimate'}
 
 
 def _public_driver(driver_id):
@@ -216,8 +218,8 @@ def ride_public(ride_type, ride):
     drv = R.driver_id(ride_type, ride)
     pickup_addr, drop_addr = R.addresses(ride_type, ride)
     pp, dp = R.pickup_point(ride_type, ride), R.dropoff_point(ride_type, ride)
-    driver_pt = _latest_driver_point(ride_type, ride, drv)
     ended = ride_ended(ride_type, stage)
+    driver_pt = _latest_driver_point(ride_type, ride, drv, ended=ended)
     crumbs = breadcrumbs(ride_type, ride, drv, limit=300) if drv else []
     pts = [(float(c.lat), float(c.lng)) for c in crumbs]
     return {
@@ -262,9 +264,30 @@ def _with_status_text(out):
             lang = (request.args.get('lang') or 'en')[:2].lower()
     except Exception:
         pass
-    label = out.get('status') or ''
-    out['status_text'] = _STATUS_FR.get(label, label) if lang == 'fr' else label
+    def apply(d):
+        label = d.get('status') or ''
+        d['status_text'] = _STATUS_FR.get(label, label) if lang == 'fr' else label
+        eta = d.get('eta')
+        if isinstance(eta, dict):
+            eta['text'] = eta_text(eta, lang)
+    apply(out)
+    if isinstance(out.get('ride'), dict):
+        apply(out['ride'])
     return out
+
+
+def eta_text(eta, lang='en'):
+    """'4 min · 1.2 km away' / '4 min · à 1,2 km'."""
+    mins = eta.get('minutes')
+    dist = eta.get('distance_m')
+    parts = [f'{mins} min'] if mins is not None else []
+    if dist is not None:
+        km = dist / 1000.0
+        if lang == 'fr':
+            parts.append(f'à {km:.1f} km'.replace('.', ',') if km >= 1 else f'à {int(dist)} m')
+        else:
+            parts.append(f'{km:.1f} km away' if km >= 1 else f'{int(dist)} m away')
+    return ' · '.join(parts)
 
 
 def public_payload(link):

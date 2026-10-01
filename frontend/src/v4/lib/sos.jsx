@@ -41,6 +41,13 @@ export function SosProvider({ children }) {
       title: `SOS #${p.incident_id}`, message: `${p.user?.name || 'A user'} (${p.role}) needs help`,
     });
   });
+  useRealtime('alert', (p) => {
+    if (!enabled || p?.kind !== 'oncall_not_configured') return;
+    notifications.show({
+      id: `oncall-${p.incident_id}`, color: 'red', autoClose: false,
+      title: 'SOS escalation failed', message: p.message || 'No on-call phones are configured (Settings → safety.oncall_phones).',
+    });
+  });
   useRealtime('safety.sos_updated', (p) => {
     if (!enabled || !p?.incident_id) return;
     setLive((m) => ({ ...m, [p.incident_id]: { ...(m[p.incident_id] || {}), ...fromEvent(p) } }));

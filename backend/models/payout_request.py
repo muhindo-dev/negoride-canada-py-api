@@ -10,7 +10,7 @@ class PayoutRequest(db.Model):
     user_id = db.Column(db.BigInteger, db.ForeignKey('admin_users.id'), nullable=False)
     payout_account_id = db.Column(db.BigInteger, db.ForeignKey('payout_accounts.id'), nullable=False)
     amount = db.Column(db.Numeric(10, 2), nullable=False)
-    currency = db.Column(db.String(3), default='USD')
+    currency = db.Column(db.String(3), default='CAD')
     fee_amount = db.Column(db.Numeric(10, 2), default=0)
     net_amount = db.Column(db.Numeric(10, 2), nullable=False)
     status = db.Column(db.Enum('pending', 'processing', 'completed', 'failed', 'cancelled'), default='pending')

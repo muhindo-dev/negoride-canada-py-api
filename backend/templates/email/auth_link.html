@@ -1,0 +1,10 @@
+{% extends "_layout.html" %}
+{% block content %}
+<h1 class="ink" style="margin:0 0 12px 0;font-size:22px;color:#111827">{{ title }}</h1>
+<p class="ink" style="margin:0 0 8px 0;color:#111827">{{ greeting }}</p>
+<p class="ink" style="margin:0 0 20px 0;color:#111827">{{ body }}</p>
+<p style="margin:0 0 20px 0"><a class="btn" href="{{ cta_url }}">{{ cta_label }}</a></p>
+<p class="muted" style="margin:0 0 8px 0;font-size:13px;color:#6b7280">{{ fallback_label }}<br>
+<a href="{{ cta_url }}" style="color:#3273dc;word-break:break-all">{{ cta_url }}</a></p>
+<p class="muted" style="margin:0;font-size:13px;color:#6b7280">{{ footnote }}</p>
+{% endblock %}

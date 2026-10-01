@@ -145,7 +145,9 @@ def _email(st):
     from backend.services.notify.templates import render
     driver = db.session.get(AdminUser, st.driver_id)
     results = []
-    if driver and driver.email:
+    if driver is not None and getattr(driver, 'email_bounced_at', None):
+        results.append((False, None, f'suppressed: {driver.email_bounce_reason or "email bounced"}'))
+    elif driver and driver.email:
         pdf = ensure_statement_pdf(st)
         subject = f'Your NegoRide earnings statement · {period_label(st)}'
         html, txt = render('driver_statement', {'title': subject, 'first_name': RC._first_name(driver) or 'there',
@@ -220,4 +222,47 @@ def weekly_driver_statements(week_start=None):
         except Exception:
             db.session.rollback()
             log.exception('Statement failed for driver %s week %s', driver_id, week_start)
+    return n
+
+
+# ── receipt sweeper (§13.4: the receipt must never be forgotten) ────────────
+
+def sweep_missing_receipts(now=None, limit=100):
+    """Periodic: rides that ended (COMPLETED / DROPPED_OFF / CLOSED) with a
+    captured ride payment but no receipt `receipts.sweep_after_s` (2 min) after
+    the capture get one now (e.g. the worker died between capture and receipt).
+    Cancelled rides with a fee capture are not receipted here."""
+    from backend.models.money import CAPTURED_STATES, RidePayment
+    from backend.services import rides as R
+    from backend.services import trip_effects
+    if not S.flag('receipts_email'):
+        return 0
+    now = now or datetime.utcnow()
+    cutoff = now - timedelta(seconds=S.get_int('receipts.sweep_after_s', 120))
+    since = now - timedelta(days=14)
+    rows = (db.session.query(RidePayment)
+            .outerjoin(Receipt, (Receipt.ride_type == RidePayment.ride_type) & (Receipt.ride_id == RidePayment.ride_id))
+            .filter(RidePayment.purpose == 'ride', RidePayment.capture_status.in_(CAPTURED_STATES),
+                    RidePayment.ride_type.in_(RC.RECEIPT_RIDE_TYPES),
+                    RidePayment.captured_at <= cutoff, RidePayment.captured_at >= since,
+                    Receipt.id.is_(None))
+            .order_by(RidePayment.captured_at.asc()).limit(limit).all())
+    n = 0
+    seen = set()
+    for rp in rows:
+        key = (rp.ride_type, rp.ride_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            ride = R.load(rp.ride_type, rp.ride_id)
+            if R.current_stage(rp.ride_type, ride) not in ('COMPLETED', 'DROPPED_OFF', 'CLOSED'):
+                continue
+            if trip_effects.issue_receipt_safe(rp.ride_type, rp.ride_id) is not None or \
+                    RC.find_receipt(rp.ride_type, rp.ride_id) is not None:
+                n += 1
+                log.warning('Receipt sweeper issued the missing receipt for %s/%s', rp.ride_type, rp.ride_id)
+        except Exception:
+            db.session.rollback()
+            log.exception('Receipt sweeper failed for %s/%s', rp.ride_type, rp.ride_id)
     return n

@@ -1,0 +1,15 @@
+{% extends "_layout.html" %}
+{% set tz = r.timezone %}
+{% block content %}
+<h1 class="ink" style="margin:0 0 6px 0;font-size:22px;line-height:1.25;color:#111827">Thank you for tipping, {{ first_name }}!</h1>
+<p class="ink" style="margin:0 0 16px 0;color:#111827">Your tip of <strong>{{ money(t.amount_cents) }}</strong> went 100 % to {{ r.driver_first or 'your driver' }}.</p>
+<table role="presentation" width="100%" style="font-size:14px;margin:0 0 10px 0">
+  <tr><td class="muted" style="padding:4px 0;color:#6b7280">Tip receipt</td><td align="right" class="ink" style="color:#111827">{{ number }}</td></tr>
+  <tr><td class="muted" style="padding:4px 0;color:#6b7280">Ride</td><td align="right" class="ink" style="color:#111827">{{ r.ride_ref }}</td></tr>
+  <tr><td class="muted" style="padding:4px 0;color:#6b7280">Route</td><td align="right" class="ink" style="color:#111827">{{ r.pickup_address }} → {{ r.dropoff_address }}</td></tr>
+  <tr><td class="muted" style="padding:4px 0;color:#6b7280">Paid with</td><td align="right" class="ink" style="color:#111827">{{ t.payment_method }}{% if t.paid_at %} · {{ local_time(t.paid_at, tz) }}{% endif %}</td></tr>
+  <tr><td class="ink" style="padding:8px 0;border-top:2px solid #111827;color:#111827;font-weight:800">Total charged</td><td align="right" class="ink" style="padding:8px 0;border-top:2px solid #111827;color:#111827;font-weight:800">{{ money(t.amount_cents) }} CAD</td></tr>
+</table>
+<p class="muted" style="margin:0 0 16px 0;color:#6b7280;font-size:13px">Tips are not subject to GST/HST. 📎 The PDF is attached.</p>
+<p style="margin:0"><a href="{{ receipt_url }}" class="ink" style="color:#111827;font-weight:600;text-decoration:underline">View the ride receipt in the app</a></p>
+{% endblock %}

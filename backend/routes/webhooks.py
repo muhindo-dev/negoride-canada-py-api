@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from flask import Blueprint, request, current_app
 from backend.models import db
 from backend.models.negotiation import Negotiation
@@ -35,9 +36,18 @@ def stripe_webhook():
             'Stripe webhook rejected: STRIPE_WEBHOOK_SECRET is not configured.')
         return error_response("Webhook signing secret not configured.", status_code=503)
 
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, secret)
-    except (ValueError, stripe.error.SignatureVerificationError):
+    event = None
+    # The Connect endpoint (driver payouts: transfer.*, payout.* on connected
+    # accounts) has its own signing secret in Stripe; accept either.
+    for candidate in (secret, os.environ.get('STRIPE_CONNECT_WEBHOOK_SECRET', '')):
+        if not candidate:
+            continue
+        try:
+            event = stripe.Webhook.construct_event(payload, sig_header, candidate)
+            break
+        except (ValueError, stripe.error.SignatureVerificationError):
+            continue
+    if event is None:
         return error_response("Invalid signature", status_code=400)
 
     event_id = event.get('id') or ''
@@ -72,6 +82,9 @@ def process_stripe_event(webhook_event_id):
     event = json.loads(row.payload)
     try:
         handled = payment_service.handle_stripe_event(event)
+        if not handled and (event.get('type', '').startswith('transfer.')
+                            or event.get('type', '').startswith('payout.')):
+            handled = payment_service.handle_connect_event(event) or True
         if not handled:
             event_type = event.get('type', '')
             data_obj = event.get('data', {}).get('object', {})
@@ -104,15 +117,10 @@ def _handle_checkout_completed(session):
         if booking:
             booking.payment_status = 'paid'
             booking.stripe_paid = 'Yes'
-            booking.status = 'Reserved'
-
-            _record_payment(
-                customer_id=booking.customer_id,
-                driver_id=booking.driver_id,
-                amount=amount,
-                reference=session_id,
-                negotiation_id=None,
-            )
+            booking.payment_completed_at = booking.payment_completed_at or datetime.utcnow()
+            _confirm_legacy_booking(booking, session_id)
+            # (The legacy `payments` table is FK-bound to negotiations, so seat
+            # bookings are not mirrored there — v4 reporting uses ride_payments.)
             # Credit the driver their net earning (idempotent, keyed on booking id).
             if booking.driver_id:
                 wallet_service.credit_ride_earning(
@@ -129,6 +137,22 @@ def _handle_checkout_completed(session):
         neg = Negotiation.query.filter_by(stripe_id=session_id).first()
         if neg:
             _mark_negotiation_paid(neg, session_id, amount)
+
+
+def _confirm_legacy_booking(booking, session_id):
+    """Pre-v4 seat Checkout paid: move the booking to CONFIRMED through the state
+    machine (writes trip_stage + legacy 'Reserved' + one trip_event per step)
+    instead of poking `status` directly."""
+    import logging
+    from backend.services import trip_state_machine as TSM
+    stage = TSM.ensure_stage('rideshare_booking', booking)
+    if stage not in ('REQUESTED', 'PENDING_PAYMENT'):
+        return
+    db.session.flush()
+    try:
+        TSM.walk_to('rideshare_booking', booking.id, 'CONFIRMED', actor=None, legacy=True)
+    except TSM.TransitionError as e:
+        logging.getLogger('negoride.webhooks').warning('legacy booking %s not confirmed: %s', booking.id, e.message)
 
 
 def _handle_payment_link_completed(link_obj):

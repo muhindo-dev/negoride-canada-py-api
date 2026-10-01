@@ -74,9 +74,14 @@ def test_phone_required_signup_flag(client, phones, monkeypatch, _created_users)
     setting(monkeypatch, 'ff.phone_required_signup', True)
     r, b = _register(client, _created_users, v4(), **_consent_ids())
     assert b['code'] == 0 and b['data']['error_code'] == 'phone_verification_required'
-    # v3 clients are unaffected
+    # v3 clients are unaffected while app.legacy_clients_allowed = true …
+    setting(monkeypatch, 'app.legacy_clients_allowed', True)
     r, b = _register(client, _created_users, {})
     assert r.status_code == 201
+    # … and get the v4 rule once legacy clients are disallowed (no header bypass)
+    setting(monkeypatch, 'app.legacy_clients_allowed', False)
+    r, b = _register(client, _created_users, {}, **_consent_ids())
+    assert b['code'] == 0 and b['data']['error_code'] == 'phone_verification_required'
 
 
 def test_resend_cooldown_and_rate_limits(client, phones, monkeypatch):
@@ -184,9 +189,13 @@ def test_passwordless_login(client, phones, make_user):
     assert b['code'] == 1 and b['data']['id'] == u.id
     me = client.get('/api/users/me', headers={'Authorization': f"Bearer {b['data']['token']}"})
     assert body(me)['data']['id'] == u.id
-    # unknown number → signup instead
-    r = client.post('/api/verify/phone/start', json={'phone': phones.new(), 'purpose': 'login'}, headers=v4())
-    assert r.status_code == 404 and body(r)['data']['signup_instead'] is True
+    # unknown number: same answer as a real start (no enumeration), nothing is sent, the code never checks
+    unknown = phones.new()
+    r = client.post('/api/verify/phone/start', json={'phone': unknown, 'purpose': 'login'}, headers=v4())
+    assert r.status_code == 200 and body(r)['code'] == 1 and set(body(r)['data']) >= {'verification_id', 'phone_masked'}
+    assert PhoneVerification.query.filter_by(phone=unknown).one().status == 'suppressed'
+    r = client.post('/api/verify/phone/check', json={'phone': unknown, 'purpose': 'login', 'code': '123456'}, headers=v4())
+    assert body(r)['data']['error_code'] == 'no_pending_code'
 
 
 def test_change_phone_notifies_old_number(client, auth, phones, make_user):
@@ -277,15 +286,20 @@ def test_sensitive_action_required_for_account_deletion(client, auth, phones, ma
     assert db.session.get(AdminUser, u.id).deleted_at is not None
 
 
-def test_sensitive_action_required_for_payout_change(client, auth, phones, make_user):
+def test_sensitive_action_required_for_payout_change(client, auth, phones, make_user, monkeypatch):
     phone = phones.new()
     u = make_user('driver')
     give_verified_phone(u, phone)
     r = client.post('/api/payout-account/deactivate', json={}, headers=auth(u, **v4()))
     assert r.status_code == 403 and body(r)['data']['purpose'] == 'sensitive_action'
-    # v3 clients keep the old behaviour
+    # v3 clients keep the old behaviour while legacy clients are allowed …
+    setting(monkeypatch, 'app.legacy_clients_allowed', True)
     r = client.post('/api/payout-account/deactivate', json={}, headers=auth(u))
     assert (body(r).get('data') or {}).get('error_code') != 'verification_required'
+    # … but a missing X-App-Version no longer bypasses the OTP once they are disallowed
+    setting(monkeypatch, 'app.legacy_clients_allowed', False)
+    r = client.post('/api/payout-account/deactivate', json={}, headers=auth(u))
+    assert r.status_code == 403 and body(r)['data']['error_code'] == 'verification_required'
 
 
 def test_legacy_otp_aliases(client, phones):
@@ -330,14 +344,16 @@ def test_twilio_inbound_stop_and_help(client, make_user, monkeypatch):
 
 def test_v4_registration_requires_three_explicit_ticks(client, _created_users):
     h = v4(ip='10.9.8.7')
-    r, b = _register(client, _created_users, h)
+    rejected = [f'v4test_reg_{uuid.uuid4().hex[:10]}' for _ in range(2)]
+    r, b = _register(client, _created_users, h, username=rejected[0])
     assert b['code'] == 0 and b['data']['error_code'] == 'consent_required'
     assert set(b['data']['missing']) == {'terms', 'privacy', 'community_guidelines'}
     ids = _consent_ids()
-    r, b = _register(client, _created_users, h, accepted_terms_id=ids['accepted_terms_id'],
+    r, b = _register(client, _created_users, h, username=rejected[1], accepted_terms_id=ids['accepted_terms_id'],
                      accepted_privacy_id=ids['accepted_privacy_id'])
     assert b['data']['missing'] == ['community_guidelines']
-    assert not AdminUser.query.filter(AdminUser.username.like('v4test_reg_%'), AdminUser.id.notin_(_created_users or [0])).count()
+    # no account was created by the refused attempts (checked by name: other test runs may be in flight)
+    assert not AdminUser.query.filter(AdminUser.username.in_(rejected)).count()
 
     r, b = _register(client, _created_users, {**h, 'User-Agent': 'NegoRide/4.0.0 (Android 14)'}, **ids)
     assert r.status_code == 201, b
@@ -359,10 +375,17 @@ def test_v4_registration_requires_three_explicit_ticks(client, _created_users):
     assert u.marketing_opt_in is True and u.marketing_opt_in_at is not None
 
 
-def test_v3_registration_still_works_without_ticks(client, _created_users):
+def test_v3_registration_still_works_without_ticks(client, _created_users, monkeypatch):
+    setting(monkeypatch, 'app.legacy_clients_allowed', True)
     r, b = _register(client, _created_users, {})
     assert r.status_code == 201 and b['code'] == 1
     assert LegalAcceptance.query.filter_by(user_id=b['data']['id']).count() == 0
+    # legacy clients disallowed → the three ticks are required even without X-App-Version
+    setting(monkeypatch, 'app.legacy_clients_allowed', False)
+    r, b = _register(client, _created_users, {})
+    assert b['code'] == 0 and b['data']['error_code'] == 'consent_required'
+    r, b = _register(client, _created_users, {}, **_consent_ids())
+    assert r.status_code == 201 and LegalAcceptance.query.filter_by(user_id=b['data']['id']).count() == 3
 
 
 def test_public_documents_render_settings_and_french(client):

@@ -1,4 +1,5 @@
-"""Delivery channels (spec §5.2): push (OneSignal), sms (Twilio), email, socket.
+"""Delivery channels (spec §5.2): push (OneSignal), sms (Twilio), email, socket,
+live_activity (OneSignal Live Activities API — services/notify/live_activity.py).
 
 `send(channel, notification, user, spec)` returns a provider message id or
 raises. PermanentFailure = don't retry (no address, not configured, opted out).
@@ -27,6 +28,9 @@ def send(channel, n, user, spec):
         return email(n, user, spec)
     if channel == 'socket':
         return socket(n, user, spec)
+    if channel == 'live_activity':
+        from backend.services.notify import live_activity
+        return live_activity.send_for_notification(n, user, spec)
     raise PermanentFailure(f'Unknown channel {channel}')
 
 
@@ -57,11 +61,13 @@ def push_onesignal(n, user, spec):
     if spec.get('sound'):
         body["ios_sound"] = f"{spec['sound']}.wav"
         body['android_sound'] = spec['sound']
-    if os.getenv('NOTIFY_PUSH_DRY_RUN') == '1' or not key:
+    if os.getenv('NOTIFY_PUSH_DRY_RUN') == '1':
+        if os.getenv('FLASK_ENV', '').strip().lower() not in ('development', 'dev', 'testing', 'test', 'local'):
+            raise PermanentFailure('NOTIFY_PUSH_DRY_RUN is not permitted in production')
         PUSH_LOG.append(body)
-        if not key:
-            raise PermanentFailure('ONESIGNAL_REST_API_KEY not configured')
         return 'dry-run'
+    if not key:
+        raise PermanentFailure('ONESIGNAL_REST_API_KEY not configured')
     r = requests.post('https://api.onesignal.com/notifications?c=push', json=body, timeout=10,
                       headers={'Authorization': f'Key {key}', 'Content-Type': 'application/json'})
     data = r.json() if r.content else {}
@@ -103,6 +109,8 @@ def email(n, user, spec):
     from backend.services.notify.templates import render_email
     if not user.email:
         raise PermanentFailure('User has no email address')
+    if getattr(user, 'email_bounced_at', None):
+        raise PermanentFailure(f'Email suppressed after {user.email_bounce_reason or "a hard bounce"}')
     subject, html, text = render_email(spec.get('email_template') or 'generic', n, user)
     try:
         return email_provider.send(user.email, subject, html, text, tag=n.event_key)

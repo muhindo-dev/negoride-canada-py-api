@@ -41,6 +41,14 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
+    # Behind nginx: trust exactly TRUSTED_PROXY_COUNT (default 1) proxy hops, so
+    # request.remote_addr is the real client IP (rate limits, audit) and a
+    # client-supplied X-Forwarded-For can't spoof it. 0 = no proxy (direct).
+    _proxies = int(os.getenv('TRUSTED_PROXY_COUNT', '1') or 0)
+    if _proxies > 0:
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_proxies, x_proto=_proxies, x_host=0, x_prefix=0)
+
     # JSON: serialise Decimal as a NUMBER, not a string. Flask's default provider
     # renders Decimal via str() (e.g. "0.90"), which breaks mobile clients that do
     # numeric math / `.toStringAsFixed()` on money fields. Money columns are
@@ -163,6 +171,14 @@ def create_app():
     if os.getenv('RUN_SCHEDULER', '0') == '1' and (not _reloading or os.getenv('WERKZEUG_RUN_MAIN') == 'true'):
         from backend.jobs import scheduler as _scheduler
         _scheduler.start_in_background()
+
+    # Loud warning when Redis is configured but unusable, or absent in production
+    # (also listed by GET /api/admin/readiness).
+    try:
+        from backend.services.readiness import log_startup_warnings
+        log_startup_warnings()
+    except Exception:  # never block startup on a diagnostic
+        pass
 
     from backend.utils.response import error_response
 

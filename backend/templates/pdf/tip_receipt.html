@@ -1,0 +1,30 @@
+{% extends "_base.html" %}
+{% set tz = r.timezone %}
+{% block title %}
+<h1>Tip receipt</h1>
+<div><strong>{{ number }}</strong></div>
+<div class="muted">Issued {{ local_time(issued_at, tz) }}</div>
+<div style="margin-top:2mm"><span class="pill">PAID</span></div>
+{% endblock %}
+{% block body %}
+<h2>Trip</h2>
+<table class="kv">
+  <tr><td class="k">Ride ID</td><td>{{ r.ride_ref }}</td></tr>
+  <tr><td class="k">Rider</td><td>{{ r.rider_name or r.rider_first }}</td></tr>
+  <tr><td class="k">Driver</td><td>{{ r.driver_name }}{% if r.vehicle %} · {{ r.vehicle }}{% endif %}</td></tr>
+  <tr><td class="k">Route</td><td>{{ r.pickup_address }} → {{ r.dropoff_address }}</td></tr>
+  {% if r.dropoff_at %}<tr><td class="k">Trip ended</td><td>{{ local_time(r.dropoff_at, tz) }}</td></tr>{% endif %}
+</table>
+
+<h2>Tip</h2>
+<table class="lines">
+  <tr><td>Tip — 100 % to your driver</td><td class="amt">{{ money(t.amount_cents) }}</td></tr>
+  <tr class="tax"><td>GST/HST</td><td class="amt">not applicable</td></tr>
+  <tr class="total"><td>Total charged</td><td class="amt">{{ money(t.amount_cents) }} CAD</td></tr>
+</table>
+<table class="kv" style="margin-top:3mm">
+  {% if t.payment_method %}<tr><td class="k">Payment method</td><td>{{ t.payment_method }}</td></tr>{% endif %}
+  {% if t.paid_at %}<tr><td class="k">Charged</td><td>{{ local_time(t.paid_at, tz) }}</td></tr>{% endif %}
+</table>
+<p class="note" style="margin-top:4mm">{{ t.note }} This is a separate document from the ride receipt.</p>
+{% endblock %}

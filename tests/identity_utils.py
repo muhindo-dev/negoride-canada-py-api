@@ -25,8 +25,10 @@ def setting(monkeypatch, key, value):
     """Override a setting for one test without touching app_settings rows."""
     spec = S.DEFAULTS[key]
     monkeypatch.setitem(S.DEFAULTS, key, (value,) + tuple(spec[1:]))
+    # hide an app_settings row for this key (a leftover admin override) for this test only
+    orig = S._load
+    monkeypatch.setattr(S, '_load', lambda: {k: v for k, v in orig().items() if k != key})
     S.invalidate()
-    assert key not in S._load(), f'{key} is overridden in app_settings; the test cannot patch it'
 
 
 class Phones:
@@ -42,6 +44,7 @@ class Phones:
         self.codes[p] = code
         if voip:
             self.voip.add(p)
+        self.mp.setenv('TWILIO_TEST_MODE_ENABLED', '1')   # §11.2 #14: test numbers need the explicit switch
         self.mp.setenv('TWILIO_TEST_NUMBERS', ','.join(f'{k}:{v}' for k, v in self.codes.items()))
         self.mp.setenv('TWILIO_TEST_VOIP_NUMBERS', ','.join(self.voip))
         return p
@@ -74,9 +77,10 @@ def verify(client, phone, purpose, headers=None, code='123456', **extra):
     return body['data']
 
 
-def give_verified_phone(user, phone):
+def give_verified_phone(user, phone, line_type='mobile'):
     from datetime import datetime
     user.phone_e164 = phone
     user.phone_number = phone
     user.phone_verified_at = datetime.utcnow()
+    user.phone_line_type = line_type
     db.session.commit()

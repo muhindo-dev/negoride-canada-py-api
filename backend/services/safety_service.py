@@ -214,6 +214,31 @@ def resolve_ride(user, ride_type, ride_id):
     return rt, ride, R.role_of(user, rt, ride)
 
 
+def resolve_ride_for_sos(user, ride_type, ride_id):
+    """SOS must never fail (spec §8.2, §8.5). Like resolve_ride(), but an
+    unknown / foreign / malformed ride falls back to the caller's active ride
+    (or no ride). Returns (ride_type, ride, role, rejected_note|None); the note
+    is stored on the incident so the safety team sees what the app sent."""
+    rejected = None
+    if ride_type or ride_id:
+        try:
+            if not ride_type or not ride_id:
+                raise SafetyError('Incomplete ride reference.', 'bad_ride')
+            return (*resolve_ride(user, ride_type, int(ride_id)), None)
+        except (SafetyError, R.RideNotFound, ValueError, TypeError) as e:
+            reason = getattr(e, 'code', None) or 'invalid'
+            rejected = (f'app sent ride {str(ride_type)[:30]}#{str(ride_id)[:20]} which was rejected '
+                        f'({reason}); using the caller\'s active ride instead')
+            log.warning('SOS by user %s: %s', user.id, rejected)
+    try:
+        rt, ride, role = resolve_ride(user, None, None)
+    except Exception:   # never let ride lookup break an SOS
+        log.exception('SOS active-ride lookup failed for user %s', user.id)
+        db.session.rollback()
+        rt = ride = role = None
+    return rt, ride, role, rejected
+
+
 def default_role(user):
     return 'driver' if user.user_type in ('Driver', 'Pending Driver') else 'customer'
 
@@ -229,7 +254,7 @@ def trigger_sos(user, data, idem_key=None, kind='sos', severity='critical'):
             db.session.commit()
             return prior, link, rec, True
 
-    rt, ride, role = resolve_ride(user, data.get('ride_type'), data.get('ride_id'))
+    rt, ride, role, rejected = resolve_ride_for_sos(user, data.get('ride_type'), data.get('ride_id'))
     lat = _num(data.get('lat', data.get('latitude')), -90, 90)
     lng = _num(data.get('lng', data.get('longitude')), -180, 180)
     if lat is None or lng is None:
@@ -249,6 +274,8 @@ def trigger_sos(user, data, idem_key=None, kind='sos', severity='critical'):
                          accuracy_m=int(acc) if acc is not None else None,
                          battery_pct=int(bat) if bat is not None else None,
                          idempotency_key=idem_key, created_at=now)
+    if rejected:
+        inc.notes = f'[{iso(now)}] system: {rejected}'
     db.session.add(inc)
     try:
         db.session.flush()
@@ -263,7 +290,8 @@ def trigger_sos(user, data, idem_key=None, kind='sos', severity='critical'):
                                               battery_pct=inc.battery_pct, recorded_at=now))
     link = live_share.get_or_create(live_share.INCIDENT, inc.id, user.id)
     audit('safety.sos_triggered', user, 'safety_incident', inc.id, after=inc.to_dict(),
-          meta={'silent': silent, 'ride_type': rt, 'ride_id': inc.ride_id, 'kind': kind})
+          meta={'silent': silent, 'ride_type': rt, 'ride_id': inc.ride_id, 'kind': kind,
+                'rejected_ride': rejected})
 
     rec = None
     st = get_settings(user.id)
@@ -319,6 +347,9 @@ def add_location(inc, data):
                'accuracy_m': int(acc) if acc is not None else None, 'heading': int(hdg) if hdg is not None else None,
                'speed_mps': spd, 'battery_pct': inc.battery_pct, 'at': iso(now), 'type': 'location'}
     realtime.to_admins('safety.sos_updated', payload, room='admin:sos')
+    # Admin live map (GET /api/admin/live/rides → `sos`): cheap position push.
+    realtime.to_admins('live.sos_location', {**payload, 'user_id': inc.user_id, 'role': inc.role,
+                                             'ride_type': inc.ride_type, 'ride_id': inc.ride_id})
     return payload
 
 
@@ -478,3 +509,139 @@ def help_contacts(province=None):
 def province_for(user, ride_type=None, ride=None):
     p = getattr(ride, 'pickup_province', None) if ride is not None else None
     return (p or getattr(user, 'province', None) or '').upper()[:2] or None
+
+
+# ── ride PIN brute-force lock (spec §8.4) ───────────────────────────────────
+#
+# Called from trip_state_machine._check_guards. Failures are written on an
+# INDEPENDENT connection: the failing transition raises and its transaction is
+# rolled back, but the attempt must still count.
+
+def _pin_window():
+    return (max(1, S.get_int('safety.pin_max_attempts', 5) or 5),
+            max(60, S.get_int('safety.pin_lock_window_s', 600) or 600))
+
+
+def _pin_failures(conn, ride_type, ride_id, since):
+    from sqlalchemy import text
+    rows = conn.execute(text('SELECT created_at FROM ride_pin_failures WHERE ride_type=:t AND ride_id=:i '
+                             'AND created_at >= :s ORDER BY created_at DESC, id DESC'),
+                        {'t': ride_type, 'i': int(ride_id), 's': since}).fetchall()
+    return [r[0] for r in rows]
+
+
+def _pin_state(times, now, max_attempts, window):
+    if len(times) < max_attempts:
+        return False, 0
+    # Locked until the max_attempts-th most recent failure leaves the window.
+    unlock = times[max_attempts - 1] + timedelta(seconds=window)
+    retry = int((unlock - now).total_seconds()) + 1
+    return retry > 0, max(0, retry)
+
+
+def pin_lock_status(ride_type, ride_id, now=None):
+    """(locked, retry_after_s, recent_failures)."""
+    now = now or datetime.utcnow()
+    max_attempts, window = _pin_window()
+    with db.engine.connect() as conn:
+        times = _pin_failures(conn, ride_type, ride_id, now - timedelta(seconds=window))
+    locked, retry = _pin_state(times, now, max_attempts, window)
+    return locked, retry, len(times)
+
+
+def record_pin_failure(ride_type, ride, actor_id=None, now=None):
+    """Count a wrong PIN. Returns (failures_in_window, locked, retry_after_s,
+    attempts_left). The attempt that reaches the limit triggers the audit +
+    admin alert job (runs outside the rolled-back transition)."""
+    from sqlalchemy import text
+    now = now or datetime.utcnow()
+    max_attempts, window = _pin_window()
+    actor_id = actor_id or R.driver_id(ride_type, ride)
+    with db.engine.begin() as conn:
+        conn.execute(text('INSERT INTO ride_pin_failures (ride_type, ride_id, actor_id, created_at) '
+                          'VALUES (:t, :i, :a, :c)'), {'t': ride_type, 'i': int(ride.id), 'a': actor_id, 'c': now})
+        times = _pin_failures(conn, ride_type, ride.id, now - timedelta(seconds=window))
+    locked, retry = _pin_state(times, now, max_attempts, window)
+    if len(times) == max_attempts:
+        jobs.enqueue('backend.services.safety_service.pin_locked_job', ride_type, int(ride.id), actor_id,
+                     len(times), retry)
+    return len(times), locked, retry, max(0, max_attempts - len(times))
+
+
+def pin_locked_job(ride_type, ride_id, actor_id, attempts, retry_after_s):
+    """Job: audit + admin alert (socket `alert` + safety notification to ops)."""
+    actor = db.session.get(AdminUser, actor_id) if actor_id else None
+    audit('ride.pin_locked', actor, ride_type, ride_id,
+          meta={'attempts': attempts, 'retry_after_s': retry_after_s, 'actor_id': actor_id},
+          actor_type='driver' if actor else 'system')
+    ctx = {'ride_type': ride_type, 'ride_id': ride_id, 'id': ride_id, 'attempts': attempts,
+           'name': first_name(actor) if actor else 'unknown', 'driver_id': actor_id,
+           'retry_after_s': retry_after_s}
+    admins = admin_recipient_ids()
+    if admins:
+        from backend.services.notify import notify
+        notify('safety.pin_locked', admins, ctx, dedupe_key=f'pinlock-{ride_type}-{ride_id}-{attempts}')
+    db.session.commit()
+    realtime.to_admins('alert', {'kind': 'pin_locked', 'ride_type': ride_type, 'ride_id': ride_id,
+                                 'driver_id': actor_id, 'attempts': attempts, 'retry_after_s': retry_after_s,
+                                 'message': f'Ride PIN locked on {ride_type} #{ride_id} after {attempts} wrong attempts'})
+    realtime.to_admins('alert', {'kind': 'pin_locked', 'ride_type': ride_type, 'ride_id': ride_id,
+                                 'driver_id': actor_id, 'attempts': attempts}, room='admin:sos')
+    return True
+
+
+# ── disputes (retention of evidence, spec §10.1) ────────────────────────────
+
+def mark_dispute_resolved(ride_type, ride_id, at=None, actor=None):
+    """Mark a ride dispute resolved (sets `dispute_resolved_at`). Evidence
+    (recordings, breadcrumbs) is then kept `recording.hold_after_case_days`
+    more days and purged by retention_cleanup. Caller commits.
+
+    Call it when an admin resolves/closes a support ticket of type `dispute`
+    (routes/support.py, admin resolution path). Returns True when changed."""
+    try:
+        ride = R.load(ride_type, ride_id)
+    except (R.RideNotFound, Exception):
+        return False
+    if not hasattr(ride, 'dispute_resolved_at') or getattr(ride, 'disputed_at', None) is None:
+        return False
+    if ride.dispute_resolved_at is not None:
+        return False
+    ride.dispute_resolved_at = at or datetime.utcnow()
+    audit('ride.dispute_resolved', actor, R.normalize_type(ride_type), ride.id,
+          meta={'dispute_resolved_at': iso(ride.dispute_resolved_at)})
+    return True
+
+
+# ── production readiness (consumed by GET /api/admin/readiness) ─────────────
+
+def readiness_checks():
+    """Safety items for the admin readiness page. Each item:
+    {key, area:'safety', level: ok|warning|critical, message}."""
+    import os
+    from backend.services import twilio_client
+    prod = os.getenv('FLASK_ENV', '').lower() == 'production'
+    items = []
+
+    def add(key, level, message):
+        items.append({'key': key, 'area': 'safety', 'level': level, 'message': message})
+
+    phones = oncall_phones()
+    add('safety.oncall_phones', 'ok' if phones else 'critical',
+        f'{len(phones)} on-call phone(s) configured for SOS escalation.' if phones else
+        'No on-call phones: an unacknowledged SOS cannot be escalated by SMS/voice. '
+        'Set Settings → safety.oncall_phones (E.164, comma-separated).')
+    add('safety.support_phone', 'ok' if S.get('safety.support_phone') else 'warning',
+        'Support phone configured.' if S.get('safety.support_phone') else
+        'Support phone empty: the Safety Toolkit cannot offer a call to NegoRide support.')
+    tw = twilio_client.is_configured()
+    add('safety.twilio', 'ok' if tw else ('critical' if prod else 'warning'),
+        'Twilio configured (SOS SMS to trusted contacts / on-call).' if tw else
+        'Twilio is not configured: SOS SMS and voice escalation are only simulated.')
+    from backend import jobs
+    red = jobs.get_redis() is not None
+    add('safety.redis', 'ok' if red else ('critical' if prod else 'warning'),
+        'Redis available (latest positions, rate limits, breadcrumb buffer).' if red else
+        'REDIS_URL absent/unreachable: latest driver positions, public-tracking rate limits and ETA throttles '
+        'fall back to per-process memory (wrong with several workers).')
+    return items

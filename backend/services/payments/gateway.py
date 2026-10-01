@@ -120,10 +120,13 @@ def _intent_dict(pi):
         brand, last4 = card.get('brand'), card.get('last4')
         cb = card.get('capture_before')
         capture_before = datetime.utcfromtimestamp(cb) if cb else None
+    err = pi.get('last_payment_error') if hasattr(pi, 'get') else None
     return {'id': pi.id, 'status': pi.status, 'amount': pi.amount,
             'amount_capturable': pi.get('amount_capturable') or 0,
             'amount_received': pi.get('amount_received') or 0,
             'brand': brand, 'last4': last4, 'capture_before': capture_before,
+            'last_payment_error': (err or {}).get('message') if err else None,
+            'decline_code': ((err or {}).get('decline_code') or (err or {}).get('code')) if err else None,
             'metadata': dict(pi.get('metadata') or {})}
 
 
@@ -166,17 +169,35 @@ class FakeGateway:
             return {'session_id': sid, 'url': f'{base}/api/dev/fake-checkout/{sid}', 'intent_id': None}
         return self._once(idempotency_key, make)
 
-    def simulate_customer_pays(self, session_id, decline=False):
+    DECLINES = {
+        'card_declined': 'Your card was declined.',
+        'insufficient_funds': 'Your card has insufficient funds.',
+        'expired_card': 'Your card has expired.',
+    }
+
+    def simulate_customer_pays(self, session_id, decline=False, requires_action=False):
+        """decline: False | True (card_declined) | 'insufficient_funds' | 'expired_card'.
+        requires_action: 3-D Secure still pending (status requires_action)."""
         s = self.sessions[session_id]
         pid = f'pi_fake_{uuid.uuid4().hex[:16]}'
         manual = s['capture_method'] == 'manual'
-        status = 'requires_payment_method' if decline else ('requires_capture' if manual else 'succeeded')
+        code = ('card_declined' if decline is True else decline) if decline else None
+        blocked = bool(code) or requires_action
+        if requires_action:
+            status = 'requires_action'
+        elif code:
+            status = 'requires_payment_method'
+        else:
+            status = 'requires_capture' if manual else 'succeeded'
         self.intents[pid] = {'id': pid, 'status': status, 'amount': s['amount_total'],
-                             'amount_capturable': s['amount_total'] if (manual and not decline) else 0,
-                             'amount_received': 0 if (manual or decline) else s['amount_total'],
+                             'amount_capturable': s['amount_total'] if (manual and not blocked) else 0,
+                             'amount_received': 0 if (manual or blocked) else s['amount_total'],
                              'brand': 'visa', 'last4': '4242',
                              'capture_before': datetime.utcfromtimestamp(datetime.utcnow().timestamp() + 7 * 86400),
+                             'last_payment_error': self.DECLINES.get(code) if code else None,
+                             'decline_code': code,
                              'metadata': dict(s['metadata'])}
+        decline = blocked
         s.update(status='complete', payment_status='unpaid' if manual or decline else 'paid', intent_id=pid)
         return {'id': f'evt_fake_{uuid.uuid4().hex[:12]}', 'type': 'checkout.session.completed',
                 'data': {'object': {'id': session_id, 'object': 'checkout.session',

@@ -11,7 +11,7 @@ export const DRIVER_STATE_LABEL = { idle: 'Idle', en_route: 'En route', on_trip:
 export function useLiveDrivers({ enabled = true, includeOfflineActive = true, interval = 15000 } = {}) {
   const q = useQuery({
     queryKey: ['live-drivers', includeOfflineActive],
-    queryFn: () => http.get('/admin/live/drivers', includeOfflineActive ? { include_offline_active: 1 } : {}),
+    queryFn: () => http.get('/admin/live/drivers', { include_offline_active: includeOfflineActive ? 1 : 0 }),
     enabled,
     refetchInterval: interval,
   });

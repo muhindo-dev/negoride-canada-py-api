@@ -24,13 +24,15 @@ PAYMENTS_GATEWAY=fake .venv/bin/python run.py  # local QA without Stripe (never 
 | Time | Store naive **UTC** (`datetime.utcnow()`); v4 JSON uses ISO-8601 `...Z` (`models/base.iso`). |
 | Schema | Additive only. New migration per change: `backend/database/migrations/v4_NNNN_name.py` using `backend/database/schema_helpers.py`. The local DB is shared with the Truckeroo backend — never drop columns you didn't create. |
 | Models | v4 models subclass `SerializeMixin` (column-driven `to_dict()`, `_hidden` for secrets). |
-| Auth | `@jwt_required_with_user` (user first arg), `@admin_role_required('ops', ...)` (roles: super_admin, ops, safety_reviewer, finance, support; super_admin passes all), tokens from `issue_token(user)` (carries `tv` = token_version for revocation). Suspended users get 403 `{data.account_status}` except on `INACTIVE_ALLOWED_PREFIXES`. |
+| Auth | `@jwt_required_with_user` (user first arg), `@admin_role_required('ops', ...)` (roles: super_admin, ops, safety_reviewer, finance, support; super_admin passes all), tokens from `issue_token(user)` (carries `tv` = token_version for revocation). Suspended users get 403 `data.error_code=account_blocked` except on `INACTIVE_ALLOWED_PREFIXES` (a revoked token of an inactive account gets the same 403; other revocations 401 `session_revoked`); `issue_restricted_token(user)` = 2 h token limited to those prefixes. v4 requests also pass the legal re-acceptance gate (`legal_service.gate_response`, 403 `legal_pending`, exempt prefixes in `REACCEPT_EXEMPT_PREFIXES`). v4-only rules use `client_info.is_v4_client()` — it is true for every client when `app.legacy_clients_allowed` is off. Ride/booking creation calls `phone_verification.require_phone_for_rides(user, data)` (`ff.phone_required_signup`). |
 | Idempotency | Add `@idempotent` (after the auth decorator) to state-changing endpoints; honours the `Idempotency-Key` header. |
 | Audit | `backend.services.audit.audit(action, actor, entity_type, entity_id, before, after, meta)` for every admin action, safety event and admin access to personal data. Caller commits. |
 | Settings / flags | `backend.services.settings_service` — `S.flag('sos')`, `S.get_int('ride.wait_window_s')`. Add new keys to `DEFAULTS` (key: default, type, category, description, public). Public keys are served to apps at `GET /api/app/config`. |
 | Jobs | Never do email/SMS/push/PDF/HTTP-to-vendors inside a request. `from backend import jobs`; `jobs.enqueue_after_commit('dotted.path', *args)` (runs only if the transaction commits), `jobs.enqueue_in(seconds, path, ...)`, `jobs.enqueue(path, ...)`. Periodic tasks: add `(interval_s, 'dotted.path')` to `backend/jobs/scheduler.py:PERIODIC`. Modes: rq (Redis), thread, eager (tests). |
 | Realtime | `backend.services.realtime`: `to_user(uid, event, data)`, `to_ride(type, id, event, data)`, `to_admins(event, data, room='admin:ops'|'admin:sos')`. Socket.IO namespace `/rt`, JWT on connect. |
 | Notifications | `from backend.services.notify import notify`; `notify('ride.driver_arrived', [user_id], context)`. Add events to `services/notify/catalogue.py` (group, channels, critical, route, EN/FR copy). Queued after commit; inbox + deliveries logged; SMS escalation for critical events. |
+| Admin alerts / Live Activities | `notify_admins(event, ctx, roles=('ops',))` for ops-console notifications; `notify.live_activity.push_update(ride_type, ride_id, payload)` to refresh iOS Live Activities (never raises). |
+| Payment states | Use `models.money.CAPTURED_STATES` / `rp.took_money` for "money was captured" (the refund overlay adds `partially_refunded` / `refunded`). |
 | Vendors | Twilio: `services/twilio_client.py`. Email: `services/notify/email_provider.send(to, subject, html, text, attachments=[(name, bytes, mime)])`, templates in `backend/templates/email/` rendered by `services/notify/templates.render(name, ctx)`. Payments: `services/payments/payment_service.py` (never call Stripe directly). |
 | Webhooks | Verify signature → insert `WebhookEvent(provider, event_id unique)` → `jobs.enqueue(processor, row.id)` → return 200. Retries by `platform_jobs.retry_failed_webhooks` (add your provider path there). |
 
@@ -56,6 +58,12 @@ Helpers: `R.load(type, id, lock=False)`, `R.role_of(user, type, ride)`, `R.custo
 * `walk_to(...)` — legacy endpoints walk intermediate stages (one event each).
 * `ride_actions.cancel(ride_type, id, actor, reason=..., reason_code=, note=)` applies `refund_policy` and moves to the right terminal stage; money moves in a job.
 * Hooks: `@TSM.on_transition` (inside the transaction, fast) and `@trip_effects.after_hook` (after commit, in a job: `fn(event, ride)`). Location hooks: `@tracking.location_hook` → `fn(user, ride_type, ride, point)`.
+  Location hooks get only the LIVE point; recent points for a ride/user come from `tracking.recent_points(...)`
+  (breadcrumbs are buffered and bulk-inserted every few seconds, so don't read `ride_locations` for "the last point").
+* `R.vehicle_card(driver, ride_type=, ride=, viewer=)` adds a short-lived `photo_url` (vehicle_front) for ride parties
+  of a confirmed ride; without those kwargs it is unchanged.
+* Safety hooks for other areas: `safety_service.readiness_checks()`, `safety_service.mark_dispute_resolved(type, id)`
+  (see docs/SAFETY.md). ETA calls `notify.live_activity.push_update(type, id, payload)` when that module exists.
 
 ### Payments — `backend/services/payments/payment_service.py`
 

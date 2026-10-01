@@ -1,13 +1,15 @@
 import React, { useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  Anchor, Badge, Button, Card, Drawer, Grid, Group, Modal, NumberInput, Select, SimpleGrid, Stack, Switch, Tabs, Text, Textarea, TextInput,
+  Alert, Anchor, Badge, Button, Card, Drawer, Grid, Group, Modal, NumberInput, Select, SimpleGrid, Stack, Switch, Tabs, Text, Textarea, TextInput,
 } from '@mantine/core';
-import { FiPlus } from 'react-icons/fi';
+import { FiAlertOctagon, FiAlertTriangle, FiPlus } from 'react-icons/fi';
 import { http, page } from '../../lib/api';
 import { humanize } from '../../lib/format';
 import { useRoles } from '../../lib/roles';
+import { useRealtime } from '../../lib/realtime';
+import { normalizeReadiness } from '../../components/ReadinessPanel';
 import MapView from '../../components/map/MapView';
 import {
   DataTable, ErrorBox, KV, Loading, notifyErr, notifyOk, PageHeader, RideLink, StatCard, StatusBadge, Time, UserLink,
@@ -261,6 +263,32 @@ function HelpContacts() {
   );
 }
 
+/** Safety readiness: SOS escalation needs on-call phones (readiness key safety.oncall_phones). */
+function OncallReadiness() {
+  const q = useQuery({ queryKey: ['readiness'], queryFn: () => http.get('/admin/readiness'), refetchInterval: 120000 });
+  const [live, setLive] = useState(null);
+  useRealtime('alert', (p) => { if (p?.kind === 'oncall_not_configured') setLive(p); });
+  const r = normalizeReadiness(q.data);
+  const safety = r.checks.filter((c) => c.level !== 'ok' && (c.area === 'safety' || String(c.key).startsWith('safety')));
+  const oncall = safety.find((c) => c.key === 'safety.oncall_phones');
+  if (!safety.length && !live) return null;
+  return (
+    <Stack gap="xs" mb="sm">
+      {(oncall || live) && (
+        <Alert color="red" variant="filled" icon={<FiAlertOctagon />} title="SOS escalation is not configured" data-testid="oncall-alert">
+          {live?.message || oncall?.message || 'No on-call phones are configured.'} Add at least one on-call number (E.164).{' '}
+          <Anchor component={Link} to="/settings?q=safety.oncall_phones" c="white" underline="always" fw={700}>Set safety.oncall_phones</Anchor>
+        </Alert>
+      )}
+      {safety.filter((c) => c.key !== 'safety.oncall_phones').map((c) => (
+        <Alert key={c.key} color={c.level === 'critical' ? 'red' : 'yellow'} variant="light" py={6} icon={<FiAlertTriangle />}>
+          <Text size="sm"><b>{c.key}</b> — {c.message}</Text>
+        </Alert>
+      ))}
+    </Stack>
+  );
+}
+
 export default function SafetyCenter() {
   const { can } = useRoles();
   const [sp, setSp] = useSearchParams();
@@ -268,6 +296,7 @@ export default function SafetyCenter() {
   return (
     <>
       <PageHeader title="Safety Center" subtitle="Open incidents first · realtime alarm on every new SOS until acknowledged" />
+      <OncallReadiness />
       <Tabs value={tab} onChange={(v) => setSp({ tab: v })} keepMounted={false}>
         <Tabs.List mb="sm">
           <Tabs.Tab value="incidents">Incidents</Tabs.Tab>

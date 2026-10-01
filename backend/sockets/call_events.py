@@ -235,14 +235,21 @@ def register_call_events(socketio, app):
             return
 
         with app.app_context():
-            from flask_jwt_extended import decode_token
+            from backend.utils.auth import user_from_token
             try:
-                decoded = decode_token(token)
-                user_id = int(decoded['sub'])
-                user = db.session.get(AdminUser, user_id)
+                # verified JWT + token_version (revocation) + deleted check
+                user = user_from_token(token)
                 if not user:
-                    emit('auth_error', {'error': 'User not found'})
+                    from backend.utils.auth import token_rejection_code
+                    code = token_rejection_code(token) or 'session_revoked'
+                    emit('auth_error', {'error': 'Account not active' if code == 'account_blocked'
+                                        else 'Invalid token', 'error_code': code})
                     return
+                if not user.is_account_active():
+                    emit('auth_error', {'error': 'Account not active', 'error_code': 'account_blocked',
+                                        'account_status': user.effective_account_status()})
+                    return
+                user_id = user.id
 
                 sid = request.sid
 

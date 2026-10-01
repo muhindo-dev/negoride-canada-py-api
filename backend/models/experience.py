@@ -80,7 +80,8 @@ class RideRequest(SerializeMixin, db.Model):
 
 
 class RideRequestOffer(SerializeMixin, db.Model):
-    """A request offered to one driver. status: offered | accepted | countered |
+    """A request offered to one driver. status: offered | countered (driver
+    countered — customer's turn) | customer_countered (driver's turn) | accepted |
     declined | withdrawn | expired."""
     __tablename__ = 'ride_request_offers'
     __table_args__ = (db.UniqueConstraint('request_id', 'driver_id', name='uq_rro'),)
@@ -92,7 +93,11 @@ class RideRequestOffer(SerializeMixin, db.Model):
     is_favourite = db.Column(db.Boolean, nullable=False, default=False)
     distance_m = db.Column(db.Integer)
     eta_s = db.Column(db.Integer)
-    counter_cents = db.Column(db.BigInteger)
+    counter_cents = db.Column(db.BigInteger)                 # the driver's counter
+    counter_by = db.Column(db.String(10))                     # driver | customer (whose counter is live)
+    customer_counter_cents = db.Column(db.BigInteger)         # the customer's counter back
+    counter_expires_at = db.Column(db.DateTime)
+    counter_round = db.Column(db.Integer, nullable=False, default=0)
     offered_at = db.Column(db.DateTime, nullable=False, default=utcnow)
     responded_at = db.Column(db.DateTime)
 

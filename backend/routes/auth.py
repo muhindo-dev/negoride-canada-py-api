@@ -2,7 +2,9 @@ import secrets
 from datetime import datetime, timedelta
 
 from flask import Blueprint, request
-from backend.utils.auth import issue_token
+from sqlalchemy.exc import IntegrityError
+
+from backend.utils.auth import account_blocked_payload, issue_restricted_token, issue_token, RESTRICTED_TOKEN_TTL
 from backend.models import db
 from backend.models.user import AdminUser
 from backend.utils.auth import jwt_required_with_user
@@ -66,9 +68,8 @@ def login():
         return error_response("Account not found")
 
     v4 = is_v4_client(data)
-    if not user.is_account_active() and not v4:
-        return error_response("Your account has been blocked",
-                              data={'account_status': user.effective_account_status()})
+    if not user.is_account_active():
+        return _blocked_login(user, v4)
 
     # Block login if email is set but not yet verified
     if user.email and user.email_verified_at is None:
@@ -91,9 +92,34 @@ def login():
     token = issue_token(user)
 
     payload = _build_auth_user_payload(user, token)
+    payload['requires_phone_verification'] = phone_verification_required(user)
     if v4:
         payload['legal_pending'] = legal_service.pending_for(user, user.preferred_language)
     return success_response("Login successful", payload)
+
+
+def phone_verification_required(user):
+    """ff.phone_required_signup: the account must have a verified phone before it can
+    request rides (login answers requires_phone_verification: true)."""
+    return bool(S.flag('phone_required_signup') and not user.phone_verified_at)
+
+
+def _blocked_login(user, v4):
+    """Suspended / deactivated / banned / pending-review account (spec §15).
+    v4 (or legacy clients disallowed): HTTP 403, data = account_blocked payload + a
+    short-lived token that only works on the suspended-screen endpoints
+    (INACTIVE_ALLOWED_PREFIXES: /api/account/status, /api/account/appeal, /api/support,
+    /api/legal, /api/users/me …). Legacy clients keep the old message."""
+    if not v4:
+        return error_response("Your account has been blocked",
+                              data={'account_status': user.effective_account_status()})
+    token = issue_restricted_token(user)
+    data = account_blocked_payload(user)
+    data.update({'token': token, 'access_token': token, 'remember_token': token, 'restricted': True,
+                 'token_expires_in_s': int(RESTRICTED_TOKEN_TTL.total_seconds()),
+                 'user': user.to_dict()})
+    st = user.effective_account_status()
+    return error_response('Your account is ' + st.replace('_', ' ') + '.', data=data, status_code=403)
 
 
 def _touch_device(user, dev, data=None, trust=False):
@@ -117,14 +143,21 @@ def _touch_device(user, dev, data=None, trust=False):
 
 
 def _step_up_check(user, dev, data):
-    """None when the login may proceed; otherwise the step-up response."""
-    if not S.flag('step_up_new_device') or not dev or not user.phone_e164 or not user.phone_verified_at:
+    """None when the login may proceed; otherwise the step-up response.
+    A login WITHOUT a device id counts as an unseen device once the account has
+    any trusted device (otherwise omitting X-Device-Id would bypass the step-up)."""
+    if not S.flag('step_up_new_device') or not user.phone_e164 or not user.phone_verified_at:
         return None
-    row = UserDevice.query.filter_by(user_id=user.id, device_id=dev).first()
-    if row and row.trusted_at:
-        return None
-    if row is None and UserDevice.query.filter_by(user_id=user.id).first() is None:
-        return None  # first device ever: trusted on first use
+    if not dev:
+        if UserDevice.query.filter(UserDevice.user_id == user.id, UserDevice.trusted_at.isnot(None)).first() is None:
+            return None
+        row = None
+    else:
+        row = UserDevice.query.filter_by(user_id=user.id, device_id=dev).first()
+        if row and row.trusted_at:
+            return None
+        if row is None and UserDevice.query.filter_by(user_id=user.id).first() is None:
+            return None  # first device ever: trusted on first use
     token = data.get('verification_token')
     if token:
         try:
@@ -134,7 +167,8 @@ def _step_up_check(user, dev, data):
             return error_response(e.message, data=e.payload(), status_code=e.status)
         _touch_device(user, dev, data, trust=True)
         return None
-    _touch_device(user, dev, data)   # registered, not trusted yet
+    if dev:
+        _touch_device(user, dev, data)   # registered, not trusted yet
     db.session.commit()
     return error_response(
         "For your security, confirm it's you with a code sent to your phone.",
@@ -258,7 +292,7 @@ def register():
     # Check for existing user
     if email and AdminUser.query.filter_by(email=email).first():
         db.session.rollback()
-        return error_response("Email already registered")
+        return error_response("Email already registered", data={'error_code': 'email_in_use', 'login_instead': True})
 
     if phone_number and AdminUser.query.filter_by(phone_number=phone_number).first():
         db.session.rollback()
@@ -306,7 +340,8 @@ def register():
     if data.get('province'):
         user.province = str(data.get('province')).upper()[:2]
     # CASL: separate, never pre-ticked; only an explicit true counts.
-    if data.get('marketing_opt_in') in (True, 'true', '1', 1, 'yes', 'on'):
+    marketing = data.get('marketing_opt_in') in (True, 'true', '1', 1, 'yes', 'on')
+    if marketing:
         user.marketing_opt_in = True
         user.marketing_opt_in_at = datetime.utcnow()
 
@@ -320,17 +355,37 @@ def register():
     db.session.flush()
     if pv_row:
         PV.apply_to_user(user, pv_row, set_legacy_phone=False)
+        try:
+            db.session.flush()   # UNIQUE verified_phone (one verified phone per account, §11.2 #12)
+        except IntegrityError as exc:
+            db.session.rollback()
+            if PV.is_verified_phone_conflict(exc):
+                return error_response("This phone number is already registered. Log in instead.",
+                                      data={'error_code': 'phone_in_use', 'login_instead': True}, status_code=409)
+            raise
     elif e164:
         user.phone_e164 = e164   # unverified until a check succeeds
     if consent_docs:
         legal_service.accept(user, consent_docs, method='checkbox', app_version=app_version(data),
                              ip=client_ip(), user_agent=user_agent())
+    if marketing:   # CASL proof of express consent (ip, user agent, wording version + text, time)
+        legal_service.record_marketing_consent(user, True, 'registration', ip=client_ip(), user_agent=user_agent(),
+                                               app_version=app_version(data), lang=user.preferred_language,
+                                               wording_version=data.get('marketing_consent_version'))
     _touch_device(user, device_id(data), data, trust=True)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError as exc:
+        db.session.rollback()
+        if PV.is_verified_phone_conflict(exc):
+            return error_response("This phone number is already registered. Log in instead.",
+                                  data={'error_code': 'phone_in_use', 'login_instead': True}, status_code=409)
+        raise
 
     # Send verification email (non-blocking — failure doesn't abort registration)
     if email:
-        send_verification_email(email, user.name or first_name or email, user.email_verification_token)
+        send_verification_email(email, user.name or first_name or email, user.email_verification_token,
+                                lang=user.preferred_language)
 
     token = issue_token(user)
 
@@ -365,15 +420,15 @@ def login_with_phone():
         db.session.rollback()
         return error_response("No account uses this phone number yet. Sign up instead.",
                               data={'error_code': 'no_account', 'signup_instead': True}, status_code=404)
-    if not user.is_account_active() and not is_v4_client(data):
-        db.session.rollback()
-        return error_response("Your account has been blocked",
-                              data={'account_status': user.effective_account_status()})
+    if not user.is_account_active():
+        db.session.commit()   # the OTP token is spent either way
+        return _blocked_login(user, is_v4_client(data))
     row.user_id = row.user_id or user.id
     _touch_device(user, device_id(data), data, trust=True)
     db.session.commit()
     token = issue_token(user)
     payload = _build_auth_user_payload(user, token)
+    payload['requires_phone_verification'] = phone_verification_required(user)
     payload['legal_pending'] = legal_service.pending_for(user, user.preferred_language)
     return success_response("Login successful", payload)
 
@@ -511,6 +566,14 @@ _VERIFY_PAGE = """<!doctype html>
 </html>"""
 
 
+def _public_web_base():
+    """Public website (landing pages /verify-email, /reset-password, /terms …)."""
+    import os
+    from flask import current_app
+    return (os.getenv('PUBLIC_WEB_BASE_URL') or S.get('company.website') or current_app.config.get('APP_URL')
+            or 'https://negoride.ca').rstrip('/')
+
+
 def _verification_page(state, heading, message, status_code=200):
     """Render a branded HTML page for the email-verification browser flow."""
     icons = {'success': '✓', 'error': '✕', 'expired': '⏳'}
@@ -521,7 +584,7 @@ def _verification_page(state, heading, message, status_code=200):
         'icon': icons.get(state, 'ℹ'),
         'accent': accents.get(state, '#EF9B11'),
         'play': 'https://play.google.com/store/apps/details?id=negoride.canada.app',
-        'site': 'https://negoride.ugnews24.info',
+        'site': _public_web_base(),
     }
     return html, status_code, {'Content-Type': 'text/html; charset=utf-8'}
 
@@ -558,6 +621,10 @@ def verify_email(token):
         user.email_verified_at = datetime.utcnow()
         user.email_verification_token = None
         user.verification_token_expires = None
+        from backend.services.notify.email_status import clear_email_bounce
+        clear_email_bounce(user)   # verified → emails flow again
+        from backend.services import onboarding_service
+        onboarding_service.queue_progress_refresh(user.id)
         db.session.commit()
 
     return _verification_page(
@@ -567,6 +634,44 @@ def verify_email(token):
         'Canada and sign in to start riding.',
         status_code=200,
     )
+
+
+def _verify_email_token(token, email=None):
+    """('ok'|'already'|'invalid'|'expired', user)."""
+    user = AdminUser.query.filter_by(email_verification_token=token).first() if token else None
+    if user and email and (user.email or '').strip().lower() != str(email).strip().lower():
+        user = None
+    if not user:
+        return 'invalid', None
+    if user.verification_token_expires and datetime.utcnow() > user.verification_token_expires:
+        return 'expired', user
+    if user.email_verified_at is not None:
+        return 'already', user
+    user.email_verified_at = datetime.utcnow()
+    user.email_verification_token = None
+    user.verification_token_expires = None
+    from backend.services.notify.email_status import clear_email_bounce
+    clear_email_bounce(user)   # verified → emails flow again
+    from backend.services import onboarding_service
+    onboarding_service.queue_progress_refresh(user.id)
+    db.session.commit()
+    return 'ok', user
+
+
+@auth_bp.route('/api/email/verify', methods=['POST'])
+def verify_email_json():
+    """Website landing page `{PUBLIC_WEB_BASE_URL}/verify-email?token=…&email=…` posts
+    {token, email} here. → {verified: true, already_verified} | 400 invalid_token | 410 token_expired."""
+    data = request.get_json(silent=True) or request.form or {}
+    state, _user = _verify_email_token((data.get('token') or '').strip(), data.get('email'))
+    if state == 'invalid':
+        return error_response('This verification link is invalid or has already been used.',
+                              data={'error_code': 'invalid_token'}, status_code=400)
+    if state == 'expired':
+        return error_response('This verification link has expired. Request a new one from the app.',
+                              data={'error_code': 'token_expired'}, status_code=410)
+    return success_response('Email verified.' if state == 'ok' else 'Your email is already verified.',
+                            {'verified': True, 'already_verified': state == 'already'})
 
 
 @auth_bp.route('/api/email/resend-verification', methods=['POST'])
@@ -592,7 +697,8 @@ def resend_verification():
     user.verification_token_expires = datetime.utcnow() + timedelta(hours=24)
     db.session.commit()
 
-    send_verification_email(email, user.name or email, user.email_verification_token)
+    send_verification_email(email, user.name or email, user.email_verification_token,
+                            lang=user.preferred_language)
 
     return success_response("A new verification link has been sent to your email.")
 
@@ -616,13 +722,12 @@ def forgot_password():
             "If an account with that email exists, a password reset link has been sent."
         )
 
-    # Generate reset token (store only first 8 chars + full token for lookup)
     token = secrets.token_urlsafe(32)
     user.password_reset_token = token
     user.password_reset_expires = datetime.utcnow() + timedelta(hours=1)
     db.session.commit()
 
-    send_password_reset_email(email, user.name or email, token)
+    send_password_reset_email(email, user.name or email, token, lang=user.preferred_language)
 
     return success_response(
         "If an account with that email exists, a password reset link has been sent."
@@ -642,24 +747,20 @@ def reset_password():
     if len(new_password) < 6:
         return error_response("Password must be at least 6 characters long")
 
-    # Allow lookup by full token OR by the 8-char short code shown in email
-    user = AdminUser.query.filter_by(password_reset_token=token).first()
-    if not user:
-        # Try matching by the first 8 chars (upper-cased in email for readability)
-        users = AdminUser.query.filter(
-            AdminUser.password_reset_token.isnot(None)
-        ).all()
-        user = next(
-            (u for u in users if u.password_reset_token.upper().startswith(token.upper()[:8])),
-            None,
-        )
+    # Full token only (the old 8-character prefix lookup allowed brute force).
+    user = AdminUser.query.filter_by(password_reset_token=str(token).strip()).first() if len(str(token)) >= 32 else None
+    email = data.get('email')
+    if user and email and (user.email or '').strip().lower() != str(email).strip().lower():
+        user = None
 
     if not user:
-        return error_response("Invalid or expired reset token.", status_code=400)
+        return error_response("Invalid or expired reset token.", data={'error_code': 'invalid_token'},
+                              status_code=400)
 
     if user.password_reset_expires and datetime.utcnow() > user.password_reset_expires:
         return error_response(
             "This reset link has expired. Please request a new one.",
+            data={'error_code': 'token_expired'},
             status_code=410,
         )
 

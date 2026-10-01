@@ -137,14 +137,102 @@ def test_favourite_decline_broadcasts_at_once_and_counter_offer(client, auth, ma
     db.session.rollback()
     assert db.session.get(RideRequest, req['id']).status == 'broadcasting'
 
+    # Counter-offer marketplace (§21.2.2): a counter does NOT match — the request stays open.
+    realtime.SENT.clear()
     r = client.post(f"/api/carhire/requests/{req['id']}/accept", headers=auth(b), json={'counter_cents': 2600})
     assert body(r)['code'] == 1, r.get_json()
+    data = body(r)['data']
+    assert data['negotiation'] is None and data['offer']['status'] == 'countered'
+    assert data['offer']['counter_cents'] == 2600 and data['offer']['expires_at']
+    db.session.rollback()
+    row = db.session.get(RideRequest, req['id'])
+    assert row.status == 'broadcasting' and row.negotiation_id is None
+    assert Negotiation.query.filter_by(customer_id=c.id, driver_id=b.id).count() == 0
+    n = Notification.query.filter_by(user_id=c.id, event_key='carhire.request_countered').one()
+    assert '$26.00' in n.title
+    ev = [p for e, p, room in realtime.SENT if e == 'carhire.request_countered' and room == f'user:{c.id}']
+    assert ev and ev[0]['counter_cents'] == 2600 and ev[0]['driver']['first_name'] == b.first_name
+    assert set(ev[0]) >= {'request_id', 'offer_id', 'driver', 'counter_cents', 'eta_min', 'distance_m', 'expires_at'}
+    assert 'phone_number' not in ev[0]['driver']
+    # the driver can't counter twice while it's the rider's turn
+    again = client.post(f"/api/carhire/requests/{req['id']}/accept", headers=auth(b), json={'counter_cents': 2500})
+    assert again.status_code == 409 and body(again)['data']['error_code'] == 'awaiting_customer'
+
+    # the customer sees the live offer list with per-offer expiry
+    got = body(client.get(f"/api/carhire/requests/{req['id']}", headers=auth(c)))['data']
+    live = got['live_offers']
+    assert len(live) == 1 and live[0]['driver']['id'] == b.id and live[0]['turn'] == 'customer'
+    assert got['counter_offer_ttl_s'] == 90 and got['offers']['countered'] == 1
+    offer_id = live[0]['offer_id']
+
+    # customer counters back → driver's turn
+    r = client.post(f"/api/carhire/requests/{req['id']}/offers/{offer_id}/counter", headers=auth(c),
+                    json={'price_cents': 2300})
+    assert body(r)['code'] == 1 and body(r)['data']['offer']['status'] == 'customer_countered', r.get_json()
+    assert Notification.query.filter_by(user_id=b.id, event_key='carhire.customer_countered').count() == 1
+    inc = body(client.get('/api/carhire/requests/incoming', headers=auth(b)))['data']['requests']
+    mine = next(x for x in inc if x['request_id'] == req['id'])
+    assert mine['offer_status'] == 'customer_countered' and mine['customer_counter_cents'] == 2300
+    # stranger can't counter/accept someone else's request
+    other = make_user('customer')
+    assert client.post(f"/api/carhire/requests/{req['id']}/offers/{offer_id}/accept",
+                       headers=auth(other)).status_code == 404
+
+    # driver accepts the customer's counter → matched at $23
+    r = client.post(f"/api/carhire/requests/{req['id']}/accept", headers=auth(b), json={})
+    assert body(r)['code'] == 1, r.get_json()
     neg = body(r)['data']['negotiation']
-    assert neg['trip_stage'] == 'NEGOTIATING' and neg['last_offer_price'] == 2600
+    assert neg['driver_id'] == b.id and neg['agreed_price_cents'] == 2300
+    assert neg['trip_stage'] in ('PRICE_AGREED', 'AWAITING_PAYMENT')
+    db.session.rollback()
+    assert db.session.get(RideRequest, req['id']).status == 'matched'
     assert NegotiationRecord.query.filter_by(negotiation_id=neg['id']).count() == 2
-    assert Notification.query.filter_by(user_id=c.id, event_key='negotiation.counter_offer').count() == 1
     # the driver was not pinged with a redundant "new request" for a ride they already answered
     assert Notification.query.filter_by(user_id=b.id, event_key='negotiation.new_request').count() == 1
+
+
+def test_customer_accepts_one_counter_others_withdrawn(client, auth, make_user):
+    c = make_user('customer')
+    d1, d2, d3 = (driver_at(make_user, at(0.01)), driver_at(make_user, at(-0.01)),
+                  driver_at(make_user, at(0.015)))
+    req = body(client.post('/api/carhire/requests', headers=auth(c), json=request_body()))['data']['request']
+    assert body(client.post(f"/api/carhire/requests/{req['id']}/accept", headers=auth(d1),
+                            json={'counter_cents': 2400}))['code'] == 1
+    assert body(client.post(f"/api/carhire/requests/{req['id']}/accept", headers=auth(d2),
+                            json={'counter_cents': 2200}))['code'] == 1
+    live = body(client.get(f"/api/carhire/requests/{req['id']}", headers=auth(c)))['data']['live_offers']
+    assert {o['counter_cents'] for o in live} == {2400, 2200}
+    pick = next(o for o in live if o['counter_cents'] == 2200)
+    realtime.SENT.clear()
+    r = client.post(f"/api/carhire/requests/{req['id']}/offers/{pick['offer_id']}/accept", headers=auth(c))
+    assert body(r)['code'] == 1, r.get_json()
+    neg = body(r)['data']['negotiation']
+    assert neg['driver_id'] == d2.id and neg['agreed_price_cents'] == 2200
+    assert body(r)['data']['request']['status'] == 'matched'
+    db.session.rollback()
+    statuses = {o.driver_id: o.status for o in RideRequestOffer.query.filter_by(request_id=req['id'])}
+    assert statuses[d2.id] == 'accepted' and statuses[d1.id] == 'withdrawn'
+    assert statuses.get(d3.id) in ('withdrawn', None)
+    assert any(e == 'carhire.request_withdrawn' and room == f'user:{d1.id}' for e, _, room in realtime.SENT)
+    # d1 is too late now
+    late = client.post(f"/api/carhire/requests/{req['id']}/accept", headers=auth(d1), json={})
+    assert late.status_code == 409
+
+
+def test_counter_offers_expire(client, auth, make_user):
+    c = make_user('customer')
+    d1 = driver_at(make_user, at(0.01))
+    req = body(client.post('/api/carhire/requests', headers=auth(c), json=request_body()))['data']['request']
+    client.post(f"/api/carhire/requests/{req['id']}/accept", headers=auth(d1), json={'counter_cents': 2700})
+    offer_id = body(client.get(f"/api/carhire/requests/{req['id']}", headers=auth(c)))['data']['live_offers'][0]['offer_id']
+    from backend.services import matching_service as M
+    M.expire_counters(datetime.utcnow() + timedelta(seconds=91))
+    db.session.rollback()
+    assert db.session.get(RideRequestOffer, offer_id).status == 'expired'
+    got = body(client.get(f"/api/carhire/requests/{req['id']}", headers=auth(c)))['data']
+    assert got['live_offers'] == []
+    r = client.post(f"/api/carhire/requests/{req['id']}/offers/{offer_id}/accept", headers=auth(c))
+    assert r.status_code == 409
 
 
 def test_broadcast_expiry_cancel_and_no_drivers(client, auth, make_user):

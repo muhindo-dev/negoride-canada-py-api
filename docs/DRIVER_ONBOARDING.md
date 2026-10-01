@@ -13,7 +13,7 @@ any time. Step status: `not_started · in_progress · under_review · done · ac
 | # | key | Done when | Notes |
 |---|---|---|---|
 | 1 | `account_created` | the three sign-up consents are accepted | `action_needed` if a new Terms/Privacy/Guidelines version awaits acceptance |
-| 2 | `phone_verified` | `users.phone_verified_at` set | Verify with purpose `driver_onboarding`: mobile numbers only (Twilio Lookup; `otp.block_voip_drivers`). A logged-in check applies the number at once |
+| 2 | `phone_verified` | the server has a verified phone number for the account | OTP verification proves control of the number. Carrier line-type data is optional and must not make an already-verified user repeat verification or block onboarding. If the server has no verified phone, verify with purpose `driver_onboarding`. |
 | 3 | `email_verified` | existing email verification | |
 | 4 | `profile_completed` | pre-qualification passed + all profile fields + Driver Agreement & Safety Policy e-signed | **Pre-qualification first** (age ≥ `onboarding.min_driver_age`, full licence class in `onboarding.allowed_licence_classes`, vehicle year ≥ `onboarding.min_vehicle_year`, province served) — nobody can pay for a check they can't use. SIN is never collected |
 | 5 | `documents_submitted` | all `onboarding.required_documents` approved | `under_review` once all are uploaded; `action_needed` if one is rejected (reviewer note shown) |
@@ -33,6 +33,22 @@ vehicle_right, vehicle_interior, selfie`. JPG/PNG/HEIC/WEBP/PDF ≤ 10 MB. `expi
 Admins open them through `GET /api/admin/onboarding/documents/{id}/file` (short-lived signed URL, audited).
 A re-upload supersedes the previous file of that type.
 
+**Insurance — rideshare endorsement.** For provinces in `onboarding.rideshare_endorsement_provinces`
+(default `ON,BC,AB,QC`) the insurance upload must include the form field `attestation_rideshare_endorsement=true`,
+otherwise 422 `endorsement_attestation_required` (`data.province`, `data.field`). The attestation is stored on the
+document: `meta = {attestation_rideshare_endorsement, province, endorsement_required, attested_at}` (visible to
+admins in every document payload). The overview exposes `insurance_endorsement_required` and
+`requirements.rideshare_endorsement_provinces`.
+
+**Selfie face match (advisory).** When both a `selfie` and a `licence_front` exist, a job
+(`face_match.run_for_application`) compares them — AWS Rekognition `CompareFaces` when `AWS_REKOGNITION_REGION` + AWS
+credentials are set, otherwise `manual_review`. The result is stored on the selfie document
+(`face_match_status: pending|match|no_match|no_face|manual_review|error`, `face_match_score` 0–100,
+`face_match_provider`, `face_match_checked_at`, `face_match_detail`) and summarised in the admin application
+detail as `face_match {status, score, provider, checked_at, detail, selfie_document_id, licence_document_id,
+threshold, advisory_only:true}`. `match` = score ≥ `onboarding.face_match_threshold` (90). **It never approves or
+rejects a document** — the reviewer decides.
+
 ### Expiry monitoring (daily job `onboarding_jobs.document_expiry_check`)
 
 Reminders at 30 / 14 / 3 days (`onboarding.expiry_reminder_days`) before licence, insurance or registration
@@ -44,16 +60,27 @@ uploaded (and approved).
 
 1. **Consent** — `POST …/background-check/consent {signature_name}` stores a `legal_acceptances` row for the
    `background_check_consent` document (method `esignature`, IP, user agent, app version) and creates a
-   `background_checks` row in `awaiting_payment`. Requires a passed pre-qualification.
+   `background_checks` row in `awaiting_payment`. Requires a passed pre-qualification. **Every check carries its
+   own evidence** in `background_checks.consent_evidence` = `{background_check_id, signature_name, signed_at, ip,
+   user_agent, app_version, document_id, document_type, document_version, document_language, acceptance_id,
+   acceptance_reused, is_recheck}` — a re-check signs again even when the consent version (and therefore the
+   `legal_acceptances` row) is unchanged.
 2. **Fee** — `POST …/background-check/pay` → Stripe Checkout (immediate capture) through
    `payment_service.start_extra_payment('background_check', 'background_check', <bgc id>, …)`; the app opens
    `checkout_url`, then calls `…/sync` (webhook fallback). The fee is `onboarding.bgc_fee_cents` (default
-   $39.99 **[CONFIRM WITH CLIENT]**). Non-refundable once submitted to Certn; refund before submission through the
-   admin manual refund (Finance).
+   $39.99 **[CONFIRM WITH CLIENT]**). A NegoRide receipt (`BGC-<year>-<id>`, template `bgc_receipt`) is emailed
+   once paid (`receipt_emailed_at`). **Cancel window:** Certn is ordered only `onboarding.bgc_start_delay_min`
+   (default 30) minutes after payment (`background_checks.start_after`); until then the driver can call
+   `POST …/background-check/cancel {reason?}` → full card refund through the payment gateway (a `refunds` row,
+   rule `bgc_cancel_before_submission`; `refunded_cents`, `refunded_at`) or, for pay-later, the deduction is
+   waived (anything already recovered is credited back). After submission → 409 `nothing_to_cancel` /
+   `already_submitted` (non-refundable).
    *Pay later from earnings* (`ff.bgc_pay_later`): `{pay_later:true}` → the platform fronts the fee
    (`paid_by='earnings'`, `deduction_status='pending'`); it is debited from the driver wallet
-   (`background_check_fee` transaction) after rides complete / hourly once the balance allows.
-   `onboarding_service.outstanding_deduction_cents(driver_id)` is available to the payouts code.
+   (`background_check_fee` transactions) after rides complete, hourly, and before every payout request —
+   **partially** when the balance is short (`deducted_cents` tracks the amount recovered; `settled` once it
+   equals `fee_cents`). `POST /api/payout-requests` settles first and answers 409 `bgc_fee_outstanding`
+   (`outstanding_cents`) while any fronted fee remains. `outstanding_deduction_cents(driver_id)` = fee − deducted.
 3. **Initiate** — when paid, a job orders a CertnCentric case with the invite flow
    (`send_invite_email:false, return_invite_link:true`); `invite_url` is shown in the in-app WebView where the
    driver completes Certn's identity + consent steps.
@@ -71,8 +98,12 @@ uploaded (and approved).
    `APPLICANT_EXPIRED/INVITE_UNDELIVERABLE → expired`, `CANCELLED → cancelled`, anything in progress → `pending`.
    Admin decisions (`adjudicated_by`) and final outcomes are never overwritten by later provider events.
 7. **Re-checks** — a clear check expires after `onboarding.recheck_months` (12). Drivers are reminded
-   `onboarding.recheck_reminder_days` (30) before; on expiry the check becomes `expired` and blocks going online
-   until a new check (consent → pay, or free when `ff.bgc_platform_pays_recheck`) clears.
+   `onboarding.recheck_reminder_days` (30) before; the overview (and admin application detail) exposes
+   `renewal_due: true` from then on, and consent → pay starts the renewal while the current check is still valid.
+   On expiry the check becomes `expired` and blocks going online until a new check (consent → pay, or free when
+   `ff.bgc_platform_pays_recheck`) clears. A **failed** re-check of an already-approved driver moves the account to
+   `pending_review` (reason `failed_background_check`, deferred until the current ride ends) — the driver goes
+   offline and can appeal.
 
 ### Certn API facts (verified 2026-09-27 against https://centric-api-docs.certn.co)
 
@@ -101,10 +132,19 @@ Per-document approve / reject (a note is mandatory to reject; the driver is noti
   flags from the approved service types (car_hire/rideshare/airport/special_car → `car`, courier/movers →
   `delivery`), copies licence number/expiry and vehicle to the legacy columns, notifies `onboarding.approved`, and
   pays the referral bonus to the referrer when `ff.referrals`.
-* **needs_changes** / **reject** — reason required, notified to the driver.
+* **needs_changes** / **reject** — reason required, notified to the driver. **reject** also clears the legacy
+  `is_<svc>='Yes'` "applied" flags set at submission (approved services are never touched) and returns a
+  `Pending Driver` to `Customer`; the same cleanup runs when a failed background check auto-rejects.
 
 Every action is audited; opening an application, a document or a Certn report is audited too.
-Funnel: `GET /api/admin/onboarding/funnel` (applicants who completed each step and the drop-off %).
+Admins with the `ops` / `safety_reviewer` roles are notified (`admin.background_check_review`: inbox + push + email,
+realtime `onboarding.bgc_review` / `onboarding.bgc_clear` / `onboarding.bgc_failed`) when a check needs
+adjudication (`consider`) and when it completes. The service types offered in the wizard come from
+`settings_service.enabled_services()` (setting `services.enabled`).
+
+Funnel: `GET /api/admin/onboarding/funnel` (applicants who completed each step and the drop-off %). Step progress is
+recorded whenever a step can change — wizard calls, phone/email verification, Certn outcomes, admin document
+reviews and decisions (`onboarding_service.refresh_progress` job) — not only when the driver opens the overview.
 
 ## Backward compatibility
 

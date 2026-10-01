@@ -96,6 +96,7 @@ class ScheduledBooking(db.Model):
     eta_updated_at = db.Column(db.DateTime, nullable=True)
     initial_eta_at = db.Column(db.DateTime, nullable=True)
     disputed_at = db.Column(db.DateTime, nullable=True)
+    dispute_resolved_at = db.Column(db.DateTime, nullable=True)   # safety_service.mark_dispute_resolved (v4_0101)
     dispute_reason = db.Column(db.Text, nullable=True)
     pickup_province = db.Column(db.String(4), nullable=True)
     tip_cents = db.Column(db.BigInteger, nullable=True)

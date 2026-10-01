@@ -21,7 +21,7 @@ def _paid_cents(ride_type, ride):
         return 0
     if rp.capture_status == 'authorized':
         return rp.amount_authorized_cents
-    if rp.capture_status in ('captured', 'partially_captured'):
+    if rp.took_money:
         return rp.amount_captured_cents - rp.amount_refunded_cents
     return 0
 
@@ -96,6 +96,58 @@ def cancel(ride_type, ride_id, actor=None, actor_type=None, reason=None, reason_
     return result, decision
 
 
+# ── admin: reassign the driver (v4 admin + legacy admin assign-driver) ──────
+
+REASSIGNABLE = ('REQUESTED', 'NEGOTIATING', 'PRICE_AGREED', 'AWAITING_PAYMENT', 'CONFIRMED',
+                'DRIVER_EN_ROUTE', 'DRIVER_ARRIVING')
+
+
+def reassign_driver(ride_type, ride_id, driver_id, admin, reason):
+    """Assign / reassign the driver before pickup (car hire, scheduled). Writes a
+    trip_events row (same stage, meta reassigned_from/to), moves the ride
+    payments to the new driver, audits and notifies all parties in realtime.
+    Raises TransitionError. Caller gets the payload; this commits."""
+    from backend.models.money import RidePayment
+    from backend.models.user import AdminUser
+    from backend.services import realtime
+    from backend.services.audit import audit
+    ride_type = R.normalize_type(ride_type)
+    if ride_type not in ('carhire', 'scheduled'):
+        raise TSM.TransitionError('Only car hire and scheduled rides can be reassigned.', code='unsupported')
+    ride = R.load(ride_type, ride_id, lock=True)
+    stage = TSM.ensure_stage(ride_type, ride)
+    if stage not in REASSIGNABLE:
+        raise TSM.TransitionError(f'A ride in stage {stage} cannot be reassigned.', code='bad_stage', status=409)
+    try:
+        new_driver = db.session.get(AdminUser, int(driver_id or 0))
+    except (TypeError, ValueError):
+        new_driver = None
+    if not new_driver or not new_driver.is_approved_driver() or not new_driver.is_account_active():
+        raise TSM.TransitionError('Choose an approved, active driver.', code='driver_unavailable')
+    old = ride.driver_id or None
+    if old == new_driver.id:
+        raise TSM.TransitionError('That driver is already assigned.', code='already_assigned', status=409)
+    ride.driver_id = new_driver.id
+    if ride_type == 'carhire':
+        ride.driver_name = new_driver.name
+    else:
+        ride.assigned_by, ride.assigned_at = admin.id, datetime.utcnow()
+    for rp in RidePayment.query.filter_by(ride_type=ride_type, ride_id=ride.id).all():
+        rp.driver_id = new_driver.id
+    db.session.add(TripEvent(ride_type=ride_type, ride_id=ride.id, from_stage=stage, to_stage=stage,
+                             actor_type='admin', actor_id=admin.id,
+                             meta={'reassigned_from': old, 'reassigned_to': new_driver.id, 'reason': reason}))
+    audit('ride.reassign_driver', admin, ride_type, ride.id, before={'driver_id': old},
+          after={'driver_id': new_driver.id}, meta={'reason': reason})
+    db.session.commit()
+    payload = {'ride_type': ride_type, 'ride_id': ride.id, 'stage': stage, 'driver_id': new_driver.id}
+    for uid in {old, new_driver.id, *R.customer_ids(ride_type, ride)} - {None}:
+        realtime.to_user(uid, 'ride.driver_reassigned', payload)
+    realtime.to_ride(ride_type, ride.id, 'ride.driver_reassigned', payload)
+    realtime.to_admins('ride.driver_reassigned', {**payload, 'previous_driver_id': old, 'by': admin.id})
+    return payload
+
+
 # ── serialization ───────────────────────────────────────────────────────────
 
 def timeline(ride_type, ride_id):
@@ -143,7 +195,7 @@ def serialize(ride_type, ride, viewer, include_timeline=True):
                   'initial_cents': getattr(ride, 'initial_price', None) if ride_type == 'carhire' else None},
         'payment': None,
         'driver': R.user_card(driver_id, full=confirmed) if driver_id else None,
-        'vehicle': R.vehicle_card(driver) if (driver and confirmed) else None,
+        'vehicle': R.vehicle_card(driver, ride_type=ride_type, ride=ride, viewer=viewer) if (driver and confirmed) else None,
         'customer': R.user_card(cids[0], full=confirmed) if len(cids) == 1 else None,
         'passenger_count': len(cids) if ride_type == 'rideshare_trip' else None,
         'eta': None,
@@ -159,6 +211,10 @@ def serialize(ride_type, ride, viewer, include_timeline=True):
                 rp.checkout_url if (role == 'customer' and rp.capture_status == 'pending') else None,
             'amount_authorized_cents': rp.amount_authorized_cents, 'amount_captured_cents': rp.amount_captured_cents,
             'amount_refunded_cents': rp.amount_refunded_cents, 'fees_cents': rp.fees_cents,
+            # §4.1 payment overlay: none | partially_refunded | refunded
+            'refund_status': rp.capture_status if rp.capture_status in ('refunded', 'partially_refunded')
+            else ('none' if not rp.amount_refunded_cents else 'partially_refunded'),
+            'provider': rp.provider, 'settlement_status': rp.settlement_status,
             'card': f"{(rp.payment_method_brand or '').title()} •••• {rp.payment_method_last4}" if rp.payment_method_last4 else None,
         }
     else:

@@ -173,7 +173,8 @@ def list_bookings(user):
 @trips_bp.route('/api/trips-create', methods=['POST'])
 @jwt_required_with_user
 def create(user):
-    """Create (publish) a rideshare trip. Approved drivers only."""
+    """Create a rideshare trip — published at once, or a DRAFT with publish=false.
+    Approved drivers only."""
     from backend.services import trip_state_machine as TSM
     data = request.get_json(silent=True) or request.form
 
@@ -219,12 +220,18 @@ def create(user):
         luggage_size=_str(data.get('luggage_size')),
     )
 
+    # publish=false saves a DRAFT (not searchable / bookable) that the driver
+    # publishes later with POST /api/rides/rideshare_trip/{id}/publish.
+    publish = str(data.get('publish', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
     db.session.add(trip)
     db.session.flush()
-    TSM.record_creation('rideshare_trip', trip, actor=user, actor_type='driver')
+    TSM.record_creation('rideshare_trip', trip, actor=user, actor_type='driver',
+                        stage='PUBLISHED' if publish else 'DRAFT')
+    if publish:
+        trip.published_at = trip.published_at or trip.stage_changed_at
     db.session.commit()
 
-    return success_response("Trip created", trip.to_dict(), status_code=201)
+    return success_response("Trip created" if publish else "Draft saved", trip.to_dict(), status_code=201)
 
 
 @trips_bp.route('/api/trips-update', methods=['POST'])

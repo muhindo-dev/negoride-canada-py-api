@@ -91,6 +91,10 @@ def index(user):
 def create_legacy(user):
     """Legacy create – ApiChatController style (dollars → cents)."""
     data = request.get_json(silent=True) or request.form
+    from backend.services.phone_verification import require_phone_for_rides
+    _pv_block = require_phone_for_rides(user, data)
+    if _pv_block is not None:
+        return _pv_block
     driver_id = data.get('driver_id')
     driver = AdminUser.query.get(driver_id) if driver_id else None
 
@@ -148,6 +152,10 @@ def create_legacy(user):
 def create(user):
     """Enhanced create – validates driver online, price ≥ 50 cents."""
     data = request.get_json(silent=True) or request.form
+    from backend.services.phone_verification import require_phone_for_rides
+    _pv_block = require_phone_for_rides(user, data)
+    if _pv_block is not None:
+        return _pv_block
     driver_id = data.get('driver_id')
 
     if not driver_id:
@@ -203,6 +211,59 @@ def create(user):
     return success_response("Negotiation created", negotiation.to_dict(), status_code=201)
 
 
+ACTIVE_STATUSES = ('Active', 'Pending', 'Accepted', 'Started')
+
+
+def _is_open_negotiation(negotiation):
+    active = str(negotiation.is_active or 'Yes').strip().lower()
+    return negotiation.status in ACTIVE_STATUSES and active not in ('no', '0', 'false', 'inactive')
+
+
+@negotiations_bp.route('/api/negotiations-verify', methods=['POST'])
+@jwt_required_with_user
+def verify_cached(user):
+    """Reconcile the app's locally cached negotiations with the server in ONE call.
+
+    Body: {"ids": [104, 105, ...]} (JSON list or comma-separated string, max 200).
+    For each id the server answers:
+      active  – exists, the caller is a participant and it is still open
+      ended   – exists but is finished (Completed / Cancelled / …): keep as history
+      gone    – does not exist on this server, or does not belong to the caller:
+                the app must drop it from its cache and never show it
+    Also returns `active_ids`: every open negotiation the caller really has, so
+    the app can discover rows its cache is missing.
+    """
+    data = request.get_json(silent=True) or request.form or {}
+    raw = data.get('ids') or []
+    if isinstance(raw, str):
+        raw = [x for x in raw.replace(' ', '').split(',') if x]
+    ids = []
+    for x in list(raw)[:200]:
+        try:
+            ids.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    found = {n.id: n for n in Negotiation.query.filter(Negotiation.id.in_(ids)).all()} if ids else {}
+    results = {}
+    for i in ids:
+        n = found.get(i)
+        if n is None or not _is_participant(n, user.id):
+            results[str(i)] = {'state': 'gone'}
+        elif _is_open_negotiation(n):
+            results[str(i)] = {'state': 'active', 'status': n.status}
+        else:
+            results[str(i)] = {'state': 'ended', 'status': n.status}
+    active_rows = Negotiation.query.filter(
+        (Negotiation.customer_id == user.id) | (Negotiation.driver_id == user.id),
+        Negotiation.status.in_(ACTIVE_STATUSES)).order_by(Negotiation.id.desc()).limit(100).all()
+    active_ids = [n.id for n in active_rows if _is_open_negotiation(n)][:20]
+    return success_response("Verified", {
+        'results': results,
+        'active_ids': active_ids,
+        'gone_ids': [int(k) for k, v in results.items() if v['state'] == 'gone'],
+    })
+
+
 @negotiations_bp.route('/api/negotiation-updates', methods=['POST'])
 @jwt_required_with_user
 def poll_updates(user):
@@ -212,7 +273,7 @@ def poll_updates(user):
 
     negotiation = Negotiation.query.get(negotiation_id)
     if not negotiation:
-        return error_response("Negotiation not found", status_code=404)
+        return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
 
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)
@@ -229,7 +290,7 @@ def records_get(user):
     if negotiation_id:
         negotiation = Negotiation.query.get(negotiation_id)
         if not negotiation:
-            return error_response("Negotiation not found", status_code=404)
+            return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
         if not _is_participant(negotiation, user.id):
             return error_response("Forbidden", status_code=403)
 
@@ -254,7 +315,7 @@ def records_post(user):
     negotiation_id = data.get('negotiation_id')
     negotiation = Negotiation.query.get(negotiation_id)
     if not negotiation:
-        return error_response("Negotiation not found", status_code=404)
+        return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)
 
@@ -353,7 +414,7 @@ def accept(user):
 
     negotiation = Negotiation.query.get(negotiation_id)
     if not negotiation:
-        return error_response("Negotiation not found", status_code=404)
+        return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
 
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)
@@ -416,7 +477,7 @@ def cancel(user):
 
     negotiation = Negotiation.query.get(negotiation_id)
     if not negotiation:
-        return error_response("Negotiation not found", status_code=404)
+        return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
 
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)
@@ -444,7 +505,7 @@ def complete(user):
 
     negotiation = Negotiation.query.get(negotiation_id)
     if not negotiation:
-        return error_response("Negotiation not found", status_code=404)
+        return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
 
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)
@@ -489,7 +550,7 @@ def with_payment(user, neg_id):
     """Get negotiation with payment details."""
     negotiation = Negotiation.query.get(neg_id)
     if not negotiation:
-        return error_response("Negotiation not found", status_code=404)
+        return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
 
     from backend.models.payment import Payment
     payment = Payment.query.filter_by(negotiation_id=neg_id).first()
@@ -514,7 +575,7 @@ def set_agreed_price(user, neg_id):
 
     negotiation = Negotiation.query.get(neg_id)
     if not negotiation:
-        return error_response("Negotiation not found", status_code=404)
+        return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
 
     negotiation.agreed_price = agreed_price
     db.session.commit()
@@ -531,7 +592,7 @@ def refresh_payment(user):
 
     negotiation = Negotiation.query.get(negotiation_id)
     if not negotiation:
-        return error_response("Negotiation not found", status_code=404)
+        return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
 
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)
@@ -648,7 +709,7 @@ def check_payment(user):
 
     negotiation = Negotiation.query.get(negotiation_id)
     if not negotiation:
-        return error_response("Negotiation not found", status_code=404)
+        return error_response("Negotiation not found", data={'error_code': 'negotiation_not_found'}, status_code=404)
 
     if not _is_participant(negotiation, user.id):
         return error_response("Forbidden", status_code=403)

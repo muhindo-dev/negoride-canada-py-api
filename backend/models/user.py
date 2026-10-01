@@ -120,6 +120,8 @@ class AdminUser(db.Model):
     legal_name = db.Column(db.String(200), nullable=True)
     pending_status_meta = db.Column(db.JSON, nullable=True)
     sms_opt_out_at = db.Column(db.DateTime, nullable=True)
+    email_bounced_at = db.Column(db.DateTime, nullable=True)      # Postmark hard bounce / spam complaint
+    email_bounce_reason = db.Column(db.String(255), nullable=True)
 
     # Relationships
     wallet = db.relationship('UserWallet', backref='user', uselist=False, lazy=True)

@@ -303,9 +303,22 @@ def _check_guards(ride_type, ride, from_stage, to_stage, actor_type, ctx):
                 raise TransitionError('No ride PIN exists for this ride.', code='pin_missing')
             if not given:
                 raise TransitionError("Enter the rider's 4-digit PIN to start.", code='pin_required')
+            # ── Safety (owned by the safety agent, §8.4): brute-force lock. At most
+            # safety.pin_max_attempts wrong PINs per ride per safety.pin_lock_window_s;
+            # failures are counted on an independent connection (this transaction
+            # rolls back) and the locking attempt audits + alerts ops.
+            from backend.services import safety_service as _SS
+            locked, retry_after, _n = _SS.pin_lock_status(ride_type, ride.id)
+            if locked:
+                raise TransitionError('Too many wrong PINs. Try again later or contact support.',
+                                      code='pin_locked', status=429, data={'retry_after': retry_after})
             if not secrets.compare_digest(given, expected):
+                _n, locked, retry_after, left = _SS.record_pin_failure(ride_type, ride)
+                if locked:
+                    raise TransitionError('Too many wrong PINs. Try again later or contact support.',
+                                          code='pin_locked', status=429, data={'retry_after': retry_after})
                 raise TransitionError('That PIN is not correct. Ask the rider for the PIN shown in their app.',
-                                      code='pin_invalid')
+                                      code='pin_invalid', data={'attempts_left': left})
 
     if to_stage == 'CUSTOMER_NO_SHOW' and actor_type != 'system':
         arrived = getattr(ride, 'driver_arrived_at', None)
@@ -585,8 +598,50 @@ def shortest_path(ride_type, start, target):
     return None
 
 
+def stamp_pickup_province(ride_type, ride):
+    """Record the pickup province at creation (sales tax by province of pickup,
+    spec §13.3). Offline polygon lookup; never fails the creation."""
+    if not hasattr(ride, 'pickup_province') or getattr(ride, 'pickup_province', None):
+        return getattr(ride, 'pickup_province', None)
+    try:
+        from backend.utils.province import province_at
+        pt = R.pickup_point(ride_type, ride)
+        if pt:
+            ride.pickup_province = province_at(pt[0], pt[1])
+    except Exception:   # pragma: no cover - defensive
+        log.warning('province lookup failed for %s/%s', ride_type, getattr(ride, 'id', None))
+    return ride.pickup_province
+
+
 INITIAL_STAGE = {'carhire': 'REQUESTED', 'scheduled': 'REQUESTED', 'rideshare_trip': 'PUBLISHED',
                  'rideshare_booking': 'PENDING_PAYMENT'}
+
+
+# Per-ride operational rows keyed by (ride_type, ride_id) that describe a ride's
+# live history. Financial / rating rows are deliberately NOT listed: they are
+# never silently removed.
+_RIDE_HISTORY_TABLES = ('trip_events', 'ride_locations', 'ride_share_links', 'ride_routes', 'ride_pin_failures')
+
+
+def _drop_orphaned_ride_rows(ride_type, ride_id):
+    """A brand-new ride must start with an empty history. MySQL 5.7 re-issues
+    AUTO_INCREMENT ids after a restart when the highest rows were deleted, so a
+    new ride can reuse the id of a deleted one; without this, the old ride's
+    timeline / GPS trail / share links would show up on the new ride (and to a
+    different customer)."""
+    if not ride_id:
+        return
+    from sqlalchemy import text
+    for table in _RIDE_HISTORY_TABLES:
+        try:
+            with db.session.begin_nested():
+                res = db.session.execute(text(f"DELETE FROM {table} WHERE ride_type=:t AND ride_id=:i"),
+                                         {'t': ride_type, 'i': int(ride_id)})
+            if res.rowcount:
+                log.warning('dropped %s orphaned %s rows inherited by new %s #%s',
+                            res.rowcount, table, ride_type, ride_id)
+        except Exception:   # pragma: no cover - table missing on an old schema
+            log.debug('orphan sweep skipped for %s', table)
 
 
 def record_creation(ride_type, ride, actor=None, actor_type=None, stage=None, meta=None):
@@ -595,12 +650,14 @@ def record_creation(ride_type, ride, actor=None, actor_type=None, stage=None, me
     ride_type = R.normalize_type(ride_type)
     stage = stage or INITIAL_STAGE[ride_type]
     now = _now()
+    _drop_orphaned_ride_rows(ride_type, ride.id)
     ride.trip_stage = stage
     ride.stage_changed_at = now
     ride.status = legacy_status(ride_type, stage, ride.status)
     col = STAMP.get(ride_type, {}).get(stage)
     if col and hasattr(ride, col):
         setattr(ride, col, now)
+    stamp_pickup_province(ride_type, ride)
     if actor_type is None:
         actor_type = 'system' if actor is None else (R.role_of(actor, ride_type, ride) or 'customer')
     ev = TripEvent(ride_type=ride_type, ride_id=ride.id, from_stage=None, to_stage=stage, actor_type=actor_type,

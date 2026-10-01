@@ -17,7 +17,7 @@ from backend.models.chat_head import ChatHead
 from backend.models.chat_message import ChatMessage
 from backend.models.company import Company
 from backend.models.route_stage import RouteStage
-from backend.utils.auth import admin_required
+from backend.utils.auth import admin_required, admin_role_required
 from backend.utils.response import success_response, error_response
 
 admin_bp = Blueprint('admin', __name__)
@@ -268,68 +268,33 @@ def users_show(user, user_id):
 
 
 @admin_bp.route('/api/admin/users/<int:user_id>/update', methods=['POST', 'PUT'])
-@admin_required
+@admin_role_required('super_admin', 'ops')
 def users_update(user, user_id):
-    """Admin updates any user's profile."""
+    """Compatibility wrapper; sensitive account edits use the strict V4 profile API."""
     target = AdminUser.query.get(user_id)
     if not target:
         return error_response("User not found", status_code=404)
 
     data = request.get_json(silent=True) or request.form
-    # Only super admins may grant or remove admin rights (spec §19.14).
-    new_type = data.get('user_type')
-    if new_type is not None and new_type != target.user_type and \
-            ('Admin' in str(new_type) or target.user_type in ('Admin', 'Super Admin')) and \
-            not user.has_admin_role('super_admin'):
-        return error_response("Only a super admin can change admin rights", status_code=403)
-    updatable = [
-        'first_name', 'last_name', 'name', 'email', 'phone_number',
-        'user_type', 'date_of_birth', 'sex', 'current_address',
-        'country_name', 'country_code', 'country_short_name', 'automobile',
-        'max_passengers', 'ready_for_trip',
-        'driving_license_number', 'nin',
-        'driving_license_issue_date', 'driving_license_validity',
-        'driving_license_issue_authority',
-        'is_car', 'is_boda', 'is_ambulance', 'is_police', 'is_delivery',
-        'is_breakdown', 'is_firebrugade',
-        'is_car_approved', 'is_boda_approved', 'is_ambulance_approved',
-        'is_police_approved', 'is_delivery_approved', 'is_breakdown_approved',
-        'is_firebrugade_approved',
-    ]
-    for field in updatable:
-        if field in data and data[field] is not None:
-            setattr(target, field, data[field])
-    target.updated_at = datetime.utcnow()
-    db.session.commit()
-    if 'status' in data:
-        # v4: account status changes go through account_service (revokes tokens,
-        # disconnects sockets, audits, respects active rides).
-        from backend.services import account_service
-        want = 'active' if int(data['status']) == 1 else 'deactivated'
-        if target.effective_account_status() != want:
-            account_service.set_status(target, want, actor=user, reason_code='admin_legacy_update',
-                                       reason_text='Changed from the legacy admin user editor')
-    return success_response("User updated", target.to_dict())
+    from backend.routes.admin_identity import PROFILE_EDIT_FIELDS
+    allowed = set(PROFILE_EDIT_FIELDS) | {'marketing_opt_in', 'reason_text'}
+    if set(data) - allowed:
+        return error_response("Use the dedicated account workflow for status, driver approval, roles, and finance changes.",
+                              data={'error_code': 'field_not_editable'}, status_code=400)
+    return error_response("Use the V4 user profile editor for audited profile changes.",
+                          data={'error_code': 'use_v4_profile'}, status_code=410)
 
 
 @admin_bp.route('/api/admin/users/<int:user_id>/reset-password', methods=['POST'])
-@admin_required
+@admin_role_required('super_admin', 'ops')
 def users_reset_password(user, user_id):
-    """Admin resets a user's password."""
-    target = AdminUser.query.get(user_id)
-    if not target:
-        return error_response("User not found", status_code=404)
-
-    data = request.get_json(silent=True) or request.form
-    new_password = data.get('new_password', 'NegoRide123!')
-    target.set_password(new_password)
-    target.updated_at = datetime.utcnow()
-    db.session.commit()
-    return success_response("Password reset successfully")
+    """Compatibility alias for sending a secure one-time reset link."""
+    return error_response("Use the V4 password reset link action; admins cannot set a user's password.",
+                          data={'error_code': 'use_v4_reset_link'}, status_code=410)
 
 
 @admin_bp.route('/api/admin/users/<int:user_id>/approve-driver', methods=['POST'])
-@admin_required
+@admin_role_required('super_admin', 'ops', 'safety_reviewer')
 def approve_driver(user, user_id):
     """Approve a pending driver application.
     
@@ -376,7 +341,7 @@ def approve_driver(user, user_id):
 
 
 @admin_bp.route('/api/admin/users/<int:user_id>/reject-driver', methods=['POST'])
-@admin_required
+@admin_role_required('super_admin', 'ops', 'safety_reviewer')
 def reject_driver(user, user_id):
     """Reject a pending driver application."""
     target = AdminUser.query.get(user_id)
@@ -393,42 +358,63 @@ def reject_driver(user, user_id):
 
 
 @admin_bp.route('/api/admin/users/<int:user_id>/toggle-status', methods=['POST'])
-@admin_required
+@admin_role_required('super_admin', 'ops', 'safety_reviewer', 'support')
 def toggle_status(user, user_id):
     """Activate/deactivate a user."""
     target = AdminUser.query.get(user_id)
     if not target:
         return error_response("User not found", status_code=404)
     from backend.services import account_service
+    data = request.get_json(silent=True) or request.form or {}
+    bad = account_service.validate_admin_reason(data)
+    if bad is not None:
+        return error_response(bad[0], data={'error_code': bad[1]})
     want = 'active' if not target.is_account_active() else 'deactivated'
-    account_service.set_status(target, want, actor=user, reason_code='admin_legacy_toggle',
-                               reason_text='Toggled from the legacy admin users page')
-    return success_response("Status updated", target.to_dict())
+    res = account_service.set_status(target, want, actor=user, reason_code=data.get('reason_code'),
+                                     reason_text=str(data.get('reason_text')).strip(), source='admin:legacy_toggle')
+    payload = target.to_dict()
+    payload['status_change'] = res   # {applied, deferred, account_status, ...}
+    msg = ("Deactivation scheduled — it applies when the user's current ride ends"
+           if res and res.get('deferred') else "Status updated")
+    return success_response(msg, payload)
 
 
 @admin_bp.route('/api/admin/users/<int:user_id>/delete', methods=['POST', 'DELETE'])
-@admin_required
+@admin_role_required('super_admin', 'ops')
 def users_delete(user, user_id):
-    """Soft-delete a user."""
+    """Soft-delete a user only after an audited, reasoned admin action."""
     target = AdminUser.query.get(user_id)
     if not target:
         return error_response("User not found", status_code=404)
     if target.id == user.id:
         return error_response("Cannot delete yourself")
+    data = request.get_json(silent=True) or request.form or {}
+    reason = str(data.get('reason_text') or data.get('reason') or '').strip()
+    if len(reason) < 5:
+        return error_response("A reason of at least 5 characters is required", data={'error_code': 'reason_required'})
+    from backend.services import account_service as A
+    _, active_ride = A.active_ride(target)
+    if active_ride is not None:
+        return error_response("This user has an active ride. Deactivate the account after the ride ends.",
+                              data={'error_code': 'active_ride'}, status_code=409)
     from backend.services.audit import audit
+    before = {'deleted_at': str(target.deleted_at) if target.deleted_at else None,
+              'account_status': target.effective_account_status(), 'token_version': target.token_version}
     target.deleted_at = datetime.utcnow()
     target.status = 0
     target.account_status = 'deactivated'
     target.token_version = (target.token_version or 0) + 1   # revoke every session
     target.ready_for_trip = 'No'
     target.updated_at = datetime.utcnow()
-    audit('user.soft_delete', user, 'user', target.id)
+    audit('admin.user_soft_deleted', user, 'user', target.id, before=before,
+          after={'deleted_at': str(target.deleted_at), 'account_status': target.effective_account_status(),
+                 'token_version': target.token_version}, meta={'reason': reason})
     db.session.commit()
     return success_response("User deleted")
 
 
 @admin_bp.route('/api/admin/users/<int:user_id>/wallet', methods=['GET'])
-@admin_required
+@admin_role_required('super_admin', 'finance')
 def users_wallet(user, user_id):
     """Get user's wallet and recent transactions."""
     wallet = UserWallet.query.filter_by(user_id=user_id).first()
@@ -442,19 +428,25 @@ def users_wallet(user, user_id):
 
 
 @admin_bp.route('/api/admin/users/<int:user_id>/wallet/adjust', methods=['POST'])
-@admin_required
+@admin_role_required('super_admin', 'finance')
 def users_wallet_adjust(user, user_id):
     """Admin adjusts user's wallet balance."""
+    import math
     import uuid
     data = request.get_json(silent=True) or request.form
-    amount = float(data.get('amount', 0))
+    try:
+        amount = float(data.get('amount', 0))
+    except (TypeError, ValueError):
+        return error_response("Amount must be a valid number")
     tx_type = data.get('type', 'credit')
-    reason = data.get('reason', 'Admin adjustment')
+    reason = str(data.get('reason') or '').strip()
 
-    if amount <= 0:
-        return error_response("Amount must be positive")
+    if not math.isfinite(amount) or amount <= 0:
+        return error_response("Amount must be a finite positive number")
     if tx_type not in ('credit', 'debit'):
         return error_response("Type must be 'credit' or 'debit'")
+    if len(reason) < 5:
+        return error_response("A reason of at least 5 characters is required", data={'error_code': 'reason_required'})
 
     wallet = UserWallet.query.filter_by(user_id=user_id).first()
     if not wallet:
@@ -484,6 +476,12 @@ def users_wallet_adjust(user, user_id):
         status='completed',
     )
     db.session.add(tx)
+    db.session.flush()
+    from backend.services.audit import audit
+    audit('admin.user_wallet_adjusted', user, 'user', user_id,
+          before={'wallet_balance': balance_before},
+          after={'wallet_balance': float(wallet.wallet_balance), 'adjustment': amount, 'type': tx_type},
+          meta={'reason': reason, 'transaction_id': tx.id})
     db.session.commit()
     return success_response("Wallet adjusted", {
         'wallet': wallet.to_dict(),
@@ -558,37 +556,27 @@ def negotiations_show(user, neg_id):
 @admin_bp.route('/api/admin/negotiations/<int:neg_id>/update-status', methods=['POST'])
 @admin_required
 def negotiations_update_status(user, neg_id):
-    """Admin updates negotiation status."""
+    """Admin sets a negotiation's legacy status. Routed through the v4 state
+    machine (one trip_event per step, actor admin, reason required) — never a
+    raw column write. 'Cancelled' applies the §7 cancellation policy."""
     neg = Negotiation.query.get(neg_id)
     if not neg:
         return error_response("Negotiation not found", status_code=404)
-
-    data = request.get_json(silent=True) or request.form
+    data = _legacy_body()
     new_status = data.get('status')
     valid_statuses = ['Pending', 'Accepted', 'Started', 'Completed', 'Cancelled']
     if new_status not in valid_statuses:
         return error_response(f"Status must be one of: {', '.join(valid_statuses)}")
-
-    neg.status = new_status
-    if new_status in ('Completed', 'Cancelled'):
-        neg.is_active = 'No'
-    neg.updated_at = datetime.utcnow()
-    db.session.commit()
-    return success_response("Negotiation status updated", neg.to_dict())
+    return _legacy_set_status(user, 'carhire', neg_id, new_status, data, "Negotiation status updated")
 
 
 @admin_bp.route('/api/admin/negotiations/<int:neg_id>/cancel', methods=['POST'])
 @admin_required
 def negotiations_cancel(user, neg_id):
-    """Admin cancels a negotiation."""
-    neg = Negotiation.query.get(neg_id)
-    if not neg:
+    """Admin cancels a negotiation (state machine + refund policy + notifications)."""
+    if not Negotiation.query.get(neg_id):
         return error_response("Negotiation not found", status_code=404)
-    neg.status = 'Cancelled'
-    neg.is_active = 'No'
-    neg.updated_at = datetime.utcnow()
-    db.session.commit()
-    return success_response("Negotiation cancelled", neg.to_dict())
+    return _legacy_cancel(user, 'carhire', neg_id, _legacy_body(), "Negotiation cancelled")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -651,28 +639,25 @@ def trips_show(user, trip_id):
 @admin_bp.route('/api/admin/trips/<int:trip_id>/update-status', methods=['POST'])
 @admin_required
 def trips_update_status(user, trip_id):
-    """Admin updates trip status."""
-    trip = Trip.query.get(trip_id)
-    if not trip:
+    """Admin sets a rideshare trip's legacy status through the state machine."""
+    if not Trip.query.get(trip_id):
         return error_response("Trip not found", status_code=404)
-    data = request.get_json(silent=True) or request.form
-    trip.status = data.get('status')
-    trip.updated_at = datetime.utcnow()
-    db.session.commit()
-    return success_response("Trip status updated", trip.to_dict())
+    data = _legacy_body()
+    new_status = data.get('status')
+    valid = ['Active', 'Ongoing', 'Started', 'Completed', 'Canceled', 'Cancelled']
+    if new_status not in valid:
+        return error_response(f"Status must be one of: {', '.join(valid)}")
+    return _legacy_set_status(user, 'rideshare_trip', trip_id, new_status, data, "Trip status updated")
 
 
 @admin_bp.route('/api/admin/trips/<int:trip_id>/cancel', methods=['POST'])
 @admin_required
 def trips_cancel(user, trip_id):
-    """Admin cancels a trip."""
-    trip = Trip.query.get(trip_id)
-    if not trip:
+    """Admin cancels a rideshare trip: CANCELLED_BY_DRIVER cascade — every
+    passenger is cancelled and refunded 100 %."""
+    if not Trip.query.get(trip_id):
         return error_response("Trip not found", status_code=404)
-    trip.status = 'Cancelled'
-    trip.updated_at = datetime.utcnow()
-    db.session.commit()
-    return success_response("Trip cancelled", trip.to_dict())
+    return _legacy_cancel(user, 'rideshare_trip', trip_id, _legacy_body(), "Trip cancelled")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -733,82 +718,198 @@ def bookings_show(user, booking_id):
 @admin_bp.route('/api/admin/bookings/<int:booking_id>/update-status', methods=['POST'])
 @admin_required
 def bookings_update_status(user, booking_id):
-    """Admin updates booking status."""
-    booking = ScheduledBooking.query.get(booking_id)
-    if not booking:
+    """Admin sets a scheduled booking's legacy status through the state machine."""
+    if not ScheduledBooking.query.get(booking_id):
         return error_response("Booking not found", status_code=404)
-
-    data = request.get_json(silent=True) or request.form
+    data = _legacy_body()
     new_status = data.get('status')
-    booking.status = new_status
-    booking.updated_at = datetime.utcnow()
-
-    if new_status == 'driver_assigned':
-        booking.assigned_at = datetime.utcnow()
-    elif new_status == 'confirmed':
-        booking.confirmed_at = datetime.utcnow()
-    elif new_status == 'in_progress':
-        booking.started_at = datetime.utcnow()
-    elif new_status == 'completed':
-        booking.completed_at = datetime.utcnow()
-    elif new_status == 'cancelled':
-        booking.cancelled_at = datetime.utcnow()
-        booking.cancellation_reason = data.get('reason')
-
-    db.session.commit()
-    return success_response("Booking status updated", booking.to_dict())
+    valid = ['pending', 'price_negotiating', 'price_accepted', 'driver_assigned', 'confirmed', 'in_progress',
+             'completed', 'cancelled']
+    if new_status not in valid:
+        return error_response(f"Status must be one of: {', '.join(valid)}")
+    return _legacy_set_status(user, 'scheduled', booking_id, new_status, data, "Booking status updated")
 
 
 @admin_bp.route('/api/admin/bookings/<int:booking_id>/assign-driver', methods=['POST'])
 @admin_required
 def bookings_assign_driver(user, booking_id):
-    """Admin assigns driver to booking."""
+    """Admin assigns (or reassigns) the driver — same rules as the v4
+    POST /api/admin/rides/scheduled/{id}/reassign (before pickup only, approved
+    active driver, audited, parties notified). A reason is required when
+    replacing an already-assigned driver."""
+    from backend.services import ride_actions as RA
+    from backend.services import trip_state_machine as TSM
     booking = ScheduledBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
-    data = request.get_json(silent=True) or request.form
-    driver = AdminUser.query.get(data.get('driver_id'))
-    if not driver:
-        return error_response("Driver not found", status_code=404)
-    booking.driver_id = driver.id
-    booking.assigned_by = user.id
-    booking.status = 'driver_assigned'
-    booking.assigned_at = datetime.utcnow()
-    booking.updated_at = datetime.utcnow()
-    db.session.commit()
-    return success_response("Driver assigned", booking.to_dict())
+    data = _legacy_body()
+    reason = (data.get('reason') or '').strip()
+    if booking.driver_id and len(reason) < 5:
+        return error_response('A reason is required to replace the assigned driver.',
+                              data={'error_code': 'reason_required'})
+    try:
+        RA.reassign_driver('scheduled', booking_id, data.get('driver_id'), user,
+                           reason or 'Driver assigned from the admin bookings page')
+    except TSM.TransitionError as e:
+        db.session.rollback()
+        return error_response(e.message, data={'error_code': e.code}, status_code=e.status)
+    db.session.expire_all()
+    return success_response("Driver assigned", ScheduledBooking.query.get(booking_id).to_dict())
 
 
 @admin_bp.route('/api/admin/bookings/<int:booking_id>/cancel', methods=['POST'])
 @admin_required
 def bookings_cancel(user, booking_id):
-    """Admin cancels a booking."""
-    booking = ScheduledBooking.query.get(booking_id)
-    if not booking:
+    """Admin cancels a scheduled booking (state machine + refund policy)."""
+    if not ScheduledBooking.query.get(booking_id):
         return error_response("Booking not found", status_code=404)
-    data = request.get_json(silent=True) or request.form
-    booking.status = 'cancelled'
-    booking.cancellation_reason = data.get('reason', 'Cancelled by admin')
-    booking.cancelled_at = datetime.utcnow()
-    booking.updated_at = datetime.utcnow()
-    db.session.commit()
-    return success_response("Booking cancelled", booking.to_dict())
+    return _legacy_cancel(user, 'scheduled', booking_id, _legacy_body(), "Booking cancelled")
 
 
 @admin_bp.route('/api/admin/bookings/<int:booking_id>/mark-paid', methods=['POST'])
 @admin_required
 def bookings_mark_paid(user, booking_id):
-    """Admin force-marks booking as paid."""
+    """Admin marks a booking paid outside Stripe (cash, e-transfer, comp):
+    records an offline RidePayment (provider 'offline', captured) and confirms
+    the booking through the state machine. Body: {amount_cents?, reason}."""
+    from backend.services import trip_state_machine as TSM
+    from backend.services.audit import audit
+    from backend.services.payments import payment_service as PS
     booking = ScheduledBooking.query.get(booking_id)
     if not booking:
         return error_response("Booking not found", status_code=404)
-    booking.payment_status = 'paid'
-    booking.stripe_paid = True
-    booking.status = 'confirmed'
-    booking.confirmed_at = datetime.utcnow()
-    booking.updated_at = datetime.utcnow()
+    data = _legacy_body()
+    reason = (data.get('reason') or data.get('note') or '').strip()
+    if len(reason) < 5:
+        return error_response('A reason is required (e.g. "Paid cash at the office").',
+                              data={'error_code': 'reason_required'})
+    TSM.ensure_stage('scheduled', booking)
+    stage = booking.trip_stage
+    if stage not in ('REQUESTED', 'NEGOTIATING', 'PRICE_AGREED', 'AWAITING_PAYMENT'):
+        return error_response(f'A booking in stage {stage} cannot be marked paid.',
+                              data={'error_code': 'bad_stage', 'stage': stage}, status_code=409)
+    try:
+        rp = PS.record_offline_payment('scheduled', booking, user, data.get('amount_cents'), note=reason)
+        if not booking.agreed_price:
+            booking.agreed_price = rp.fare_cents
+        db.session.flush()
+        TSM.walk_to('scheduled', booking_id, 'CONFIRMED', actor=user, actor_type='admin', legacy=False,
+                    meta={'admin_reason': reason, 'ride_payment_id': rp.id, 'offline_payment': True})
+    except PS.PaymentError as e:
+        db.session.rollback()
+        return error_response(e.message, data={'error_code': e.code}, status_code=e.status)
+    except TSM.TransitionError as e:
+        db.session.rollback()
+        return error_response(e.message, data={'error_code': e.code, **e.data}, status_code=e.status)
+    audit('ride.admin_mark_paid', user, 'scheduled', booking_id, before={'stage': stage},
+          after={'stage': 'CONFIRMED', 'ride_payment_id': rp.id, 'amount_cents': rp.amount_captured_cents},
+          meta={'reason': reason})
     db.session.commit()
-    return success_response("Marked as paid", booking.to_dict())
+    db.session.expire_all()
+    return success_response("Marked as paid", ScheduledBooking.query.get(booking_id).to_dict())
+
+
+# ── legacy admin → state machine helpers ────────────────────────────────────
+
+def _legacy_body():
+    data = request.get_json(silent=True)
+    if data is None:
+        data = request.form.to_dict() if request.form else {}
+    return data or {}
+
+
+# legacy status → target v4 stage, per ride type (None = cancel through the policy)
+_LEGACY_TARGET = {
+    'carhire': {'Pending': 'NEGOTIATING', 'Accepted': 'PRICE_AGREED', 'Started': 'IN_PROGRESS',
+                'Completed': 'COMPLETED', 'Cancelled': None},
+    'scheduled': {'pending': 'REQUESTED', 'price_negotiating': 'NEGOTIATING', 'price_accepted': 'PRICE_AGREED',
+                  'driver_assigned': 'PRICE_AGREED', 'confirmed': 'CONFIRMED', 'in_progress': 'IN_PROGRESS',
+                  'completed': 'COMPLETED', 'cancelled': None},
+    'rideshare_trip': {'Active': 'PUBLISHED', 'Ongoing': 'IN_PROGRESS', 'Started': 'IN_PROGRESS',
+                       'Completed': 'COMPLETED', 'Canceled': None, 'Cancelled': None},
+}
+
+
+def _legacy_set_status(admin, ride_type, ride_id, new_status, data, message):
+    """Map a legacy status to its v4 stage and walk there as admin. Returns the
+    legacy response shape (the row's to_dict()) or a clear error."""
+    from backend.services import rides as R
+    from backend.services import trip_state_machine as TSM
+    from backend.services.audit import audit
+    target = _LEGACY_TARGET[ride_type].get(new_status, 'unknown')
+    if target is None:
+        return _legacy_cancel(admin, ride_type, ride_id, data, message)
+    reason = (data.get('reason') or '').strip()
+    if len(reason) < 5:
+        return error_response('A reason (at least 5 characters) is required for admin status changes.',
+                              data={'error_code': 'reason_required'})
+    ride = R.load(ride_type, ride_id)
+    stage = TSM.ensure_stage(ride_type, ride)
+    if ride_type == 'carhire' and new_status == 'Accepted' and TSM.payment_secured(ride_type, ride):
+        target = 'CONFIRMED'
+    before = {'stage': stage, 'status': ride.status}
+    # No-op only when already there, or when the ride is already past the target
+    # with the same legacy status (e.g. 'Accepted' on a CONFIRMED ride). A ride at
+    # DRIVER_ARRIVED also reads 'Started', but admin 'Started' must still move it
+    # forward to IN_PROGRESS.
+    same_legacy = TSM.legacy_status(ride_type, stage, ride.status) == new_status
+    if stage == target or (same_legacy and TSM.shortest_path(ride_type, stage, target) is None):
+        db.session.commit()
+        return success_response(message, R.load(ride_type, ride_id).to_dict())
+    if target in TSM.PAYMENT_GATED.get(ride_type, ()) and S_flag('pay_before_trip') \
+            and not TSM.payment_secured(ride_type, ride):
+        return error_response('This ride is not paid. Mark it paid (offline payment) or let the customer pay '
+                              'before moving it on.', data={'error_code': 'payment_required', 'stage': stage},
+                              status_code=402)
+    if TSM.is_terminal(ride_type, stage):
+        return error_response(f'The ride is already {stage} and cannot change.',
+                              data={'error_code': 'terminal', 'stage': stage}, status_code=409)
+    try:
+        TSM.walk_to(ride_type, ride_id, target, actor=admin, actor_type='admin', legacy=False,
+                    meta={'admin_reason': reason, 'legacy_admin_status': new_status})
+    except TSM.TransitionError as e:
+        db.session.rollback()
+        return error_response(f'{e.message} Use a status the ride can reach from {stage}.',
+                              data={'error_code': e.code, 'stage': stage, **e.data}, status_code=e.status)
+    ride = R.load(ride_type, ride_id)
+    audit('ride.admin_legacy_status', admin, ride_type, ride_id, before=before,
+          after={'stage': ride.trip_stage, 'status': ride.status}, meta={'reason': reason, 'status': new_status})
+    db.session.commit()
+    return success_response(message, R.load(ride_type, ride_id).to_dict())
+
+
+def _legacy_cancel(admin, ride_type, ride_id, data, message):
+    """Admin cancellation: ride_actions.cancel(actor_type='admin') — refund policy,
+    terminal stage, hold released / refund in a job, parties notified."""
+    from backend.services import ride_actions as RA
+    from backend.services import rides as R
+    from backend.services import trip_state_machine as TSM
+    from backend.services.audit import audit
+    reason = (data.get('reason') or data.get('note') or '').strip()
+    if len(reason) < 5:
+        return error_response('A cancellation reason (at least 5 characters) is required.',
+                              data={'error_code': 'reason_required'})
+    policy_reason = data.get('policy_reason') or 'customer_cancel'
+    if policy_reason not in ('customer_cancel', 'driver_cancel', 'safety', 'expired', 'driver_no_show'):
+        return error_response('Invalid policy_reason', data={'error_code': 'bad_policy_reason'})
+    try:
+        before = R.load(ride_type, ride_id)
+        before = {'stage': TSM.ensure_stage(ride_type, before), 'status': before.status}
+        result, decision = RA.cancel(ride_type, ride_id, actor=admin, actor_type='admin', reason=policy_reason,
+                                     reason_code='admin', note=reason, commit=False)
+        audit('ride.admin_cancel', admin, ride_type, ride_id, before=before,
+              after={'stage': result.to_stage, 'status': result.ride.status},
+              meta={'reason': reason, 'policy': decision.to_dict() if decision else None, 'legacy_admin': True})
+        db.session.commit()
+    except TSM.TransitionError as e:
+        db.session.rollback()
+        return error_response(e.message, data={'error_code': e.code, **e.data}, status_code=e.status)
+    return success_response(message, R.load(ride_type, ride_id).to_dict())
+
+
+def S_flag(name):
+    from backend.services import settings_service as S
+    return S.flag(name)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1054,6 +1155,12 @@ def payout_complete(user, payout_id):
     payout.stripe_transfer_id = transfer.id
     payout.status = 'completed'
     payout.processed_at = datetime.utcnow()
+    from backend.services.audit import audit
+    from backend.services.notify import notify
+    audit('payout.complete', user, 'payout_request', payout.id, after={'status': 'completed',
+                                                                      'stripe_transfer_id': transfer.id})
+    notify('payout.sent', [payout.user_id], {'amount': f"${float(payout.net_amount or payout.amount):,.2f}",
+                                             'id': payout.id}, dedupe_key=f'payout-{payout.id}')
     db.session.commit()
     return success_response("Payout completed", payout.to_dict())
 
@@ -1267,3 +1374,66 @@ def system_counts(user):
         'companies': Company.query.count(),
         'route_stages': RouteStage.query.count(),
     })
+
+
+# ── Spec §2.8: every admin action is audited ────────────────────────────────
+_AUDIT_REDACT = ('password', 'token', 'secret', 'otp', 'code', 'card', 'cvc')
+
+
+_SNAPSHOT_MODELS = {
+    'users': AdminUser, 'negotiations': Negotiation, 'trips': Trip, 'bookings': ScheduledBooking,
+    'trip-bookings': TripBooking, 'payout-requests': PayoutRequest, 'companies': Company,
+    'route-stages': RouteStage, 'payments': Payment,
+}
+_SNAPSHOT_HIDE = ('password', 'remember_token', 'token', 'secret', 'otp', 'stripe_url')
+
+
+@admin_bp.before_request
+def _snapshot_before_legacy_admin_action():
+    """Capture a 'before' row snapshot for the audit log (cheap: one PK lookup)."""
+    from flask import g
+    g._admin_audit_before = None
+    try:
+        if request.method in ('GET', 'HEAD', 'OPTIONS') or '/api/admin/' not in request.path:
+            return
+        parts = request.path.split('/api/admin/')[-1].split('/')
+        model = _SNAPSHOT_MODELS.get(parts[0])
+        if model is None or len(parts) < 2 or not parts[1].isdigit():
+            return
+        row = db.session.get(model, int(parts[1]))
+        if row is not None and hasattr(row, 'to_dict'):
+            snap = row.to_dict()
+            import json
+            g._admin_audit_before = json.loads(json.dumps(
+                {k: ('[redacted]' if any(t in k.lower() for t in _SNAPSHOT_HIDE) else v)
+                 for k, v in snap.items() if not isinstance(v, (list, dict))}, default=str))
+    except Exception:
+        db.session.rollback()
+
+
+@admin_bp.after_request
+def _audit_legacy_admin_actions(response):
+    """Audit every successful state-changing request on the legacy admin API
+    (the v4 admin blueprints audit explicitly with before/after snapshots)."""
+    try:
+        if request.method in ('GET', 'HEAD', 'OPTIONS') or response.status_code >= 400:
+            return response
+        from backend.services.audit import audit
+        from backend.utils.auth import get_current_user
+        actor = get_current_user()
+        if actor is None:
+            return response
+        payload = request.get_json(silent=True) or (request.form.to_dict() if request.form else {})
+        safe = {k: ('[redacted]' if any(t in k.lower() for t in _AUDIT_REDACT) else v)
+                for k, v in (payload or {}).items()} if isinstance(payload, dict) else {}
+        view_args = request.view_args or {}
+        entity_id = next(iter(view_args.values()), None)
+        entity_type = request.path.split('/api/admin/')[-1].split('/')[0] if '/api/admin/' in request.path else None
+        from flask import g
+        audit(f'admin_legacy.{request.endpoint.split(".")[-1]}', actor, entity_type, entity_id,
+              before=getattr(g, '_admin_audit_before', None), after=safe or None,
+              meta={'method': request.method, 'path': request.path})
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    return response

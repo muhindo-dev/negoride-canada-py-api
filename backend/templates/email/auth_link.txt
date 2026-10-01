@@ -1,0 +1,12 @@
+{{ title }}
+
+{{ greeting }}
+
+{{ body }}
+
+{{ cta_label }}: {{ cta_url }}
+
+{{ footnote }}
+--
+{{ company_legal_name }} · {{ company_address }}
+Support: {{ support_email }}

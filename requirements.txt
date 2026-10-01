@@ -13,6 +13,10 @@ python-dotenv==1.0.1
 flask-socketio==5.3.7
 eventlet==0.37.0
 boto3>=1.34
-weasyprint==70.0      # receipt / credit note / statement PDFs (needs pango: brew install pango | apt install libpango-1.0-0 libpangoft2-1.0-0)
+weasyprint==66.0      # last Python 3.9 compatible line; receipt / credit note / statement PDFs
 pypdf>=6.0            # tests: PDF text extraction (receipt totals comparison)
 PyYAML>=6.0
+redis>=5.0            # job queue + Socket.IO message queue + rate limits
+rq>=1.16              # background worker (worker.py)
+pytest>=8.0           # tests
+openpyxl>=3.1           # admin finance Excel (.xlsx) exports

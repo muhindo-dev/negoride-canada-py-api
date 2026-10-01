@@ -36,6 +36,18 @@ CATALOGUE = {
         'New offer', '{{ from_name }} countered: {{ price }}',
         'Nouvelle offre', '{{ from_name }} propose : {{ price }}',
         route='negotiation', android='negotiation'),
+    # Counter-offer marketplace (§21.2.2): a driver countered a broadcast request;
+    # the request stays open for other drivers until the customer accepts one.
+    'carhire.request_countered': E(
+        'negotiation', ('push', 'socket', 'inbox'),
+        'New offer: {{ price }}', '{{ driver_first }}{% if rating %} ★{{ rating }}{% endif %} offers {{ price }}{% if eta_min %} · {{ eta_min }} min away{% endif %}.',
+        'Nouvelle offre : {{ price }}', '{{ driver_first }}{% if rating %} ★{{ rating }}{% endif %} propose {{ price }}{% if eta_min %} · à {{ eta_min }} min{% endif %}.',
+        route='carhire_request', android='negotiation', sound='new_request'),
+    'carhire.customer_countered': E(
+        'negotiation', ('push', 'socket', 'inbox'),
+        'Counter-offer: {{ price }}', '{{ customer_first }} countered with {{ price }}. Accept or counter?',
+        'Contre-offre : {{ price }}', '{{ customer_first }} propose {{ price }}. Accepter ou contre-proposer ?',
+        route='carhire_request', android='negotiation', sound='new_request'),
     'negotiation.agreed': E(
         'ride', ('push', 'socket', 'inbox'),
         'Price agreed', 'Price agreed: {{ price }}.{% if is_customer %} Complete payment to confirm.{% endif %}',
@@ -51,8 +63,8 @@ CATALOGUE = {
         route='ride', android='payments'),
     'payment.failed': E(
         'payment', ('push', 'socket', 'inbox'),
-        'Payment failed', 'Payment failed — update your card to keep this ride.',
-        'Paiement refusé', 'Paiement refusé — mettez à jour votre carte pour garder cette course.',
+        'Payment failed', '{% if action_required %}Confirm the payment with your bank to keep this ride.{% else %}Payment failed{% if reason %} — {{ reason }}{% endif %} Update your card to keep this ride.{% endif %}',
+        'Paiement refusé', '{% if action_required %}Confirmez le paiement auprès de votre banque pour garder cette course.{% else %}Paiement refusé. Mettez à jour votre carte pour garder cette course.{% endif %}',
         route='ride', android='payments'),
     'refund.issued': E(
         'payment', ('push', 'inbox', 'email'),
@@ -76,6 +88,12 @@ CATALOGUE = {
         'Your weekly statement', 'Week of {{ period }}: net earnings {{ net }}.',
         'Votre relevé hebdomadaire', 'Semaine du {{ period }} : gains nets {{ net }}.',
         route='wallet', android='payments'),
+    # Logged by services/receipts.py (tip receipt email with PDF). Do not notify() it.
+    'tip.receipt': E(
+        'payment', ('inbox', 'email'),
+        'Tip receipt {{ number }}', 'Thanks! Your {{ amount }} tip went 100 % to {{ driver_first }}.',
+        'Reçu de pourboire {{ number }}', 'Merci! Votre pourboire de {{ amount }} va à 100 % à {{ driver_first }}.',
+        route='receipt', android='payments'),
     'payout.sent': E(
         'payouts', ('push', 'inbox'),
         'Payout sent', '{{ amount }} is on its way to your bank.',
@@ -83,17 +101,17 @@ CATALOGUE = {
         route='wallet', android='payments'),
     # ── ride lifecycle ───────────────────────────────────────────────────────
     'ride.driver_en_route': E(
-        'ride', ('push', 'socket', 'inbox'),
+        'ride', ('push', 'socket', 'inbox', 'live_activity'),
         '{{ driver_first }} is on the way', '{{ driver_first }} is on the way{% if eta_min %} · {{ eta_min }} min{% endif %}{% if vehicle %} · {{ vehicle }}{% endif %}',
         '{{ driver_first }} est en route', '{{ driver_first }} est en route{% if eta_min %} · {{ eta_min }} min{% endif %}{% if vehicle %} · {{ vehicle }}{% endif %}',
         route='ride', android='ride_updates'),
     'ride.driver_arriving': E(
-        'ride', ('push', 'socket'),
+        'ride', ('push', 'socket', 'live_activity'),
         'Your driver is almost there', 'Your driver is {{ eta_min or 1 }} min away — get ready.',
         'Votre chauffeur arrive', 'Votre chauffeur est à {{ eta_min or 1 }} min — préparez-vous.',
         route='ride', critical=True, android='ride_critical'),
     'ride.driver_arrived': E(
-        'ride', ('push', 'socket', 'inbox'),
+        'ride', ('push', 'socket', 'inbox', 'live_activity'),
         'Your driver has arrived', 'Your driver has arrived.{% if pin %} PIN: {{ pin }}.{% endif %}{% if wait_until %} Waiting until {{ wait_until }}.{% endif %}{% if vehicle %} {{ vehicle }}{% endif %}',
         'Votre chauffeur est arrivé', 'Votre chauffeur est arrivé.{% if pin %} NIP : {{ pin }}.{% endif %}{% if wait_until %} Attente jusqu’à {{ wait_until }}.{% endif %}{% if vehicle %} {{ vehicle }}{% endif %}',
         route='ride', critical=True, sms_fallback=True, android='ride_critical', sound='driver_arrived'),
@@ -103,7 +121,7 @@ CATALOGUE = {
         'Votre chauffeur attend', 'Il reste {{ minutes_left or 2 }} minutes avant des frais d’absence.',
         route='ride', critical=True, android='ride_critical'),
     'ride.started': E(
-        'ride', ('push', 'socket', 'inbox'),
+        'ride', ('push', 'socket', 'inbox', 'live_activity'),
         'Trip started', 'Trip started — you can share your live location with a trusted contact.',
         'Trajet commencé', 'Trajet commencé — partagez votre position en direct avec un proche.',
         route='ride', android='ride_updates'),
@@ -132,8 +150,9 @@ CATALOGUE = {
         'Ride request expired', '{{ reason or "The request expired before it was confirmed." }} Nothing was charged.',
         'Demande expirée', 'La demande a expiré avant confirmation. Aucun frais.',
         route='home', android='ride_updates'),
+    # ETA refreshes are pushed by services/eta.py directly (realtime + live_activity.push_update).
     'ride.eta_updated': E(
-        'ride', ('socket',), '', '', '', '', route='ride'),
+        'ride', ('socket', 'live_activity'), '', '', '', '', route='ride'),
     'rating.reminder': E(
         'ratings', ('push', 'inbox'),
         'How was your trip?', 'How was your trip with {{ other_first }}?',
@@ -197,10 +216,22 @@ CATALOGUE = {
         'Safety check unanswered', '{{ name }} did not answer an "Are you OK?" check ({{ kind }}). Incident #{{ incident_id }}.',
         'Vérification sans réponse', '{{ name }} n’a pas répondu à « Tout va bien ? » ({{ kind }}). Incident n° {{ incident_id }}.',
         route='safety_incident', critical=True, android='ride_critical'),
+    'safety.recording_started': E(
+        'safety', ('push', 'socket', 'inbox'),
+        'Audio recording is on for safety', 'The other person on your trip turned on audio recording for safety. '
+        'Recordings are private and only reviewed by NegoRide safety staff if there is a report.',
+        'Enregistrement audio activé', 'L’autre personne de votre trajet a activé l’enregistrement audio pour la sécurité. '
+        'Les enregistrements sont privés et examinés seulement en cas de signalement.',
+        route='ride', android='ride_updates'),
     'safety.trip_shared': E(
         'safety', ('sms',),
         '', '{{ name }} is sharing a NegoRide trip with you: {{ link }}',
         '', '{{ name }} partage un trajet NegoRide avec vous : {{ link }}'),
+    'safety.pin_locked': E(
+        'safety', ('socket', 'push', 'inbox'),
+        'Ride PIN locked', 'Ride {{ ride_type }} #{{ ride_id }}: {{ attempts }} wrong PIN attempts by {{ name }}. Check the ride now.',
+        'NIP de course bloqué', 'Course {{ ride_type }} n° {{ ride_id }} : {{ attempts }} NIP erronés saisis par {{ name }}. Vérifiez la course.',
+        route='ride', critical=True, android='ride_critical'),
     # ── onboarding / account ─────────────────────────────────────────────────
     'onboarding.step_required': E(
         'onboarding', ('push', 'email', 'inbox'),
@@ -227,6 +258,13 @@ CATALOGUE = {
         'Your background check is complete', '{{ summary }}',
         'Vérification des antécédents terminée', '{{ summary }}',
         route='driver_onboarding', email_template='generic'),
+    # Ops console: a background check needs a human decision (consider / suspended /
+    # error). Sent through notify.notify_admins(...) by the onboarding module.
+    'admin.background_check_review': E(
+        'account', ('push', 'email', 'inbox'),
+        'Background check needs review', '{{ name or "A driver applicant" }}: background check {{ result or "needs review" }}{% if check_id %} (check #{{ check_id }}){% endif %}.',
+        'Vérification à examiner', '{{ name or "Un candidat" }} : vérification {{ result or "à examiner" }}{% if check_id %} (n° {{ check_id }}){% endif %}.',
+        route='admin_onboarding', email_template='generic'),
     'document.expiring': E(
         'account', ('push', 'email', 'inbox'),
         'Document expiring soon', 'Your {{ document }} expires in {{ days }} days. Upload a new one to keep driving.',

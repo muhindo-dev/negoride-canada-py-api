@@ -8,9 +8,10 @@ import { useQueryClient } from '@tanstack/react-query';
 const Ctx = createContext(null);
 
 const ADMIN_EVENTS = [
-  'connected', 'ride.stage_changed', 'driver.location', 'safety.sos', 'safety.sos_updated', 'alert',
+  'connected', 'ride.stage_changed', 'ride.driver_reassigned', 'driver.location', 'live.sos_location', 'safety.sos',
+  'safety.sos_updated', 'alert',
   'safety.check_created', 'safety.check_answered', 'safety.report_created', 'onboarding.submitted',
-  'onboarding.document_uploaded', 'onboarding.bgc_clear', 'onboarding.bgc_review', 'notification',
+  'onboarding.document_uploaded', 'onboarding.bgc_clear', 'onboarding.bgc_review', 'onboarding.bgc_failed', 'notification',
 ];
 
 export function RealtimeProvider({ token, children }) {
@@ -47,6 +48,7 @@ export function RealtimeProvider({ token, children }) {
         qc.invalidateQueries({ queryKey: ['alerts'] });
       } else if (event === 'alert') {
         qc.invalidateQueries({ queryKey: ['alerts'] });
+        if (payload?.kind === 'oncall_not_configured') qc.invalidateQueries({ queryKey: ['readiness'] });
       } else if (event.startsWith('onboarding.')) {
         qc.invalidateQueries({ queryKey: ['onboarding'] });
       }

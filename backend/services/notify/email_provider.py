@@ -29,6 +29,15 @@ def provider_name():
     return (os.getenv('EMAIL_PROVIDER') or 'smtp').strip().lower()
 
 
+def _support_reply_to():
+    """Replies go to support (setting safety.support_email) when EMAIL_REPLY_TO is unset."""
+    try:
+        from backend.services import settings_service as S
+        return (S.get('safety.support_email') or '').strip() or None
+    except Exception:
+        return None
+
+
 def _from_header():
     from flask import current_app
     explicit = os.getenv('EMAIL_FROM', '').strip()
@@ -43,11 +52,11 @@ def send(to, subject, html, text=None, attachments=None, reply_to=None, tag=None
     """Send one email. Returns a provider message id. Raises EmailError."""
     attachments = attachments or []
     text = text or _html_to_text(html)
-    reply_to = reply_to or os.getenv('EMAIL_REPLY_TO', '').strip() or None
+    reply_to = reply_to or os.getenv('EMAIL_REPLY_TO', '').strip() or _support_reply_to()
     p = provider_name()
     if p == 'memory':
         mid = f'mem-{uuid.uuid4().hex[:12]}'
-        OUTBOX.append({'id': mid, 'to': to, 'subject': subject, 'html': html, 'text': text,
+        OUTBOX.append({'id': mid, 'to': to, 'subject': subject, 'html': html, 'text': text, 'reply_to': reply_to,
                        'attachments': [(a[0], len(a[1]), a[2]) for a in attachments], 'tag': tag})
         return mid
     if p == 'console':

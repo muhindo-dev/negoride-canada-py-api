@@ -51,6 +51,7 @@ DEFAULTS = {
     'ff.auto_suspend_low_rating': (True, 'bool', 'flags', 'Automatic warning / suspension on low rating', False),
     'ff.strike_suspension': (True, 'bool', 'flags', 'Automatic warning / suspension on reliability strikes', False),
     'ff.referrals': (False, 'bool', 'flags', 'Driver referral bonus', True),
+    'ff.home_v4': (True, 'bool', 'flags', 'Map-first v4 Home screens (§21.2) — off restores the legacy Home', True),
     'ff.driver_no_show_credit': (True, 'bool', 'flags', '$5 apology credit on driver no-show', False),
 
     # ── Pricing / commission ─────────────────────────────────────────────────
@@ -127,6 +128,12 @@ DEFAULTS = {
     'safety.incident_share_hours': (24, 'int', 'safety', 'Max lifetime of an SOS live-location link', False),
     'tracking.share_max_hours': (12, 'int', 'safety', 'Max lifetime of a trip share link while the trip runs', False),
     'tracking.public_rate_limit_per_min': (60, 'int', 'safety', 'Public tracking requests per IP per minute', False),
+    # safety audit gaps (v4_0101)
+    'tracking.public_rate_limit_per_token_per_min': (120, 'int', 'safety', 'Public tracking requests per share link per minute (all viewers)', False),
+    'tracking.batch_flush_s': (3, 'int', 'safety', 'Breadcrumb buffer flush interval (bulk insert)', False),
+    'tracking.max_point_age_s': (600, 'int', 'safety', 'Older (offline catch-up) points are stored but not used for live updates', False),
+    'safety.pin_max_attempts': (5, 'int', 'safety', 'Wrong ride-PIN attempts before the ride PIN locks', False),
+    'safety.pin_lock_window_s': (600, 'int', 'safety', 'Sliding window / lock duration for wrong ride-PIN attempts', False),
 
     # ── Identity (§11) ───────────────────────────────────────────────────────
     'otp.resend_after_s': (30, 'int', 'identity', 'Resend cooldown', True),
@@ -143,6 +150,11 @@ DEFAULTS = {
     'otp.block_voip_signup': (False, 'bool', 'identity', 'Block VoIP numbers at customer sign-up (drivers: otp.block_voip_drivers)', False),
     'ff.sensitive_action_reverify': (True, 'bool', 'flags', 'v4 clients must re-verify the phone before payout-account changes and account deletion', True),
     'legal.consent_min_app_version': ('4.0.0', 'string', 'identity', 'Clients at/above this X-App-Version must send the three consent ticks', False),
+    'otp.allowed_nanp_regions': ('', 'string', 'identity', 'Extra NANP (+1) regions allowed besides CA/US, e.g. "876,809" area codes or "JM,DO" (Caribbean numbers are refused by default — fraud / SMS pumping)', False),
+    'legal.enforce_reacceptance': (True, 'bool', 'identity', 'Block API calls (403 legal_pending) until a policy version marked "requires re-acceptance" is accepted (v4 clients)', False),
+    'legal.marketing_consent_version': ('2026-09', 'string', 'identity', 'Version tag of the CASL marketing consent wording stored as proof', True),
+    'legal.marketing_consent_text': ('Yes, send me NegoRide news, offers and promotions by email and SMS. I can unsubscribe at any time.', 'string', 'identity', 'CASL marketing consent wording (EN) shown by the apps and stored as proof with every grant', True),
+    'legal.marketing_consent_text_fr': ('Oui, envoyez-moi les nouvelles, offres et promotions de NegoRide par courriel et SMS. Je peux me désabonner en tout temps.', 'string', 'identity', 'CASL marketing consent wording (FR)', True),
 
     # ── Onboarding (§14) [CONFIRM WITH CLIENT] ───────────────────────────────
     'onboarding.bgc_fee_cents': (3999, 'int', 'onboarding', 'Background check fee (CAD cents)', True),
@@ -160,6 +172,9 @@ DEFAULTS = {
                                       'string', 'onboarding', 'Documents required before submitting', True),
     'onboarding.expiry_reminder_days': ('30,14,3', 'string', 'onboarding', 'Document expiry reminder thresholds (days)', False),
     'onboarding.recheck_reminder_days': (30, 'int', 'onboarding', 'Notify drivers this many days before the annual re-check is due', False),
+    'onboarding.bgc_start_delay_min': (30, 'int', 'onboarding', 'Minutes between the fee payment and ordering the Certn check (cancel + refund window)', True),
+    'onboarding.rideshare_endorsement_provinces': ('ON,BC,AB,QC', 'string', 'onboarding', 'Provinces where the insurance upload must attest a rideshare endorsement', True),
+    'onboarding.face_match_threshold': (90, 'int', 'onboarding', 'Face-match similarity (0-100) at/above which the selfie is flagged "match" for the reviewer (never auto-approves)', False),
     'onboarding.certn_dispute_contact': ('Certn Support — https://certn.co/contact', 'string', 'onboarding',
                                          'Where drivers dispute background-check results [REVIEW WITH COUNSEL]', True),
     'support.sla_urgent_h': (1, 'int', 'support', 'First-response SLA for urgent tickets (hours)', False),
@@ -194,10 +209,21 @@ DEFAULTS = {
     'tax.default_province': ('ON', 'string', 'company', 'Province used for sales tax when the pickup province is unknown', False),
     'ff.driver_statements': (True, 'bool', 'flags', 'Weekly driver earnings statement email + PDF (§13.3)', False),
 
+    # ── Trip / payments / notifications audit gaps (v4_0402) ───────────────
+    'ff.live_activities': (True, 'bool', 'flags', 'Server-driven iOS Live Activity updates through OneSignal (§5.1)', True),
+    'safety.settle_hold_h': (24, 'int', 'cancellation', 'Safety-ended rides: keep the payment hold this many hours for an admin decision, then release it', False),
+    'carhire.counter_offer_ttl_s': (90, 'int', 'ride', 'A driver counter-offer on a broadcast request stays valid for (seconds)', True),
+    'tip.within_h': (72, 'int', 'ratings', 'Riders can add a tip up to N hours after the ride ended', True),
+    'tip.max_cents': (50000, 'int', 'ratings', 'Largest tip accepted', True),
+    'receipts.sweep_after_s': (120, 'int', 'company', 'Receipt sweeper issues missing receipts for rides captured more than N s ago', False),
+    'services.enabled': (['car_hire', 'rideshare', 'courier', 'movers', 'airport', 'special_car'], 'json', 'app',
+                         'Service types offered (apps, onboarding). JSON list of car_hire, rideshare, courier, movers, airport, special_car', True),
+
     # ── App ──────────────────────────────────────────────────────────────────
     'search.region_codes': ('ca', 'string', 'app', 'Address autocomplete regions (comma-separated ISO codes, e.g. ca,us)', True),
     'app.min_supported_version': ('3.0.0', 'string', 'app', 'Older builds are asked to update', True),
     'app.latest_version': ('4.0.0', 'string', 'app', 'Latest store version', True),
+    'app.legacy_clients_allowed': (True, 'bool', 'app', 'Allow pre-v4 builds (no X-App-Version header). Off = every client gets the v4 rules (consent ticks, phone-required sign-up, sensitive-action OTP, re-acceptance gate)', True),
 }
 
 _cache = {}
@@ -252,6 +278,24 @@ def invalidate():
     _cache_at = 0.0
 
 
+# Env vars that seed a setting's default (an admin override in app_settings still wins).
+ENV_DEFAULTS = {
+    'onboarding.bgc_fee_cents': 'BACKGROUND_CHECK_FEE_CENTS',
+}
+
+
+def _env_default(key, spec):
+    import os
+    env = ENV_DEFAULTS.get(key)
+    raw = os.getenv(env, '').strip() if env else ''
+    if raw:
+        try:
+            return _coerce(raw, spec[1])
+        except (TypeError, ValueError):
+            pass
+    return spec[0]
+
+
 def get(key, default=None):
     key = _normalize_key(key)
     spec = DEFAULTS.get(key)
@@ -260,10 +304,10 @@ def get(key, default=None):
         raw, typ = rows[key]
         try:
             return _coerce(raw, spec[1] if spec else typ)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, json.JSONDecodeError):
             pass
     if spec:
-        return spec[0]
+        return _env_default(key, spec)
     return default
 
 
@@ -330,6 +374,21 @@ def all_settings(public_only=False):
             'overridden': key in rows,
         })
     return out
+
+
+ALL_SERVICES = ('car_hire', 'rideshare', 'courier', 'movers', 'airport', 'special_car')
+
+
+def enabled_services():
+    """Service types currently offered (setting `services.enabled`), in
+    canonical order, unknown values dropped. Use this instead of hard-coded
+    lists (apps via /api/app/config → `services`, driver onboarding)."""
+    val = get('services.enabled')
+    if isinstance(val, str):
+        val = [v.strip() for v in val.split(',')]
+    wanted = {str(v).strip().lower() for v in (val or [])}
+    out = [s for s in ALL_SERVICES if s in wanted]
+    return out or list(ALL_SERVICES)
 
 
 def public_config():

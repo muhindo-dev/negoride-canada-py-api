@@ -1,0 +1,16 @@
+{{ title }}
+
+{% if fr %}Bonjour{% else %}Hi{% endif %} {{ first_name }},
+
+{{ preheader }}
+
+{% if fr %}N° de reçu{% else %}Receipt no.{% endif %}: {{ receipt_number }}
+Date: {{ paid_at }}
+{{ description }}
+{% if fr %}Mode de paiement{% else %}Payment method{% endif %}: {{ method }}
+{% if fr %}Total payé (CAD){% else %}Total paid (CAD){% endif %}: {{ amount }}
+
+{{ refund_note }}
+--
+{{ company_legal_name }} · {{ company_address }}
+Support: {{ support_email }}

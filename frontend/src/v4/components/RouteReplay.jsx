@@ -1,19 +1,28 @@
 // Ride route replay with a time slider (spec §9.1): breadcrumbs from
-// GET /api/admin/rides/{type}/{id}/route, trip events pinned on the map.
+// GET /api/admin/rides/{type}/{id}/route, trip events pinned on the map,
+// the planned routes (`planned_routes`, encoded polylines computed when the
+// ride was confirmed / started) and an optional "snap to roads" view
+// (`?snap=1` → `snapped` — Roads API, cached; unavailable without a server key).
 import React, { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ActionIcon, Badge, Group, SegmentedControl, Slider, Stack, Text } from '@mantine/core';
+import { ActionIcon, Alert, Badge, Group, SegmentedControl, Slider, Stack, Switch, Text, Tooltip } from '@mantine/core';
 import { FiPause, FiPlay, FiSkipBack } from 'react-icons/fi';
 import { http } from '../lib/api';
-import { fmt, humanize, parseTs } from '../lib/format';
+import { duration, fmt, humanize, parseTs } from '../lib/format';
+import { decodePolyline } from '../lib/geo';
 import MapView from './map/MapView';
 import { ErrorBox, Loading, StageBadge } from './ui';
 
+const PLANNED_COLOR = { pickup: '#1c7ed6', dropoff: '#2f9e44' };
+
 export default function RouteReplay({ rideType, rideId, height = 380, extraMarkers = [], live = false }) {
+  const [snap, setSnap] = useState(false);
+  const [showPlanned, setShowPlanned] = useState(true);
   const q = useQuery({
-    queryKey: ['ride-route', rideType, String(rideId)],
-    queryFn: () => http.get(`/admin/rides/${rideType}/${rideId}/route`),
+    queryKey: ['ride-route', rideType, String(rideId), snap ? 'snap' : 'raw'],
+    queryFn: () => http.get(`/admin/rides/${rideType}/${rideId}/route`, snap ? { snap: 1 } : undefined),
     refetchInterval: live ? 10000 : false,
+    placeholderData: (prev) => prev,
   });
   const pts = q.data?.points || [];
   const [idx, setIdx] = useState(null);
@@ -48,6 +57,15 @@ export default function RouteReplay({ rideType, rideId, height = 380, extraMarke
   const i = Math.floor(cur);
   const done = pts.slice(0, i + 1).map((p) => [p.lat, p.lng]);
   const rest = pts.slice(i).map((p) => [p.lat, p.lng]);
+  const planned = (d.planned_routes || []).map((r) => ({ ...r, points: decodePolyline(r.polyline) })).filter((r) => r.points.length > 1);
+  const snapped = snap && d.snapped?.snapped && Array.isArray(d.snapped.points) && d.snapped.points.length > 1 ? d.snapped.points : null;
+  const lines = [
+    ...(showPlanned ? planned.map((r) => ({ id: `plan-${r.target}`, points: r.points, color: PLANNED_COLOR[r.target] || '#7048e8', weight: 4, opacity: 0.55, dashed: true })) : []),
+    ...(snapped ? [{ id: 'snapped', points: snapped, color: '#f08c00', weight: 5 }] : [
+      { id: 'rest', points: rest, color: '#adb5bd', dashed: true, weight: 3 },
+      { id: 'done', points: done, color: '#f08c00', weight: 5 },
+    ]),
+  ];
   const markers = [
     d.pickup?.lat && { id: 'pickup', lat: d.pickup.lat, lng: d.pickup.lng, color: '#2f9e44', label: `Pickup: ${d.pickup.address || ''}`, radius: 8 },
     d.dropoff?.lat && { id: 'dropoff', lat: d.dropoff.lat, lng: d.dropoff.lng, color: '#1c7ed6', label: `Drop-off: ${d.dropoff.address || ''}`, radius: 8 },
@@ -61,12 +79,24 @@ export default function RouteReplay({ rideType, rideId, height = 380, extraMarke
       <MapView
         height={height}
         markers={markers}
-        polylines={[
-          { id: 'rest', points: rest, color: '#adb5bd', dashed: true, weight: 3 },
-          { id: 'done', points: done, color: '#f08c00', weight: 5 },
-        ]}
+        polylines={lines}
         fitKey={`${rideType}-${rideId}-${pts.length > 0}`}
       />
+      <Group gap="md" wrap="wrap">
+        <Tooltip label="Google Roads API (server key, cached). The playhead still follows the recorded GPS points." withArrow multiline w={260}>
+          <Switch size="xs" label="Snap to roads" checked={snap} onChange={(e) => setSnap(e.currentTarget.checked)} disabled={pts.length < 2} data-testid="snap-toggle" />
+        </Tooltip>
+        <Switch size="xs" label={`Planned routes (${planned.length})`} checked={showPlanned} onChange={(e) => setShowPlanned(e.currentTarget.checked)} disabled={!planned.length} data-testid="planned-toggle" />
+        {planned.map((r) => (
+          <Badge key={r.target} size="xs" variant="light" color={r.target === 'pickup' ? 'blue' : 'green'}>
+            Planned to {r.target}: {r.distance_m ? `${(r.distance_m / 1000).toFixed(1)} km` : '—'}{r.duration_s ? ` · ${duration(r.duration_s)}` : ''} · {r.source}
+          </Badge>
+        ))}
+        {q.isFetching && snap && <Text size="xs" c="dimmed">snapping…</Text>}
+      </Group>
+      {snap && d.snapped && !d.snapped.snapped && !q.isFetching && (
+        <Alert color="gray" variant="light" py={4}>Snap to roads is unavailable (no Google server key / Roads API refused) — showing the raw GPS trace.</Alert>
+      )}
       {pts.length > 1 ? (
         <Stack gap={4}>
           <Group gap="xs" wrap="nowrap">

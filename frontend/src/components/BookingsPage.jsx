@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { adminAPI } from '../services/api';
+import { isTerminal, LegacyActionModal, StageCell, StageSection } from './legacyActions';
 import {
   FiSearch, FiChevronLeft, FiChevronRight, FiX, FiEye,
   FiCheck, FiXCircle, FiAlertTriangle,
@@ -74,17 +75,18 @@ function BookingDrawer({ booking, drivers, onClose, onAction }) {
                 <div className="d-row"><span className="dk">Vehicle</span><span className="dv">{booking.driver.automobile || '—'}</span></div>
               </>
             ) : <p style={{ color: 'var(--warning)', fontSize: 13, margin: '4px 0 10px', fontWeight: 600 }}>⚠ No driver assigned yet</p>}
-            {!['completed', 'cancelled'].includes(booking.status) && (
+            {!isTerminal(booking.trip_stage, booking.status) && (
               <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
                 <select className="d-select" value={driverId} onChange={e => setDriverId(e.target.value)}>
                   <option value="">Assign a driver…</option>
                   {drivers.map(d => <option key={d.id} value={d.id}>{d.name} (#{d.id}){d.automobile ? ` — ${d.automobile}` : ''}</option>)}
                 </select>
-                <button className="btn btn-sm btn-accent" disabled={!driverId || saving} onClick={() => act('assign', { driver_id: Number(driverId) })}>Assign</button>
+                <button className="btn btn-sm btn-accent" disabled={!driverId || saving} onClick={() => act('assign', { driver_id: Number(driverId), replacing: !!booking.driver_id })}>{booking.driver_id ? 'Reassign…' : 'Assign'}</button>
               </div>
             )}
           </div>
-          {!['completed', 'cancelled'].includes(booking.status) && (
+          <StageSection type="scheduled" ride={booking} />
+          {!isTerminal(booking.trip_stage, booking.status) && (
             <div className="d-section">
               <h4>Update Status</h4>
               <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
@@ -93,13 +95,13 @@ function BookingDrawer({ booking, drivers, onClose, onAction }) {
                     <option key={s} value={s}>{B_LABELS[s] || s}</option>
                   ))}
                 </select>
-                <button className="btn btn-sm btn-accent" disabled={saving || newStatus === booking.status} onClick={() => act('status', { status: newStatus })}>Save</button>
+                <button className="btn btn-sm btn-accent" disabled={saving || newStatus === booking.status} onClick={() => act('status', { status: newStatus })}>Save…</button>
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
                 {booking.payment_status !== 'paid' && (
-                  <button className="btn btn-sm btn-success" disabled={saving} onClick={() => act('markPaid')}><FiCheck /> Mark Paid</button>
+                  <button className="btn btn-sm btn-success" disabled={saving} onClick={() => act('markPaid')}><FiCheck /> Mark Paid…</button>
                 )}
-                <button className="btn btn-sm btn-danger" disabled={saving} onClick={() => act('cancel')}><FiXCircle /> Cancel Booking</button>
+                <button className="btn btn-sm btn-danger" disabled={saving} onClick={() => act('cancel')}><FiXCircle /> Cancel Booking…</button>
               </div>
             </div>
           )}
@@ -120,6 +122,7 @@ export default function BookingsPage() {
   const [selected, setSelected] = useState(null);
   const [drivers, setDrivers] = useState([]);
   const [confirm, setConfirm] = useState(null);
+  const [action, setAction] = useState(null);
   const perPage = 20;
   const totalPages = Math.ceil(total / perPage);
 
@@ -148,23 +151,49 @@ export default function BookingsPage() {
     catch { setSelected(item); }
   };
 
-  const doAction = async (id, action, params = {}) => {
+  const refreshAfter = async (id) => {
     try {
-      if (action === 'assign') await adminAPI.bookingAssign(id, params);
-      else if (action === 'markPaid') await adminAPI.bookingMarkPaid(id);
-      else if (action === 'status') await adminAPI.bookingStatus(id, params);
-      else if (action === 'cancel') await adminAPI.bookingCancel(id, { reason: 'Cancelled by admin' });
       const { data } = await adminAPI.bookingShow(id);
-      if (data.code === 1) setSelected(data.data);
-      load(page, search, filter);
-    } catch {}
+      if (data.code === 1) setSelected((cur) => (cur && cur.id === id ? data.data : cur));
+    } catch { /* list reload below still runs */ }
+    load(page, search, filter);
+  };
+
+  // Every action needs a reason and runs through the v4 state machine.
+  const doAction = async (id, kind, params = {}) => {
+    if (kind === 'assign') {
+      setAction({
+        id, title: `${params.replacing ? 'Reassign' : 'Assign'} driver #${params.driver_id} to booking #${id}`, url: `/admin/bookings/${id}/assign-driver`,
+        body: { driver_id: params.driver_id }, reasonOptional: !params.replacing, confirmLabel: params.replacing ? 'Reassign' : 'Assign', color: 'blue',
+        successMessage: `Driver #${params.driver_id} assigned`,
+        description: 'Same rules as the v4 reassign: before pickup only, the driver must be approved and active; both drivers and the customer are notified.',
+      });
+    } else if (kind === 'markPaid') {
+      setAction({
+        id, title: `Mark booking #${id} paid (offline)`, url: `/admin/bookings/${id}/mark-paid`, amount: true, confirmLabel: 'Mark paid', color: 'green',
+        successMessage: `Booking #${id} marked paid and confirmed`,
+        description: 'Records an offline payment (cash, e-transfer, comp) and confirms the booking. Refunds of offline payments are recorded without calling Stripe.',
+      });
+    } else if (kind === 'status' && params.status !== 'cancelled') {
+      setAction({
+        id, title: `Set booking #${id} to “${params.status}”`, url: `/admin/bookings/${id}/update-status`, body: { status: params.status },
+        confirmLabel: 'Apply', color: 'orange', successMessage: `Booking #${id} → ${params.status}`,
+        description: 'The booking is walked through the state machine. Unpaid bookings cannot be confirmed (402) — use “Mark paid” first.',
+      });
+    } else if (kind === 'cancel' || kind === 'status') {
+      setAction({
+        id, title: `Cancel booking #${id}`, url: `/admin/bookings/${id}/cancel`, policy: true, confirmLabel: 'Cancel booking', color: 'red',
+        successMessage: `Booking #${id} cancelled`, description: 'Applies the §7 cancellation policy, releases/refunds the payment and notifies the parties.',
+      });
+    }
   };
 
   const fc = v => v != null ? `$${(Number(v) / 100).toFixed(2)}` : '—';
 
   return (
     <div className="page-bookings">
-      {selected && <BookingDrawer booking={selected} drivers={drivers} onClose={() => setSelected(null)} onAction={doAction} />}
+      {selected && <BookingDrawer key={`${selected.id}-${selected.status}-${selected.trip_stage}-${selected.driver_id}`} booking={selected} drivers={drivers} onClose={() => setSelected(null)} onAction={doAction} />}
+      {action && <LegacyActionModal action={action} onClose={() => setAction(null)} onDone={() => refreshAfter(action.id)} />}
       {confirm && <Confirm message={confirm.msg} onCancel={() => setConfirm(null)}
         onConfirm={() => { doAction(confirm.id, confirm.action); setConfirm(null); }} />}
 
@@ -193,7 +222,7 @@ export default function BookingsPage() {
             <thead>
               <tr>
                 <th>ID</th><th>Customer</th><th>Driver</th><th>Route</th>
-                <th>Price</th><th>Payment</th><th>Status</th><th>Date</th><th>Actions</th>
+                <th>Price</th><th>Payment</th><th>Status</th><th>Stage</th><th>Date</th><th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -208,21 +237,22 @@ export default function BookingsPage() {
                   <td>{fc(b.agreed_price || b.customer_proposed_price)}</td>
                   <td><span className={`badge badge-${b.payment_status === 'paid' ? 'success' : 'warning'}`}>{b.payment_status || 'unpaid'}</span></td>
                   <td><span className={`badge badge-${b.status}`}>{b.status}</span></td>
+                  <td><StageCell stage={b.trip_stage} /></td>
                   <td>{(b.scheduled_at || b.created_at)?.slice(0, 10)}</td>
                   <td className="actions">
                     <button className="btn btn-xs" title="View / Manage" onClick={() => openDetail(b)}><FiEye /></button>
-                    {b.payment_status !== 'paid' && (
-                      <button className="btn btn-xs btn-success" title="Mark Paid"
-                        onClick={() => setConfirm({ id: b.id, action: 'markPaid', msg: `Mark booking #${b.id} as paid?` })}><FiCheck /></button>
+                    {b.payment_status !== 'paid' && !isTerminal(b.trip_stage, b.status) && (
+                      <button className="btn btn-xs btn-success" title="Mark Paid (reason required)"
+                        onClick={() => doAction(b.id, 'markPaid')}><FiCheck /></button>
                     )}
-                    {!['completed', 'cancelled'].includes(b.status) && (
-                      <button className="btn btn-xs btn-danger" title="Cancel Booking"
-                        onClick={() => setConfirm({ id: b.id, action: 'cancel', msg: `Cancel booking #${b.id}? This cannot be undone.` })}><FiXCircle /></button>
+                    {!isTerminal(b.trip_stage, b.status) && (
+                      <button className="btn btn-xs btn-danger" title="Cancel Booking (reason required)"
+                        onClick={() => doAction(b.id, 'cancel')}><FiXCircle /></button>
                     )}
                   </td>
                 </tr>
               ))}
-              {!items.length && <tr><td colSpan="9" className="empty-state">No bookings found</td></tr>}
+              {!items.length && <tr><td colSpan="10" className="empty-state">No bookings found</td></tr>}
             </tbody>
           </table>
         </div>

@@ -4,8 +4,13 @@
     POST   /api/rides/<type>/<id>/share                parties, CONFIRMED → before COMPLETED
                                                        {contact_ids?: [..]} → SMS to those trusted contacts
     DELETE /api/rides/<type>/<id>/share/<token>        revoke (link owner)
-    GET    /api/public/track/<token>                   NO auth, rate-limited, no-store
-    GET    /t/<token>                                  minimal public tracking page (noindex)
+    GET    /api/public/track/<token>                   NO auth, rate-limited (per IP + per token), no-store
+    GET    /t/<token>                                  302 → PUBLIC_WEB_BASE_URL/t/<token> when that is another
+                                                       host; otherwise the minimal fallback page (noindex)
+
+Client IP: `request.remote_addr` only. Behind nginx, backend/app.py wraps the
+app in werkzeug ProxyFix (TRUSTED_PROXY_COUNT, default 1) so remote_addr is the
+real client and a spoofed X-Forwarded-For can't dodge the limit.
 """
 import json
 import os
@@ -13,7 +18,7 @@ import threading
 import time
 from datetime import datetime
 
-from flask import Blueprint, Response, request
+from flask import Blueprint, Response, redirect, request
 
 from backend import jobs
 from backend.models import db
@@ -31,9 +36,10 @@ _rl_lock = threading.Lock()
 _rl = {}
 
 
-def rate_ok(ip, limit=None):
+def rate_ok(ip, limit=None, scope='ip'):
     limit = limit or S.get_int('tracking.public_rate_limit_per_min', 60) or 60
     minute = int(time.time() // 60)
+    ip = f'{scope}:{ip}'
     r = jobs.get_redis()
     if r is not None:
         try:
@@ -53,7 +59,23 @@ def rate_ok(ip, limit=None):
 
 
 def _client_ip():
-    return (request.headers.get('X-Forwarded-For', '') or request.remote_addr or '').split(',')[0].strip() or '?'
+    # ProxyFix (app.py) already resolved the trusted X-Forwarded-For hop.
+    return (request.remote_addr or '').strip() or '?'
+
+
+def _limited(token):
+    """None when allowed, else the 429 response. Per IP and per token (a
+    leaked link hammered from many IPs is capped too)."""
+    ok = rate_ok(_client_ip())
+    if ok:
+        per_token = S.get_int('tracking.public_rate_limit_per_token_per_min', 120) or 120
+        ok = rate_ok((token or '')[:64], limit=per_token, scope='tok')
+    if ok:
+        return None
+    resp, status = error_response('Too many requests. Try again in a minute.',
+                                  data={'error_code': 'rate_limited', 'retry_after': 60}, status_code=429)
+    resp.headers['Retry-After'] = '60'
+    return _nocache(resp), status
 
 
 def _load_party(user, ride_type, ride_id):
@@ -150,11 +172,9 @@ def _nocache(resp):
 
 @tracking_share_bp.route('/api/public/track/<token>', methods=['GET'])
 def public_track(token):
-    if not rate_ok(_client_ip()):
-        resp, status = error_response('Too many requests. Try again in a minute.',
-                                      data={'error_code': 'rate_limited'}, status_code=429)
-        resp.headers['Retry-After'] = '60'
-        return _nocache(resp), status
+    limited = _limited(token)
+    if limited:
+        return limited
     link = _find_live(token)
     payload = live_share.public_payload(link) if link else None
     if not payload:
@@ -196,7 +216,8 @@ __MAPHEAD__
 <div class="sheet" id="sheet"><p class="muted">Loading live trip…</p></div>
 <script>
 const TOKEN = __TOKEN__;
-const API = '/api/public/track/' + encodeURIComponent(TOKEN);
+const LANG = (new URLSearchParams(location.search).get('lang') || (navigator.language||'en')).slice(0,2);
+const API = '/api/public/track/' + encodeURIComponent(TOKEN) + '?lang=' + encodeURIComponent(LANG);
 const GMAPS = __GMAPS__;
 let map, car, line, pickupM, dropM, fitted = false;
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -229,8 +250,8 @@ function render(d){
   const drv = r.driver||{}, v = r.vehicle||{};
   let h = '';
   if(d.kind==='sos') h += '<p class="sos">'+(d.sos_active?'SOS active':'SOS closed')+' · '+esc((d.person||{}).first_name||'')+'</p>';
-  h += '<p class="status">'+esc(d.kind==='sos'?(r.status||''):d.status)+'</p>';
-  if(d.eta && !d.trip_ended) h += '<p class="eta">'+esc(d.eta.minutes)+' min to '+esc(d.eta.target||'destination')+'</p>';
+  h += '<p class="status">'+esc(d.kind==='sos'?(r.status_text||r.status||''):(d.status_text||d.status))+'</p>';
+  if(d.eta && !d.trip_ended) h += '<p class="eta">'+esc(d.eta.text || (d.eta.minutes+' min'))+(d.eta.arrives_at?' · '+esc(new Date(d.eta.arrives_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})):'')+'</p>';
   if(d.trip_ended) h += '<p class="muted">This trip has ended.</p>';
   if(drv.first_name) h += '<div class="row">'+(drv.avatar?'<img class="av" src="'+esc(drv.avatar)+'" alt="">':'<div class="av"></div>')+
      '<div><div><b>'+esc(drv.first_name)+'</b>'+(drv.rating?' · ★ '+esc(Number(drv.rating).toFixed(1)):'')+'</div>'+
@@ -254,8 +275,27 @@ poll();
 </script></body></html>"""
 
 
+def _external_page_url(token):
+    """PUBLIC_WEB_BASE_URL/t/<token> when the landing site lives on another host."""
+    from urllib.parse import urlencode, urlparse
+    base = (os.getenv('PUBLIC_WEB_BASE_URL') or '').strip().rstrip('/')
+    if not base:
+        return None
+    host = (urlparse(base).netloc or '').lower()
+    if not host or host == (request.host or '').lower():
+        return None
+    q = {k: v for k, v in request.args.items() if k in ('lang',)}
+    return f'{base}/t/{token[:64]}' + (f'?{urlencode(q)}' if q else '')
+
+
 @tracking_share_bp.route('/t/<token>', methods=['GET'])
 def public_page(token):
+    limited = _limited(token)
+    if limited:
+        return limited
+    ext = _external_page_url(token)
+    if ext:
+        return _nocache(redirect(ext, code=302))
     key = os.getenv('GOOGLE_MAPS_BROWSER_KEY', '').strip()
     if key:
         head = f'<script src="https://maps.googleapis.com/maps/api/js?key={key}"></script>'

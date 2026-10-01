@@ -19,6 +19,7 @@ from flask import Response, stream_with_context, Blueprint, current_app
 from backend.models import db
 from backend.models.negotiation import Negotiation
 from backend.models.negotiation_record import NegotiationRecord
+from backend.models.user import AdminUser
 from backend.utils.auth import get_current_user
 
 stream_bp = Blueprint('stream', __name__)
@@ -27,6 +28,9 @@ stream_bp = Blueprint('stream', __name__)
 _POLL_INTERVAL = 3
 # Send a keepalive comment every N polls so proxies/NAT don't drop the conn.
 _KEEPALIVE_EVERY = 10  # 10 * 3s = 30s
+# Re-check the token_version + account status every N polls (spec §15): a
+# revoked session or a suspension ends the stream with a final event.
+_AUTH_RECHECK_EVERY = 5  # 5 * 3s = 15s
 
 # Track active SSE connections for debugging
 _active_connections: dict[int, float] = {}
@@ -46,9 +50,17 @@ def stream_events():
     user = get_current_user()
     if not user:
         def _unauth():
-            yield 'data: {"type":"error","msg":"Unauthorized"}\n\n'
+            yield 'data: {"type":"error","msg":"Unauthorized","error_code":"session_revoked"}\n\n'
         return Response(_unauth(), mimetype='text/event-stream', status=401)
+    if not user.is_account_active():
+        st = user.effective_account_status()
 
+        def _blocked():
+            yield f'data: {json.dumps({"type": "error", "msg": "Account not active", "error_code": "account_blocked", "account_status": st})}\n\n'
+        return Response(_blocked(), mimetype='text/event-stream', status=403)
+
+    from flask_jwt_extended import get_jwt
+    token_tv = int(get_jwt().get('tv', 0) or 0)
     user_id = user.id
     is_driver = user.user_type in ('Driver', 'Pending Driver')
 
@@ -60,6 +72,7 @@ def stream_events():
         last_neg_hash = None
         last_rec_hash = None
         keepalive_counter = 0
+        loops = 0
 
         # Send an immediate handshake so the client knows the connection works
         yield f'data: {json.dumps({"type": "connected", "user_id": user_id, "role": "driver" if is_driver else "customer"})}\n\n'
@@ -69,6 +82,19 @@ def stream_events():
                 try:
                     # ── Fresh session for each poll ──────────────────────────
                     db.session.expire_all()
+
+                    # ── Periodic revocation / suspension check ───────────────
+                    loops += 1
+                    if loops % _AUTH_RECHECK_EVERY == 0:
+                        me = db.session.get(AdminUser, user_id)
+                        reason = None
+                        if not me or me.deleted_at is not None or int(me.token_version or 0) != token_tv:
+                            reason = 'session_revoked'
+                        if me and not me.is_account_active():
+                            reason = 'account_blocked'
+                        if reason:
+                            yield f'data: {json.dumps({"type": "auth_revoked", "error_code": reason, "account_status": me.effective_account_status() if me else None})}\n\n'
+                            break
 
                     # ── 1) Query negotiations relevant to this user ──────────
                     # Active negotiations, PLUS terminal ones (Cancelled/Completed)

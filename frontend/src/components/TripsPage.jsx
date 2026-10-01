@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { adminAPI } from '../services/api';
+import { isTerminal, LegacyActionModal, StageCell, StageSection } from './legacyActions';
 import {
   FiSearch, FiChevronLeft, FiChevronRight, FiX, FiEye, FiXCircle, FiAlertTriangle,
 } from 'react-icons/fi';
@@ -69,16 +70,18 @@ function TripDrawer({ trip, onClose, onAction }) {
               ))}
             </div>
           )}
-          {!['Completed', 'Cancelled'].includes(trip.status) && (
+          <StageSection type="rideshare_trip" ride={trip} />
+          {!isTerminal(trip.trip_stage, trip.status) && (
             <div className="d-section">
               <h4>Update Status</h4>
               <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
                 <select className="d-select" value={newStatus} onChange={e => setNewStatus(e.target.value)}>
-                  {['Pending', 'Active', 'Ongoing', 'Completed', 'Cancelled'].map(s => <option key={s} value={s}>{s}</option>)}
+                  {/* legacy statuses the backend maps to v4 stages: Active→PUBLISHED, Ongoing→IN_PROGRESS, Completed→COMPLETED */}
+                  {['Active', 'Ongoing', 'Completed', 'Cancelled'].map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
-                <button className="btn btn-sm btn-accent" disabled={saving || newStatus === trip.status} onClick={() => act('status', { status: newStatus })}>Save</button>
+                <button className="btn btn-sm btn-accent" disabled={saving || newStatus === trip.status} onClick={() => act('status', { status: newStatus })}>Save…</button>
               </div>
-              <button className="btn btn-sm btn-danger" disabled={saving} onClick={() => act('cancel')}><FiXCircle /> Cancel Trip</button>
+              <button className="btn btn-sm btn-danger" disabled={saving} onClick={() => act('cancel')}><FiXCircle /> Cancel Trip…</button>
             </div>
           )}
         </div>
@@ -97,6 +100,7 @@ export default function TripsPage() {
   const [error, setError] = useState(null);
   const [selected, setSelected] = useState(null);
   const [confirm, setConfirm] = useState(null);
+  const [action, setAction] = useState(null);
   const perPage = 20;
   const totalPages = Math.ceil(total / perPage);
 
@@ -121,19 +125,35 @@ export default function TripsPage() {
     catch { setSelected(item); }
   };
 
-  const doAction = async (id, action, params = {}) => {
+  const refreshAfter = async (id) => {
     try {
-      if (action === 'status') await adminAPI.tripStatus(id, params);
-      else if (action === 'cancel') await adminAPI.tripCancel(id);
       const { data } = await adminAPI.tripShow(id);
-      if (data.code === 1) setSelected(data.data);
-      load(page, search, filter);
-    } catch {}
+      if (data.code === 1) setSelected((cur) => (cur && cur.id === id ? data.data : cur));
+    } catch { /* list reload below still runs */ }
+    load(page, search, filter);
+  };
+
+  // Every action needs a reason and runs through the v4 state machine.
+  const doAction = async (id, kind, params = {}) => {
+    if (kind === 'status' && !['Cancelled', 'Canceled'].includes(params.status)) {
+      setAction({
+        id, title: `Set trip #${id} to “${params.status}”`, url: `/admin/trips/${id}/update-status`, body: { status: params.status },
+        confirmLabel: 'Apply', color: 'orange', successMessage: `Trip #${id} → ${params.status}`,
+        description: 'The trip is walked step by step through the state machine (one timeline event per step); passengers are notified as usual.',
+      });
+    } else if (kind === 'cancel' || kind === 'status') {
+      setAction({
+        id, title: `Cancel rideshare trip #${id}`, url: `/admin/trips/${id}/cancel`, confirmLabel: 'Cancel trip', color: 'red',
+        successMessage: `Trip #${id} cancelled`,
+        description: 'CANCELLED_BY_DRIVER cascade: every passenger booking is cancelled and refunded 100 %, and everyone is notified.',
+      });
+    }
   };
 
   return (
     <div className="page-trips">
-      {selected && <TripDrawer trip={selected} onClose={() => setSelected(null)} onAction={doAction} />}
+      {selected && <TripDrawer key={`${selected.id}-${selected.status}-${selected.trip_stage}`} trip={selected} onClose={() => setSelected(null)} onAction={doAction} />}
+      {action && <LegacyActionModal action={action} onClose={() => setAction(null)} onDone={() => refreshAfter(action.id)} />}
       {confirm && <Confirm message={confirm.msg} onCancel={() => setConfirm(null)}
         onConfirm={() => { doAction(confirm.id, confirm.action); setConfirm(null); }} />}
 
@@ -162,7 +182,7 @@ export default function TripsPage() {
             <thead>
               <tr>
                 <th>ID</th><th>Driver</th><th>From</th><th>To</th>
-                <th>Car</th><th>Reg#</th><th>Slots</th><th>$/Seat</th><th>Status</th><th>Date</th><th>Actions</th>
+                <th>Car</th><th>Reg#</th><th>Slots</th><th>$/Seat</th><th>Status</th><th>Stage</th><th>Date</th><th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -177,17 +197,18 @@ export default function TripsPage() {
                   <td>{t.slots ?? '—'}</td>
                   <td>{t.amount_per_seat != null ? `$${Number(t.amount_per_seat).toFixed(2)}` : '—'}</td>
                   <td><span className={`badge badge-${t.status?.toLowerCase()}`}>{t.status}</span></td>
+                  <td><StageCell stage={t.trip_stage} /></td>
                   <td>{t.created_at?.slice(0, 10)}</td>
                   <td className="actions">
                     <button className="btn btn-xs" title="View / Manage" onClick={() => openDetail(t)}><FiEye /></button>
-                    {!['Completed', 'Cancelled'].includes(t.status) && (
-                      <button className="btn btn-xs btn-danger" title="Cancel Trip"
-                        onClick={() => setConfirm({ id: t.id, action: 'cancel', msg: `Cancel trip #${t.id}? All passengers will be notified.` })}><FiXCircle /></button>
+                    {!isTerminal(t.trip_stage, t.status) && (
+                      <button className="btn btn-xs btn-danger" title="Cancel Trip (reason required)"
+                        onClick={() => doAction(t.id, 'cancel')}><FiXCircle /></button>
                     )}
                   </td>
                 </tr>
               ))}
-              {!trips.length && <tr><td colSpan="11" className="empty-state">No trips found</td></tr>}
+              {!trips.length && <tr><td colSpan="12" className="empty-state">No trips found</td></tr>}
             </tbody>
           </table>
         </div>

@@ -53,7 +53,8 @@ _USER_TABLES = [
     ('driver_documents', 'user_id'), ('background_checks', 'user_id'), ('driver_applications', 'user_id'),
     ('support_tickets', 'user_id'), ('ride_ratings', 'rater_id'), ('favourite_drivers', 'customer_id'),
     ('referrals', 'referrer_id'), ('analytics_events', 'user_id'), ('transactions', 'user_id'),
-    ('user_wallets', 'user_id'), ('audit_logs', 'actor_id'),
+    ('user_wallets', 'user_id'), ('audit_logs', 'actor_id'), ('marketing_consents', 'user_id'),
+    ('live_activity_tokens', 'user_id'), ('tip_receipts', 'customer_id'),
 ]
 
 
@@ -69,7 +70,7 @@ def _cleanup(user_ids):
     books = f"SELECT id FROM trip_bookings WHERE customer_id IN ({ids}) OR driver_id IN ({ids}) OR trip_id IN ({trips})"
     for rt, sub in (('carhire', neg), ('scheduled', sched), ('rideshare_trip', trips), ('rideshare_booking', books)):
         for table in ('trip_events', 'ride_payments', 'refunds', 'receipts', 'ride_locations', 'ride_share_links',
-                      'ride_ratings', 'safety_checks'):
+                      'ride_ratings', 'safety_checks', 'ride_routes', 'ride_pin_failures'):
             ex(f"DELETE FROM {table} WHERE ride_type='{rt}' AND ride_id IN (SELECT id FROM ({sub}) x)")
     ex(f"DELETE FROM payments WHERE negotiation_id IN (SELECT id FROM ({neg}) x)")
     ex(f"DELETE FROM negotiation_records WHERE negotiation_id IN (SELECT id FROM ({neg}) x)")

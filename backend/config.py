@@ -5,9 +5,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Only an explicit development/testing/local FLASK_ENV is non-production (fail closed).
+_IS_PRODUCTION = os.getenv('FLASK_ENV', '').strip().lower() not in ('development', 'dev', 'testing', 'test', 'local')
+
+
+def _secret(name, dev_default):
+    """Production refuses to start without a real secret; dev/test keep a default."""
+    value = os.getenv(name, '').strip()
+    if value:
+        return value
+    if _IS_PRODUCTION:
+        raise RuntimeError(f'{name} must be set in the environment when FLASK_ENV is production '
+                           f'(or unset). Set FLASK_ENV=development for local runs.')
+    return dev_default
+
+
 class Config:
-    SECRET_KEY = os.getenv('SECRET_KEY', 'negoride-default-secret-key-2026')
-    JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'negoride-default-jwt-key-2026')
+    SECRET_KEY = _secret('SECRET_KEY', 'negoride-default-secret-key-2026')
+    JWT_SECRET_KEY = _secret('JWT_SECRET_KEY', 'negoride-default-jwt-key-2026')
     # Access-token lifetime. Default 30 days (a reasonable mobile session for an
     # app without a refresh-token flow) instead of the previous ~10 years, so a
     # leaked token is not valid forever. Override via env if needed.

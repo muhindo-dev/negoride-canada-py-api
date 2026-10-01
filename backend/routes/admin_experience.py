@@ -157,7 +157,7 @@ def _set_hidden(admin, rating_id, hidden):
     r.hidden_by = admin.id if hidden else None
     r.hidden_reason = reason[:500] if hidden else None
     db.session.flush()
-    score = RS.recompute_score(r.ratee_id)
+    score = RS.on_visibility_changed(r)      # recompute + re-evaluate the rating rules
     audit('rating.hidden' if hidden else 'rating.unhidden', admin, 'ride_rating', r.id, before=before,
           after=r.to_dict(), meta={'reason': reason, 'ratee_score': score})
     db.session.commit()

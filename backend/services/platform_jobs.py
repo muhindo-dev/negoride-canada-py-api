@@ -7,6 +7,15 @@ from backend.models.platform import IdempotencyKey, WebhookEvent
 
 MAX_WEBHOOK_ATTEMPTS = 5
 
+# provider (webhook_events.provider) → processor job taking the row id.
+WEBHOOK_PROCESSORS = {
+    'stripe': 'backend.routes.webhooks.process_stripe_event',
+    'certn': 'backend.services.onboarding_service.process_certn_event',
+    'twilio': 'backend.routes.verify.process_twilio_inbound',              # inbound SMS (STOP/START/HELP)
+    'twilio_status': 'backend.services.notify.email_status.process_twilio_status',
+    'postmark': 'backend.services.notify.email_status.process_postmark_event',
+}
+
 
 def tick():
     retried = retry_failed_webhooks()
@@ -22,8 +31,7 @@ def retry_failed_webhooks():
             .filter((WebhookEvent.status == 'failed') |
                     ((WebhookEvent.status == 'received') & (WebhookEvent.received_at <= stale)))
             .limit(50).all())
-    paths = {'stripe': 'backend.routes.webhooks.process_stripe_event',
-             'certn': 'backend.services.onboarding_service.process_certn_event'}
+    paths = WEBHOOK_PROCESSORS
     n = 0
     for r in rows:
         path = paths.get(r.provider)

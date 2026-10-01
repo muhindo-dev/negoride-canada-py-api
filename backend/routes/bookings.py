@@ -88,6 +88,10 @@ def index(user):
 def create(user):
     """Create a scheduled booking."""
     data = request.get_json(silent=True) or request.form
+    from backend.services.phone_verification import require_phone_for_rides
+    _pv_block = require_phone_for_rides(user, data)
+    if _pv_block is not None:
+        return _pv_block
 
     customer_proposed_price = int(data.get('customer_proposed_price', 0))
     if customer_proposed_price < 50:
@@ -148,6 +152,10 @@ def create(user):
 def create_courier_batch(user):
     """Create chained courier bookings in one batch for multi-parcel delivery."""
     data = request.get_json(silent=True) or request.form
+    from backend.services.phone_verification import require_phone_for_rides
+    _pv_block = require_phone_for_rides(user, data)
+    if _pv_block is not None:
+        return _pv_block
     service_type = (data.get('service_type') or '').strip().lower()
     if service_type not in ('courier', 'delivery'):
         return error_response("service_type must be courier or delivery")
@@ -536,7 +544,7 @@ def upload_pickup_proof(user, booking_id):
     if not booking:
         return error_response("Booking not found", status_code=404)
 
-    if user.id not in (booking.driver_id, 1):
+    if _party(user, booking) not in ('driver', 'admin'):
         return error_response("Only assigned driver or admin can upload pickup proof", status_code=403)
 
     image_file = request.files.get('photo') or request.files.get('image') or request.files.get('file')
@@ -560,7 +568,7 @@ def upload_dropoff_proof(user, booking_id):
     if not booking:
         return error_response("Booking not found", status_code=404)
 
-    if user.id not in (booking.driver_id, 1):
+    if _party(user, booking) not in ('driver', 'admin'):
         return error_response("Only assigned driver or admin can upload dropoff proof", status_code=403)
 
     image_file = request.files.get('photo') or request.files.get('image') or request.files.get('file')

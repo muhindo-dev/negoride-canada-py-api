@@ -33,7 +33,8 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from backend import jobs
 from backend.models import db
-from backend.models.money import CreditNote, DocumentSequence, Receipt, Refund, RidePayment, TaxRate
+from backend.models.money import (CAPTURED_STATES, CreditNote, DocumentSequence, Receipt, Refund, RidePayment,
+                                  TaxRate, TipReceipt)
 from backend.models.notification import Notification, NotificationDelivery
 from backend.models.user import AdminUser
 from backend.services import rides as R
@@ -179,7 +180,8 @@ _PROV_RE = re.compile(r'(?:,|\s)\s*(AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)\b(?:
 
 
 def province_of(ride_type, ride):
-    """(province_code, source). Source: ride | address | default."""
+    """(province_code, source). Source: ride (stored pickup_province) | geo (pickup
+    lat/lng lookup) | address (", QC H2X") | default (setting tax.default_province)."""
     candidates = [getattr(ride, 'pickup_province', None)]
     if ride_type == 'rideshare_booking':
         trip = R.load('rideshare_trip', ride.trip_id)
@@ -188,6 +190,15 @@ def province_of(ride_type, ride):
         c = (c or '').strip().upper()[:2]
         if c in PROVINCES:
             return c, 'ride'
+    # Rides created before the province was stamped: look the pickup point up.
+    try:
+        from backend.utils.province import province_at
+        pt = R.pickup_point(ride_type, ride)
+        code = province_at(pt[0], pt[1]) if pt else None
+        if code in PROVINCES:
+            return code, 'geo'
+    except Exception:
+        pass
     pickup, _ = R.addresses(ride_type, ride)
     if pickup:
         m = _PROV_RE.search(pickup.upper())
@@ -243,7 +254,7 @@ def payment_method_label(rp):
 def ride_payment_for(ride_type, ride_id):
     """Latest ride payment that actually took money."""
     return (RidePayment.query.filter_by(ride_type=ride_type, ride_id=ride_id, purpose='ride')
-            .filter(RidePayment.capture_status.in_(('captured', 'partially_captured')))
+            .filter(RidePayment.capture_status.in_(CAPTURED_STATES))
             .order_by(RidePayment.id.desc()).first())
 
 
@@ -419,7 +430,7 @@ def compute_totals(ride_type, ride, rp=None, *, at=None):
         ride_total = subtotal + tax_total
 
     tips = (RidePayment.query.filter_by(ride_type=ride_type, ride_id=ride.id, purpose='tip')
-            .filter(RidePayment.capture_status.in_(('captured', 'partially_captured'))).all())
+            .filter(RidePayment.capture_status.in_(CAPTURED_STATES)).all())
     tip = sum(int(t.amount_captured_cents or 0) for t in tips)
     total = ride_total + tip
 
@@ -477,7 +488,7 @@ def compute_totals(ride_type, ride, rp=None, *, at=None):
 # Document numbers
 # ═══════════════════════════════════════════════════════════════════════════
 
-DOC_PREFIX = {'receipt': 'NR', 'credit_note': 'NR-CN'}
+DOC_PREFIX = {'receipt': 'NR', 'credit_note': 'NR-CN', 'tip': 'NR-TIP'}
 
 
 def _ensure_sequence_row(doc_type, year):
@@ -577,23 +588,48 @@ def human_distance(meters, estimated=False):
     return f'≈ {s}' if estimated else s
 
 
+_LOGO_URI = None
+
+
+def logo_data_uri():
+    """The brand logo embedded as a data URI (the PDF renderer never fetches
+    remote resources). backend/static/brand/logo.png — replace with the final
+    artwork (same name); '' falls back to the text wordmark."""
+    global _LOGO_URI
+    if _LOGO_URI is None:
+        path = os.path.join(BACKEND_DIR, 'static', 'brand', 'logo.png')
+        try:
+            with open(path, 'rb') as f:
+                _LOGO_URI = 'data:image/png;base64,' + base64.b64encode(f.read()).decode()
+        except OSError:
+            _LOGO_URI = ''
+    return _LOGO_URI
+
+
 def _helpers():
     return {'money': fmt, 'local_time': local_time, 'human_duration': human_duration,
-            'human_distance': human_distance}
+            'human_distance': human_distance, 'logo_data_uri': logo_data_uri()}
 
 
-def _pdf_fetcher(url, *args, **kwargs):
-    """Never touch the network while rendering (fast + private)."""
-    if url.startswith('data:'):
-        from weasyprint import default_url_fetcher
-        return default_url_fetcher(url, *args, **kwargs)
-    raise ValueError(f'External resource blocked in PDF: {url[:60]}')
+def _pdf_fetcher():
+    """Never touch the network or the disk while rendering (fast + private):
+    only data: URIs (the embedded logo) are allowed."""
+    try:
+        from weasyprint.urls import URLFetcher
+        return URLFetcher(allowed_protocols=('data',), timeout=2)
+    except ImportError:   # older WeasyPrint: function-style fetcher
+        def fetch(url, *args, **kwargs):
+            if url.startswith('data:'):
+                from weasyprint import default_url_fetcher
+                return default_url_fetcher(url, *args, **kwargs)
+            raise ValueError(f'External resource blocked in PDF: {url[:60]}')
+        return fetch
 
 
 def render_pdf(template, context):
     html = _pdf_env.get_template(template).render(**_helpers(), **context)
     from weasyprint import HTML
-    return HTML(string=html, url_fetcher=_pdf_fetcher, base_url=PDF_TEMPLATE_DIR).write_pdf()
+    return HTML(string=html, url_fetcher=_pdf_fetcher(), base_url=PDF_TEMPLATE_DIR).write_pdf()
 
 
 def _web_base():
@@ -608,13 +644,18 @@ def rating_links(ride_type, ride_id):
     return [{'stars': n, 'url': open_link(f'negoride://rate/{ride_type}/{ride_id}?stars={n}')} for n in range(1, 6)]
 
 
-def _receipt_pdf_context(receipt, totals):
+def _receipt_pdf_context(receipt, totals, driver_copy=False):
     return {'doc': 'receipt', 'number': receipt.number, 'issued_at': _iso(receipt.issued_at), 't': totals,
             'r': totals.get('ride') or {}, 'policy_url': f'{_web_base()}/cancellation-policy',
-            'web_base': _web_base()}
+            'web_base': _web_base(), 'driver_copy': driver_copy}
 
 
-def render_receipt_pdf(receipt):
+def render_receipt_pdf(receipt, viewer='customer'):
+    """The stored PDF is the customer's. `viewer='driver'` renders the driver
+    copy on the fly: rider first name only, no payment method."""
+    if viewer == 'driver':
+        return render_pdf('receipt.html', _receipt_pdf_context(receipt, public_totals(receipt.totals, 'driver'),
+                                                               driver_copy=True))
     return render_pdf('receipt.html', _receipt_pdf_context(receipt, receipt.totals))
 
 
@@ -757,6 +798,11 @@ def _send_receipt_email(receipt, ride=None):
     """Returns True when every message went out."""
     from backend.services.notify.templates import render
     customer = db.session.get(AdminUser, receipt.customer_id)
+    if customer is not None and getattr(customer, 'email_bounced_at', None):
+        _log_suppressed(customer, 'ride.receipt', f'receipt-{receipt.id}', f'Your receipt {receipt.number}',
+                        f'Total charged {fmt(receipt.total_cents)}', {'receipt_id': receipt.id, 'number': receipt.number},
+                        f'negoride://receipt/{receipt.ride_type}/{receipt.ride_id}')
+        return None
     if not customer or not customer.email:
         _log_email(receipt.customer_id, 'ride.receipt', f'receipt-{receipt.id}', f'Your receipt {receipt.number}',
                    f'Total charged {fmt(receipt.total_cents)}', {'receipt_id': receipt.id, 'number': receipt.number},
@@ -799,6 +845,14 @@ def _send_receipt_email(receipt, ride=None):
         receipt.email_count = int(receipt.email_count or 0) + 1
     db.session.commit()
     return ok
+
+
+def _log_suppressed(user, event_key, dedupe, title, body, data, deep_link):
+    """Email suppressed after a hard bounce / spam complaint: inbox row + a
+    failed email delivery explaining why; no retries."""
+    _log_email(user.id, event_key, dedupe, title, body, data, deep_link,
+               [(False, None, f'suppressed: {user.email_bounce_reason or "email bounced"}')])
+    db.session.commit()
 
 
 def _claim_first_send(receipt_id):
@@ -872,7 +926,12 @@ def issue_and_send(ride_type, ride_id):
         try:
             ok = _send_receipt_email(receipt)
         finally:
-            if not ok:
+            if ok is None:          # suppressed (bounced address): no email, no retry
+                db.session.rollback()
+                db.session.execute(text('UPDATE receipts SET emailed_at=NULL WHERE id=:id AND email_count=0'),
+                                   {'id': receipt.id})
+                db.session.commit()
+            elif not ok:
                 db.session.rollback()
                 db.session.execute(text('UPDATE receipts SET emailed_at=NULL WHERE id=:id AND email_count=0'),
                                    {'id': receipt.id})
@@ -893,7 +952,7 @@ def retry_email(receipt_id, attempt=2):
             db.session.execute(text('UPDATE receipts SET emailed_at=NULL WHERE id=:id AND email_count=0'),
                                {'id': receipt.id})
             db.session.commit()
-            if attempt < MAX_EMAIL_ATTEMPTS:
+            if ok is not None and attempt < MAX_EMAIL_ATTEMPTS:
                 jobs.enqueue_in(120 * attempt, retry_email, receipt.id, attempt + 1)
 
 
@@ -903,7 +962,7 @@ def resend(receipt_id, actor=None):
     receipt = db.session.get(Receipt, int(receipt_id))
     if receipt is None:
         raise ReceiptError('Receipt not found')
-    ok = _send_receipt_email(receipt)
+    ok = bool(_send_receipt_email(receipt))
     if actor is not None:
         from backend.services.audit import audit
         audit('receipt.resend', actor, 'receipt', receipt.id,
@@ -911,6 +970,15 @@ def resend(receipt_id, actor=None):
                     'sent': ok, 'email_count': receipt.email_count})
         db.session.commit()
     return ok
+
+
+def resend_job(receipt_id, actor_id=None):
+    """Job behind the admin 'Resend' button (the request returns 202)."""
+    actor = db.session.get(AdminUser, actor_id) if actor_id else None
+    try:
+        return resend(receipt_id, actor=actor)
+    except ReceiptError:
+        return False
 
 
 # ── Credit notes ────────────────────────────────────────────────────────────
@@ -963,7 +1031,9 @@ def _send_credit_note_email(cn, receipt):
     from backend.services.notify.templates import render
     customer = db.session.get(AdminUser, cn.customer_id)
     results = []
-    if customer and customer.email:
+    if customer is not None and getattr(customer, 'email_bounced_at', None):
+        results.append((False, None, f'suppressed: {customer.email_bounce_reason or "email bounced"}'))
+    elif customer and customer.email:
         pdf = ensure_credit_note_pdf(cn)
         subject = f'Credit note {cn.number} for your NegoRide receipt {receipt.number}'
         t = cn.totals or {}
@@ -1064,5 +1134,147 @@ def receipt_payload(receipt, viewer='customer', base_path=None):
         'credit_notes': [{'id': c.id, 'number': c.number, 'amount_cents': int(c.amount_cents),
                           'tax_cents': int(c.tax_cents or 0), 'reason': c.reason, 'issued_at': _iso(c.issued_at)}
                          for c in cns],
+        # Tips paid after the receipt was issued have their own documents
+        # (NR-TIP-…); tips already on the receipt stay in totals.tip_cents.
+        'tips': tips_section(rt, rid),
         'pdf_url': base_path or f'/api/rides/{rt}/{rid}/receipt.pdf',
     }
+
+
+def tips_section(ride_type, ride_id):
+    rows = (TipReceipt.query.filter_by(ride_type=ride_type, ride_id=int(ride_id))
+            .order_by(TipReceipt.id.asc()).all())
+    items = [{'id': t.id, 'number': t.number, 'amount_cents': int(t.amount_cents), 'currency': t.currency,
+              'paid_at': (t.totals or {}).get('paid_at'), 'issued_at': _iso(t.issued_at),
+              'pdf_url': f'/api/receipts/tips/{t.id}.pdf'} for t in rows]
+    return {'items': items, 'total_cents': sum(i['amount_cents'] for i in items)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tip receipts (NR-TIP-YYYY-NNNNNN) — tips paid after the ride (§13, §17)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def tip_totals(rp, ride_type, ride):
+    info = {}
+    province = None
+    try:
+        province, _ = province_of(ride_type, ride)
+        info = ride_info(ride_type, ride, province)
+    except Exception:
+        db.session.rollback()
+    return {
+        'version': 1, 'currency': 'cad', 'amount_cents': int(rp.amount_captured_cents or rp.fare_cents or 0),
+        'taxable': False, 'note': 'Tips are not subject to GST/HST and go 100 % to the driver.',
+        'payment_method': payment_method_label(rp), 'paid_at': _iso(rp.captured_at or rp.authorized_at),
+        'province': province, 'ride': info,
+        'company': {'legal_name': S.get('company.legal_name'), 'address': S.get('company.address'),
+                    'website': S.get('company.website'), 'support_email': S.get('safety.support_email'),
+                    'support_phone': S.get('safety.support_phone')},
+        'registration': {'gst_hst': S.get('company.gst_number') or '', 'qst': S.get('company.qst_number') or ''},
+    }
+
+
+def issue_tip_receipt(ride_payment_id):
+    """Job after a tip is paid: numbered tip receipt + PDF + email. Idempotent
+    (unique per ride payment)."""
+    rp = db.session.get(RidePayment, int(ride_payment_id))
+    if rp is None or rp.purpose != 'tip' or rp.capture_status not in CAPTURED_STATES:
+        return None
+    if rp.ride_type not in RECEIPT_RIDE_TYPES:
+        return None
+    ride = R.load(rp.ride_type, rp.ride_id)
+
+    def find(lock=False):
+        q = TipReceipt.query.filter_by(ride_payment_id=rp.id)
+        return (q.with_for_update() if lock else q).first()
+
+    tr = find()
+    if tr is None:
+        totals = tip_totals(rp, rp.ride_type, ride)
+        base = find_receipt(rp.ride_type, rp.ride_id)
+
+        def build(number):
+            return TipReceipt(number=number, ride_payment_id=rp.id, ride_type=rp.ride_type, ride_id=rp.ride_id,
+                              receipt_id=base.id if base else None, customer_id=rp.customer_id,
+                              driver_id=rp.driver_id, amount_cents=totals['amount_cents'], totals=totals,
+                              issued_at=datetime.utcnow())
+        tr, created = _insert_numbered('tip', build, find)
+        if created:
+            try:
+                tr.pdf_path = save_private(f'tip_receipts/{tr.issued_at.year}/{tr.number}.pdf', render_tip_pdf(tr))
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                log.exception('Tip receipt PDF failed for %s', tr.number)
+    if tr.emailed_at is None:
+        claimed = db.session.execute(text('UPDATE tip_receipts SET emailed_at=:n WHERE id=:id AND emailed_at IS NULL'),
+                                     {'n': datetime.utcnow(), 'id': tr.id}).rowcount == 1
+        db.session.commit()
+        if claimed:
+            db.session.refresh(tr)
+            if not _send_tip_email(tr):
+                db.session.execute(text('UPDATE tip_receipts SET emailed_at=NULL WHERE id=:id'), {'id': tr.id})
+                db.session.commit()
+    return tr
+
+
+def issue_tip_receipt_safe(ride_payment_id):
+    if not S.flag('receipts_email'):
+        return None
+    try:
+        return issue_tip_receipt(ride_payment_id)
+    except Exception:
+        db.session.rollback()
+        log.exception('tip receipt failed for payment %s', ride_payment_id)
+        return None
+
+
+def render_tip_pdf(tr):
+    t = tr.totals or {}
+    return render_pdf('tip_receipt.html', {'doc': 'tip', 'number': tr.number, 'issued_at': _iso(tr.issued_at),
+                                           't': t, 'r': t.get('ride') or {}, 'web_base': _web_base(),
+                                           'policy_url': None})
+
+
+def ensure_tip_pdf(tr):
+    blob = read_private(tr.pdf_path)
+    if blob:
+        return blob
+    blob = render_tip_pdf(tr)
+    rel = tr.pdf_path or f'tip_receipts/{tr.issued_at.year}/{tr.number}.pdf'
+    save_private(rel, blob)
+    if tr.pdf_path != rel:
+        tr.pdf_path = rel
+        db.session.commit()
+    return blob
+
+
+def _send_tip_email(tr):
+    from backend.services.notify.templates import render
+    customer = db.session.get(AdminUser, tr.customer_id)
+    t = tr.totals or {}
+    info = t.get('ride') or {}
+    results = []
+    if customer is not None and getattr(customer, 'email_bounced_at', None):
+        results.append((False, None, f'suppressed: {customer.email_bounce_reason or "email bounced"}'))
+    elif customer and customer.email:
+        subject = f'Your NegoRide tip receipt {tr.number}'
+        html, txt = render('tip_receipt', {'title': subject, 'first_name': _first_name(customer) or 'there',
+                                           'number': tr.number, 't': t, 'r': info,
+                                           'preheader': f'{fmt(tr.amount_cents)} · 100 % to {info.get("driver_first") or "your driver"}',
+                                           'receipt_url': open_link(f'negoride://receipt/{tr.ride_type}/{tr.ride_id}'),
+                                           **_helpers()})
+        results.append(_send(customer.email, subject, html, txt,
+                             [(f'NegoRide-tip-{tr.number}.pdf', ensure_tip_pdf(tr), 'application/pdf')], 'tip.receipt'))
+    else:
+        results.append((False, None, 'no email address'))
+    _log_email(tr.customer_id, 'tip.receipt', f'tip-receipt-{tr.id}', f'Tip receipt {tr.number}',
+               f'Thanks! Your {fmt(tr.amount_cents)} tip went 100 % to {info.get("driver_first") or "your driver"}.',
+               {'tip_receipt_id': tr.id, 'number': tr.number, 'ride_type': tr.ride_type, 'ride_id': tr.ride_id,
+                'amount': fmt(tr.amount_cents)},
+               f'negoride://receipt/{tr.ride_type}/{tr.ride_id}', results)
+    ok = all(r[0] for r in results)
+    if ok:
+        tr.emailed_at = datetime.utcnow()
+    db.session.commit()
+    return ok

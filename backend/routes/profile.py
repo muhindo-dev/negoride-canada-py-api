@@ -2,6 +2,8 @@ import os
 from datetime import datetime
 from flask import Blueprint, request, current_app
 from werkzeug.utils import secure_filename
+from sqlalchemy.exc import IntegrityError
+
 from backend.models import db
 from backend.models.user import AdminUser
 from backend.utils.auth import jwt_required_with_user
@@ -16,18 +18,49 @@ def update(user):
     """Update user profile."""
     data = request.get_json(silent=True) or request.form
 
+    # phone_number is NOT editable here: a phone change must be verified through
+    # /api/verify/phone/start (purpose change_phone) + /api/profile/update-phone.
     updatable_fields = [
-        'first_name', 'last_name', 'name', 'email', 'phone_number', 'phone_number_2',
+        'first_name', 'last_name', 'name', 'email', 'phone_number_2',
         'date_of_birth', 'place_of_birth', 'sex', 'home_address', 'current_address',
         'country_name', 'country_code', 'country_short_name',
     ]
 
+    # Email / phone changes must not collide with another account, and a changed
+    # value is no longer verified (v4 identity rules — spec §11.2 #3, #12).
+    new_email = (data.get('email') or '').strip() or None
+    if new_email and new_email != user.email:
+        if AdminUser.query.filter(AdminUser.email == new_email, AdminUser.id != user.id).first():
+            return error_response("Email already in use", data={'error_code': 'email_in_use'}, status_code=409)
+    new_phone = str(data.get('phone_number') or '').strip() or None
+    if new_phone and new_phone != user.phone_number:
+        from backend.utils.phone import safe_normalize
+        e164 = safe_normalize(new_phone)
+        current = {x for x in (user.phone_e164, safe_normalize(user.phone_number)) if x}
+        if not (e164 and e164 in current):
+            return error_response("To change your phone number, verify the new number first.",
+                                  data={'error_code': 'use_update_phone', 'purpose': 'change_phone',
+                                        'endpoint': '/api/profile/update-phone'}, status_code=400)
+
+    email_changed = bool(new_email and new_email != user.email)
     for field in updatable_fields:
         if field in data and data[field] is not None:
             setattr(user, field, data[field])
 
+    if email_changed:
+        import secrets
+        from datetime import timedelta
+        user.email_verified_at = None
+        user.email_verification_token = secrets.token_urlsafe(32)
+        user.verification_token_expires = datetime.utcnow() + timedelta(hours=24)
+        from backend.services.notify.email_status import clear_email_bounce
+        clear_email_bounce(user)   # a new address: lift the old bounce suppression
     user.updated_at = datetime.utcnow()
     db.session.commit()
+    if email_changed:
+        from backend.utils.email_service import send_verification_email
+        send_verification_email(user.email, user.name or user.email, user.email_verification_token,
+                                lang=user.preferred_language)
 
     return success_response("Profile updated", user.to_dict())
 
@@ -68,11 +101,24 @@ def update_email(user):
 
     existing = AdminUser.query.filter(AdminUser.email == email, AdminUser.id != user.id).first()
     if existing:
-        return error_response("Email already in use")
+        return error_response("Email already in use", data={'error_code': 'email_in_use'}, status_code=409)
 
+    changed = email != user.email
     user.email = email
     user.updated_at = datetime.utcnow()
+    if changed:   # a new address is unverified until the link is clicked
+        import secrets
+        from datetime import timedelta
+        user.email_verified_at = None
+        user.email_verification_token = secrets.token_urlsafe(32)
+        user.verification_token_expires = datetime.utcnow() + timedelta(hours=24)
+        from backend.services.notify.email_status import clear_email_bounce
+        clear_email_bounce(user)
     db.session.commit()
+    if changed:
+        from backend.utils.email_service import send_verification_email
+        send_verification_email(user.email, user.name or user.email, user.email_verification_token,
+                                lang=user.preferred_language)
 
     return success_response("Email updated", user.to_dict())
 
@@ -85,7 +131,9 @@ def update_phone(user):
     v4 (spec §11.2 #3): send `verification_token` from
     /api/verify/phone/check with purpose=change_phone. The new number becomes the
     verified phone and the OLD number receives an SMS ("your number was changed").
-    v4 clients must verify; v3 clients keep the legacy unverified update.
+    v4 clients (and every client once app.legacy_clients_allowed is off) must verify.
+    Legacy (v3) clients may still set an UNVERIFIED number: phone_e164 /
+    phone_verified_at are cleared and the old number gets the same SMS.
     """
     from backend.services import phone_verification as PV
     from backend.utils.client_info import is_v4_client
@@ -116,18 +164,40 @@ def update_phone(user):
             from backend import jobs
             jobs.enqueue_after_commit('backend.services.account_service.sms_phone_changed', old,
                                       user.preferred_language or 'en')
-        db.session.commit()
+        try:
+            db.session.commit()
+        except IntegrityError as exc:
+            db.session.rollback()
+            if PV.is_verified_phone_conflict(exc):
+                return PV.phone_in_use_response()
+            raise
         return success_response("Phone number updated", user.to_dict())
 
+    # ── legacy (v3) unverified change — only while app.legacy_clients_allowed ──
     if not phone_number:
         return error_response("Phone number is required")
 
-    existing = AdminUser.query.filter(AdminUser.phone_number == phone_number, AdminUser.id != user.id).first()
+    from backend.utils.phone import safe_normalize
+    new_e164 = safe_normalize(phone_number)
+    conds = [AdminUser.phone_number == phone_number] + ([AdminUser.phone_number == new_e164,
+                                                         AdminUser.phone_e164 == new_e164] if new_e164 else [])
+    existing = AdminUser.query.filter(AdminUser.id != user.id, db.or_(*conds)).first()
     if existing:
-        return error_response("Phone number already in use")
+        return error_response("Phone number already in use", data={'error_code': 'phone_in_use'}, status_code=409)
 
+    old = user.phone_e164 or safe_normalize(user.phone_number)
     user.phone_number = phone_number
+    user.phone_e164 = None            # unverified until a Twilio Verify check succeeds
+    user.phone_verified_at = None
+    user.phone_line_type = None
     user.updated_at = datetime.utcnow()
+    from backend.services.audit import audit
+    audit('user.phone_changed', user, 'user', user.id, before={'phone': old}, after={'phone': phone_number},
+          meta={'verified': False, 'client': 'legacy'}, actor_type='user')
+    if old and old != new_e164:
+        from backend import jobs
+        jobs.enqueue_after_commit('backend.services.account_service.sms_phone_changed', old,
+                                  user.preferred_language or 'en')
     db.session.commit()
 
     return success_response("Phone number updated", user.to_dict())
@@ -179,6 +249,10 @@ def delete_account(user):
     user.token_version = int(user.token_version or 0) + 1
     user.deleted_at = datetime.utcnow()
     user.updated_at = datetime.utcnow()
+    reason = (data.get('reason') or '').strip()[:500]
+    user.status_reason = reason or user.status_reason
+    from backend.services.audit import audit
+    audit('account.self_delete', user, 'user', user.id, meta={'reason': reason or None}, actor_type='user')
     db.session.commit()
 
     return success_response("Account deleted successfully")

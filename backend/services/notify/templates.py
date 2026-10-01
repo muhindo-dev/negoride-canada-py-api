@@ -21,8 +21,18 @@ def brand():
         'support_phone': S.get('safety.support_phone'),
         'company_legal_name': S.get('company.legal_name'),
         'company_address': S.get('company.address'),
-        'logo_url': os.getenv('EMAIL_LOGO_URL', f'{base}/logo.png'),
+        'logo_url': logo_url(),
     }
+
+
+def logo_url():
+    """Public URL of the email logo: EMAIL_LOGO_URL, else the API's own
+    /api/brand/logo.png (APP_URL), else '' → the layout shows the text wordmark."""
+    explicit = (os.getenv('EMAIL_LOGO_URL') or '').strip()
+    if explicit:
+        return explicit
+    api = (os.getenv('APP_URL') or '').strip().rstrip('/')
+    return f'{api}/api/brand/logo.png' if api else ''
 
 
 def render(name, context):

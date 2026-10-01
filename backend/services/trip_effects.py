@@ -29,6 +29,80 @@ log = logging.getLogger('negoride.effects')
 AFTER_HOOKS = []   # fn(event: TripEvent, ride) — registered by feature modules
 
 
+def user_zone(user_id):
+    """Recipient's IANA time zone: users.timezone → latest device timezone →
+    province → America/Toronto (spec §2.10: store UTC, display local)."""
+    from backend.services import safety_service as SS
+    u = db.session.get(AdminUser, user_id) if user_id else None
+    tz = getattr(u, 'timezone', None)
+    if not tz and u is not None:
+        try:
+            from backend.models.notification import DeviceToken
+            d = (DeviceToken.query.filter(DeviceToken.user_id == u.id, DeviceToken.timezone.isnot(None))
+                 .order_by(DeviceToken.last_seen_at.desc()).first())
+            tz = d.timezone if d else None
+        except Exception:
+            tz = None
+    if not tz:
+        tz = SS.user_tz(u) if u is not None else 'America/Toronto'
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(tz)
+    except Exception:
+        tz = 'America/Toronto'
+    return tz
+
+
+def local_dt(user_id, dt_utc, fmt='%H:%M'):
+    """Format a naive-UTC datetime in the recipient's local time."""
+    if not dt_utc:
+        return ''
+    from zoneinfo import ZoneInfo
+    local = dt_utc.replace(tzinfo=ZoneInfo('UTC')).astimezone(ZoneInfo(user_zone(user_id)))
+    return local.strftime(fmt)
+
+
+def _local_hhmm(user_id, dt_utc):
+    """'18:42' in the rider's local time — the arrival push must not show a UTC clock."""
+    try:
+        return local_dt(user_id, dt_utc, '%H:%M')
+    except Exception:
+        return dt_utc.strftime('%H:%M UTC')
+
+
+DEPARTURE_FMT = '%a %b %d, %H:%M'
+
+
+def with_local_times(ctx, user_ids):
+    """Add per-recipient local renderings of the time fields in ctx
+    (`_departure_at` → departure) through the dispatcher's per_user mechanism."""
+    dep = ctx.get('_departure_at')
+    if not dep:
+        return ctx
+    out = dict(ctx)
+    per = {k: dict(v) for k, v in (out.get('per_user') or {}).items()}
+    for uid in [u for u in user_ids if u]:
+        try:
+            per.setdefault(str(uid), {})['departure'] = local_dt(uid, dep, DEPARTURE_FMT)
+        except Exception:
+            pass
+    out['per_user'] = per
+    return out
+
+
+def _notify(event_key, user_ids, ctx, **kw):
+    """notify() with recipient-local times."""
+    ids = [u for u in user_ids if u]
+    return notify(event_key, ids, with_local_times(ctx, ids), **kw)
+
+
+def driver_net_cents(fare_cents):
+    """What the driver keeps from a fare: fare − platform commission."""
+    from backend.utils.money import pct_of
+    fare_cents = int(fare_cents or 0)
+    return fare_cents - pct_of(fare_cents, S.get_int('pricing.commission_pct'))
+
+
 def after_hook(fn):
     AFTER_HOOKS.append(fn)
     return fn
@@ -65,7 +139,10 @@ def ride_context(ride_type, ride):
         if ride_type == 'rideshare_booking':
             ctx['booking_id'] = ride.id
         ctx['route'] = f"{trip.start_name or trip.start_address or ''} → {trip.end_name or trip.end_address or ''}"
-        ctx['departure'] = trip.departure_at.strftime('%a %b %d, %H:%M UTC') if trip.departure_at else (trip.scheduled_start_time or '')
+        # Default rendering (Toronto); with_local_times() replaces it per recipient.
+        ctx['departure'] = local_dt(None, trip.departure_at, DEPARTURE_FMT) if trip.departure_at \
+            else (trip.scheduled_start_time or '')
+        ctx['_departure_at'] = trip.departure_at
     eta = getattr(ride, 'eta_seconds', None)
     if eta:
         ctx['eta_min'] = max(1, round(eta / 60))
@@ -93,6 +170,7 @@ def after_transition(event_id):
         _money_and_cascades(ev, ride)
     finally:
         db.session.commit()
+    _live_activity(ev, ride)
 
     for hook in list(AFTER_HOOKS):
         try:
@@ -100,6 +178,30 @@ def after_transition(event_id):
         except Exception:
             log.exception('after-hook %s failed for event %s', getattr(hook, '__name__', hook), ev.id)
     db.session.commit()
+
+
+# Stages whose catalogue notification already updates the customer's Live Activity.
+_LA_BY_NOTIFICATION = ('DRIVER_EN_ROUTE', 'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'IN_PROGRESS', 'RIDING')
+
+
+def _live_activity(ev, ride):
+    """Keep iOS Live Activities in step with the ride (spec §5.1); end them on
+    terminal stages. Never fails the effects job."""
+    from backend.services.notify import live_activity as LA
+    rt, stage = ev.ride_type, ev.to_stage
+    if rt not in LA.RIDE_TYPES:
+        return
+    try:
+        if TSM.is_terminal(rt, stage) or stage in ('COMPLETED', 'DROPPED_OFF'):
+            LA.end_for_ride(rt, ride.id)
+        elif stage in _LA_BY_NOTIFICATION:
+            drv = R.driver_id(rt, ride)
+            if drv:
+                LA.push_update(rt, ride.id, user_id=drv, priority=10)
+        else:
+            LA.push_update(rt, ride.id, priority=10)
+    except Exception:
+        log.exception('live activity update failed for event %s', ev.id)
 
 
 def _policy(ev):
@@ -140,23 +242,21 @@ def _notifications(ev, ride):
             ends = (getattr(ride, "driver_arrived_at", None) or datetime.utcnow()) + timedelta(seconds=window)
             notify('ride.driver_arrived', [customer],
                    {**ctx, 'pin': ride.ride_pin if TSM.pin_required(rt, ride) else '',
-                    'wait_until': ends.strftime('%H:%M UTC')}, dedupe_key=f'arrived-{rt}-{ride.id}')
+                    'wait_until': _local_hhmm(customer, ends)}, dedupe_key=f'arrived-{rt}-{ride.id}')
             warn_in = window - S.get_int('ride.wait_warning_before_s')
             if warn_in > 0:
                 jobs.enqueue_in(warn_in, wait_warning, rt, ride.id, ev.id)
         elif stage == 'IN_PROGRESS':
             notify('ride.started', [customer], ctx)
         elif stage == 'COMPLETED':
-            earning = ''
+            earning = fmt(driver_net_cents(R.fare_cents(rt, ride)))
             notify('ride.completed', [customer, drv], {**ctx, **per_role, 'earning': earning})
             _rating_reminder(rt, ride, [customer, drv])
         elif stage in ('CANCELLED_BY_CUSTOMER', 'CANCELLED_BY_DRIVER'):
             p = _policy(ev)
             by = 'driver' if stage == 'CANCELLED_BY_DRIVER' else 'customer'
             other = customer if by == 'driver' else drv
-            refund_text = ''
-            if by == 'driver' and p.get('paid_cents', p.get('breakdown', {}).get('paid_cents', 0)):
-                refund_text = 'Full refund issued.'
+            refund_text = refund_text_for(p) if by == 'driver' else ''
             if other:
                 notify('ride.cancelled', [other], {**ctx, 'cancelled_by': by,
                                                    'cancelled_by_fr': 'chauffeur' if by == 'driver' else 'client',
@@ -170,28 +270,54 @@ def _notifications(ev, ride):
             notify('ride.expired', [customer], ctx)
     elif rt == 'rideshare_booking':
         if stage == 'REQUESTED':
-            notify('rideshare.booking_requested', [drv], {**ctx, 'seats': ride.slot_count or 1,
-                                                          'minutes': S.get_int('rideshare.request_timeout_min')})
+            _notify('rideshare.booking_requested', [drv], {**ctx, 'seats': ride.slot_count or 1,
+                                                           'minutes': S.get_int('rideshare.request_timeout_min')})
         elif stage == 'PENDING_PAYMENT' and ev.from_stage == 'REQUESTED':
-            notify('rideshare.booking_approved', [customer], ctx)
+            _notify('rideshare.booking_approved', [customer], ctx)
         elif stage == 'DECLINED':
-            notify('rideshare.booking_declined', [customer], ctx)
+            _notify('rideshare.booking_declined', [customer], ctx)
         elif stage == 'CONFIRMED':
-            notify('rideshare.booking_confirmed', [customer, drv], ctx)
+            _notify('rideshare.booking_confirmed', [customer, drv], ctx)
         elif stage == 'DRIVER_ARRIVED':
             notify('ride.driver_arrived', [customer], {**ctx, 'pin': ride.ride_pin if TSM.pin_required(rt, ride) else ''},
                    dedupe_key=f'arrived-{rt}-{ride.id}')
+        elif stage == 'RIDING':
+            notify('ride.started', [customer], ctx, dedupe_key=f'started-{rt}-{ride.id}')
         elif stage == 'DROPPED_OFF':
             notify('ride.completed', [customer], {**ctx, 'is_customer': True})
             _rating_reminder(rt, ride, [customer])
         elif stage == 'CANCELLED_BY_DRIVER':
             notify('ride.cancelled', [customer], {**ctx, 'cancelled_by': 'driver', 'cancelled_by_fr': 'chauffeur',
-                                                  'refund_text': 'Full refund issued.'})
+                                                  'refund_text': refund_text_for(_policy(ev))})
         elif stage == 'CANCELLED_BY_CUSTOMER' and drv:
             notify('ride.cancelled', [drv], {**ctx, 'cancelled_by': 'passenger', 'cancelled_by_fr': 'passager'})
     elif rt == 'rideshare_trip':
         if stage == 'BOARDING':
-            notify('rideshare.boarding', cids + ([drv] if drv else []), ctx)
+            _notify('rideshare.boarding', cids + ([drv] if drv else []), ctx)
+        elif stage == 'COMPLETED' and drv:
+            # The driver's trip summary: net of every seat that actually rode.
+            from backend.models.trip_booking import TripBooking
+            rode = [b for b in TripBooking.query.filter_by(trip_id=ride.id).all()
+                    if R.current_stage('rideshare_booking', b) in ('CHECKED_IN', 'RIDING', 'DROPPED_OFF', 'CLOSED')]
+            gross = sum(R.fare_cents('rideshare_booking', b) for b in rode)
+            notify('ride.completed', [drv], {**ctx, 'is_customer': False,
+                                             'earning': fmt(sum(driver_net_cents(R.fare_cents('rideshare_booking', b))
+                                                                for b in rode)),
+                                             'passengers': len(rode), 'gross': fmt(gross)},
+                   dedupe_key=f'completed-{rt}-{ride.id}')
+
+
+def refund_text_for(policy):
+    """'Full refund issued.' only when money was actually secured; a partial
+    refund names the amount; nothing when nothing was paid."""
+    p = policy or {}
+    paid = int(p.get('breakdown', {}).get('paid_cents', p.get('paid_cents', 0)) or 0)
+    refund = int(p.get('refund_cents') or 0)
+    if paid <= 0 or refund <= 0:
+        return ''
+    if refund >= paid:
+        return 'Full refund issued.'
+    return f'Refund of {fmt(refund)} issued.'
 
 
 def _rating_reminder(rt, ride, user_ids):
@@ -318,7 +444,7 @@ def issue_receipt_safe(ride_type, ride_id):
     except ImportError:
         log.info('receipts module not installed — skipping receipt for %s/%s', ride_type, ride_id)
         return
-    receipts.issue_and_send(ride_type, ride_id)
+    return receipts.issue_and_send(ride_type, ride_id)
 
 
 def issue_credit_note_safe(refund_id):

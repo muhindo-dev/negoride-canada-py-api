@@ -6,6 +6,7 @@ from backend.models.payout_account import PayoutAccount
 from backend.models.user_wallet import UserWallet
 from backend.services import wallet_service
 from backend.utils.auth import jwt_required_with_user
+from backend.utils.idempotency import idempotent
 from backend.utils.response import success_response, error_response
 
 payout_requests_bp = Blueprint('payout_requests', __name__)
@@ -62,6 +63,7 @@ def statistics(user):
 
 @payout_requests_bp.route('/api/payout-requests', methods=['POST'])
 @jwt_required_with_user
+@idempotent
 def create(user):
     """Create a payout (withdrawal) request.
 
@@ -88,6 +90,17 @@ def create(user):
         return error_response(
             "Your payout account isn't ready yet. Complete payout setup and verification first."
         )
+
+    # Pay-later background-check fee (spec §14.3): recover it from the wallet first
+    # (partial recovery allowed); a payout cannot leave a fronted fee unpaid.
+    from backend.services import onboarding_service
+    onboarding_service.settle_bgc_deductions(user.id)
+    outstanding = onboarding_service.outstanding_deduction_cents(user.id)
+    if outstanding > 0:
+        return error_response(
+            f"Your background check fee (${outstanding / 100:.2f} remaining) is recovered from your earnings "
+            "before you can withdraw.",
+            data={'error_code': 'bgc_fee_outstanding', 'outstanding_cents': outstanding}, status_code=409)
 
     min_payout = wallet_service.money(account.minimum_payout_amount or 10)
     if amount < min_payout:

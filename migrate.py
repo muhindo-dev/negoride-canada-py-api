@@ -100,7 +100,7 @@ def get_migration_files():
     return [
         f[:-3]
         for f in sorted(os.listdir(MIGRATIONS_DIR))
-        if f.endswith('.py') and not f.startswith('__')
+        if f.endswith('.py') and not f.startswith(('__', '._'))
     ]
 
 
@@ -155,16 +155,36 @@ def down(conn):
     print(f"  File: backend/database/migrations/{filename}.py")
 
 
-def cmd_migrate():
-    conn = get_connection()
-    ensure_migrations_table(conn)
+def migration_table_exists(conn):
+    """Check migration metadata without creating or changing anything."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = DATABASE() AND table_name = 'py_migrations' LIMIT 1"
+        )
+        return cur.fetchone() is not None
 
-    ran = get_ran_migrations(conn)
+
+def cmd_migrate(dry_run=False):
+    conn = get_connection()
+    if dry_run:
+        ran = get_ran_migrations(conn) if migration_table_exists(conn) else []
+    else:
+        ensure_migrations_table(conn)
+        ran = get_ran_migrations(conn)
     all_migrations = get_migration_files()
     pending = [m for m in all_migrations if m not in ran]
 
     if not pending:
         print("  Nothing to migrate.")
+        conn.close()
+        return
+
+    if dry_run:
+        print("  DRY RUN — no database changes were made.")
+        print(f"  {len(pending)} migration(s) would run:")
+        for name in pending:
+            print(f"    {name}")
         conn.close()
         return
 
@@ -234,16 +254,16 @@ def cmd_rollback(steps=1):
 
 def cmd_status():
     conn = get_connection()
-    ensure_migrations_table(conn)
-
-    ran = get_ran_migrations(conn)
+    has_table = migration_table_exists(conn)
+    ran = get_ran_migrations(conn) if has_table else []
     all_migrations = get_migration_files()
 
     batch_info = {}
-    with conn.cursor() as cur:
-        cur.execute("SELECT migration, batch, executed_at FROM py_migrations ORDER BY batch, id")
-        for row in cur.fetchall():
-            batch_info[row[0]] = {'batch': row[1], 'executed_at': row[2]}
+    if has_table:
+        with conn.cursor() as cur:
+            cur.execute("SELECT migration, batch, executed_at FROM py_migrations ORDER BY batch, id")
+            for row in cur.fetchall():
+                batch_info[row[0]] = {'batch': row[1], 'executed_at': row[2]}
     conn.close()
 
     if not all_migrations:
@@ -339,6 +359,8 @@ Examples:
     ], help='Migration command to run')
     parser.add_argument('name', nargs='?', help='Migration name (for "make" command)')
     parser.add_argument('--steps', type=int, default=1, help='Number of batches to rollback')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='With migrate, list pending migrations without changing the database')
 
     args = parser.parse_args()
 
@@ -354,7 +376,7 @@ Examples:
             sys.exit(1)
         cmd_make(args.name)
     elif args.command == 'migrate':
-        cmd_migrate()
+        cmd_migrate(dry_run=args.dry_run)
     elif args.command == 'rollback':
         cmd_rollback(steps=args.steps)
     elif args.command == 'status':

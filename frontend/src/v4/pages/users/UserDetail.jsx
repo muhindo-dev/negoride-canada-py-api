@@ -4,31 +4,17 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Alert, Anchor, Avatar, Badge, Button, Card, Grid, Group, SimpleGrid, Stack, Tabs, Text,
 } from '@mantine/core';
-import { FiShield, FiUserCheck } from 'react-icons/fi';
+import { FiEdit2, FiShield, FiUserCheck } from 'react-icons/fi';
 import { http, page } from '../../lib/api';
 import { fmt, humanize, initials, money } from '../../lib/format';
 import { useRoles } from '../../lib/roles';
 import { DocThumb, DocZoomModal } from '../../components/DocViewer';
 import {
-  DataTable, Empty, ErrorBox, Json, KV, Loading, notifyOk, PageHeader, RideLink, StageBadge, StatCard, StatusBadge, Time, UserLink,
+  DataTable, Empty, ErrorBox, KV, Loading, notifyOk, PageHeader, RideLink, StageBadge, StatCard, StatusBadge, Time, UserLink,
 } from '../../components/ui';
 import AccountStatusModal from './AccountStatusModal';
-
-function History({ id }) {
-  const [p, setP] = useState(1);
-  const q = useQuery({ queryKey: ['user-history', id, p], queryFn: () => http.get(`/admin/users/${id}/history`, { page: p }) });
-  const pg = page(q.data);
-  return (
-    <DataTable loading={q.isLoading} error={q.error} rows={pg.items} pageInfo={pg} onPage={setP} empty="No audit history."
-      columns={[
-        { key: 'created_at', label: 'When', render: (r) => <Time value={r.created_at} seconds /> },
-        { key: 'action', label: 'Action', render: (r) => <Text size="sm" ff="monospace">{r.action}</Text> },
-        { key: 'actor', label: 'Actor', render: (r) => (r.actor_id ? `${r.actor_name || ''} #${r.actor_id} (${r.actor_type})` : r.actor_type) },
-        { key: 'entity', label: 'Entity', render: (r) => `${r.entity_type || ''} ${r.entity_id || ''}` },
-        { key: 'change', label: 'Change', render: (r) => <Json value={r.after_json || r.meta} maxH={90} /> },
-      ]} />
-  );
-}
+import UserHistory from '../../components/UserHistory';
+import UserAccountControls from './UserAccountControls';
 
 function UserRides({ id }) {
   const nav = useNavigate();
@@ -64,12 +50,69 @@ function UserRatings({ id }) {
   );
 }
 
+function ViewAs({ id }) {
+  const q = useQuery({ queryKey: ['view-as', id], queryFn: () => http.get(`/admin/users/${id}/view-as`), staleTime: 0 });
+  if (q.isLoading) return <Loading />;
+  if (q.error) return <ErrorBox error={q.error} />;
+  const v = q.data;
+  const ride = v.active_ride;
+  return (
+    <Stack gap="sm" data-testid="view-as">
+      <Alert color="blue" variant="light" py={6}>Read-only snapshot of what this user sees in the app right now. No session is created; this view is audited.</Alert>
+      <Grid gutter="sm">
+        <Grid.Col span={{ base: 12, md: 6 }}>
+          <Card withBorder radius="md" padding="sm">
+            <Group justify="space-between" mb="xs"><Text fw={600}>Active ride (as the user sees it)</Text><Button size="compact-xs" variant="subtle" onClick={() => q.refetch()}>Refresh</Button></Group>
+            {ride ? (
+              <KV items={[
+                ['Ride', <RideLink type={ride.ride_type} id={ride.id} />], ['Stage', <StageBadge stage={ride.stage} />],
+                ['Their role', ride.viewer_role], ['Pickup', ride.pickup?.address], ['Drop-off', ride.dropoff?.address],
+                ['Fare', money(ride.price?.fare_cents)],
+                ride.pin && ['Ride PIN shown', <Text span ff="monospace" fw={700}>{ride.pin}</Text>],
+                ride.driver && ['Driver card', `${ride.driver.name}${ride.driver.rating ? ` · ★ ${ride.driver.rating}` : ''}`],
+                ride.vehicle && ['Vehicle', [ride.vehicle.color, ride.vehicle.make, ride.vehicle.model, ride.vehicle.plate].filter(Boolean).join(' ')],
+                ride.customer && ['Customer card', ride.customer.name],
+                ride.eta && ['ETA', `${ride.eta.minutes} min`],
+                ['Payment', ride.payment?.status],
+                ['Next steps', (ride.allowed_next || []).map((x) => <StageBadge key={x} stage={x} size="xs" />)],
+              ]} />
+            ) : <Text size="sm" c="dimmed">No active ride.</Text>}
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, md: 6 }}>
+          <Stack gap="sm">
+            <Card withBorder radius="md" padding="sm">
+              <Text fw={600} mb="xs">App state</Text>
+              <KV items={[['Account', <StatusBadge value={v.account_status} />], ['Language', v.profile?.preferred_language], ['Online toggle', v.profile?.ready_for_trip]]} />
+            </Card>
+            <Card withBorder radius="md" padding="sm">
+              <Text fw={600} mb="xs">Pending legal documents</Text>
+              {v.pending_legal_documents === null ? <Text size="sm" c="dimmed">Unavailable.</Text>
+                : v.pending_legal_documents.length ? v.pending_legal_documents.map((d, i) => (
+                  <Text key={d.id || i} size="sm">{humanize(d.type)} v{d.version} {d.requires_reacceptance ? '(re-acceptance required)' : ''}</Text>
+                )) : <Text size="sm" c="dimmed">None — all current documents accepted.</Text>}
+            </Card>
+            <Card withBorder radius="md" padding="sm">
+              <Text fw={600} mb="xs">Unread notifications ({v.unread_notifications.length})</Text>
+              {v.unread_notifications.slice(0, 10).map((n) => (
+                <div key={n.id}><Text size="sm" fw={500}>{n.title}</Text><Text size="xs" c="dimmed">{n.body} · {fmt.dateTime(n.created_at)}</Text></div>
+              ))}
+              {!v.unread_notifications.length && <Text size="sm" c="dimmed">Inbox is clear.</Text>}
+            </Card>
+          </Stack>
+        </Grid.Col>
+      </Grid>
+    </Stack>
+  );
+}
+
 export default function UserDetail() {
   const { id } = useParams();
   const qc = useQueryClient();
   const { can } = useRoles();
   const q = useQuery({ queryKey: ['user-profile', id], queryFn: () => http.get(`/admin/users/${id}/profile`) });
   const [statusModal, setStatusModal] = useState(null);
+  const [accountControls, setAccountControls] = useState(false);
   const [doc, setDoc] = useState(null);
   if (q.isLoading) return <Loading />;
   if (q.error) return <ErrorBox error={q.error} />;
@@ -81,6 +124,7 @@ export default function UserDetail() {
         title={<Group gap="sm"><Avatar src={u.avatar || null} radius="xl">{initials(u.name)}</Avatar>{u.name || `User #${u.id}`}<StatusBadge value={st} size="lg" /></Group>}
         subtitle={`#${u.id} · ${u.user_type} · joined ${fmt.date(u.created_at)}${u.admin_roles?.length ? ` · admin: ${u.admin_roles.join(', ')}` : ''}`}
         actions={<>
+          {(can('userAccountEdit') || can('userVerification')) && <Button variant="default" leftSection={<FiEdit2 />} onClick={() => setAccountControls(true)}>Manage account</Button>}
           {st !== 'active' && <Button color="green" onClick={() => setStatusModal('reactivate')}>Reactivate</Button>}
           {st === 'active' && <Button color="orange" variant="light" onClick={() => setStatusModal('suspend')}>Suspend</Button>}
           {st === 'active' && <Button color="gray" variant="light" onClick={() => setStatusModal('deactivate')}>Deactivate</Button>}
@@ -112,6 +156,7 @@ export default function UserDetail() {
           <Tabs.Tab value="legal">Legal ({acc.length})</Tabs.Tab>
           <Tabs.Tab value="support">Support ({tickets.length})</Tabs.Tab>
           <Tabs.Tab value="history">Audit history</Tabs.Tab>
+          {can('viewAs') && <Tabs.Tab value="viewas">View as</Tabs.Tab>}
         </Tabs.List>
         <Tabs.Panel value="overview">
           <Grid gutter="sm">
@@ -187,7 +232,14 @@ export default function UserDetail() {
           {bgcs.length > 0 && (
             <Card withBorder radius="md" padding="sm" mt="sm">
               <Text fw={600} mb="xs">Background checks</Text>
-              {bgcs.map((b) => <Text key={b.id} size="sm">#{b.id} · {b.provider} · <StatusBadge value={b.status} size="xs" /> · {b.result || ''} · paid {money(b.fee_cents)} ({b.paid_by}) · {fmt.dateTime(b.completed_at || b.initiated_at || b.created_at)}</Text>)}
+              {bgcs.map((b) => (
+                <Text key={b.id} size="sm">
+                  #{b.id} · {b.provider} · <StatusBadge value={b.status} size="xs" /> · {b.result || ''} · fee {money(b.fee_cents)} ({b.paid_by})
+                  {b.refunded_cents ? ` · refunded ${money(b.refunded_cents)} ${fmt.date(b.refunded_at)}` : ''}
+                  {b.cancelled_at ? ` · cancelled ${fmt.date(b.cancelled_at)}` : ''}
+                  {b.expires_at ? ` · expires ${fmt.date(b.expires_at)}` : ''} · {fmt.dateTime(b.completed_at || b.initiated_at || b.created_at)}
+                </Text>
+              ))}
             </Card>
           )}
         </Tabs.Panel>
@@ -209,11 +261,17 @@ export default function UserDetail() {
               { key: 'created_at', label: 'Opened', render: (t) => <Time value={t.created_at} /> },
             ]} />
         </Tabs.Panel>
-        <Tabs.Panel value="history"><History id={id} /></Tabs.Panel>
+        <Tabs.Panel value="history"><UserHistory id={id} /></Tabs.Panel>
+        {can('viewAs') && <Tabs.Panel value="viewas"><ViewAs id={id} /></Tabs.Panel>}
       </Tabs>
       <AccountStatusModal
         user={u} current={st} opened={!!statusModal} initialAction={statusModal} onClose={() => setStatusModal(null)}
         onDone={(msg) => { notifyOk(msg); qc.invalidateQueries({ queryKey: ['user-profile', id] }); qc.invalidateQueries({ queryKey: ['user-history', id] }); qc.invalidateQueries({ queryKey: ['users'] }); }}
+      />
+      <UserAccountControls
+        user={u} verification={v} opened={accountControls} onClose={() => setAccountControls(false)}
+        canEdit={can('userAccountEdit')} canVerify={can('userVerification')}
+        onDone={(msg) => { notifyOk(msg); setAccountControls(false); qc.invalidateQueries({ queryKey: ['user-profile', id] }); qc.invalidateQueries({ queryKey: ['user-history', id] }); qc.invalidateQueries({ queryKey: ['users'] }); }}
       />
       <DocZoomModal doc={doc} opened={!!doc} onClose={() => setDoc(null)} />
     </>
