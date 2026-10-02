@@ -193,10 +193,15 @@ DEFAULTS = {
     'carhire.broadcast_timeout_s': (180, 'int', 'ride', 'Unanswered broadcast requests expire after', True),
     'carhire.nearby_radius_km': (10, 'int', 'ride', "'Choose a driver' list radius", True),
     'rideshare.search_radius_km': (25, 'int', 'ride', 'Rideshare search radius around origin / destination', True),
-    'pricing.fair_base_cents': (350, 'int', 'pricing', 'Fair-price hint: base fare', False),
-    'pricing.fair_per_km_cents': (135, 'int', 'pricing', 'Fair-price hint: per km', False),
-    'pricing.fair_per_min_cents': (30, 'int', 'pricing', 'Fair-price hint: per minute', False),
+    'pricing.fair_base_cents': (425, 'int', 'pricing', 'Typical-fare estimate: Toronto benchmark starting fare (CAD cents); adjust for your market', False),
+    'pricing.fair_per_km_cents': (175, 'int', 'pricing', 'Typical-fare estimate: distance rate per km (CAD cents); Toronto benchmark', False),
+    'pricing.fair_per_min_cents': (15, 'int', 'pricing', 'Typical-fare estimate: travel-time contribution per minute (CAD cents)', False),
     'pricing.fair_spread_pct': (13, 'int', 'pricing', 'Fair-price hint: ± spread around the typical fare', False),
+    'pricing.fair_car_pct': (100, 'int', 'pricing', 'Typical-fare estimate multiplier for standard car hire (%)', False),
+    'pricing.fair_courier_pct': (115, 'int', 'pricing', 'Typical-fare estimate multiplier for courier service (%)', False),
+    'pricing.fair_movers_pct': (175, 'int', 'pricing', 'Typical-fare estimate multiplier for moving service (%)', False),
+    'pricing.fair_airport_pct': (110, 'int', 'pricing', 'Typical-fare estimate multiplier for airport service (%)', False),
+    'pricing.fair_special_car_pct': (130, 'int', 'pricing', 'Typical-fare estimate multiplier for special / premium cars (%)', False),
     'rating.trend_drop': (0.3, 'float', 'ratings', 'Admin trend alert when a 7-day average falls by more than this', False),
     'analytics.max_events_per_min': (120, 'int', 'app', 'Client analytics events accepted per user/IP per minute', False),
 
@@ -337,6 +342,21 @@ def set_value(key, value, actor_id=None):
     spec = DEFAULTS.get(key)
     typ = spec[1] if spec else ('bool' if isinstance(value, bool) else 'string')
     coerced = _coerce(value, typ)  # validates
+    pricing_limits = {
+        'pricing.fair_base_cents': (0, 10000),
+        'pricing.fair_per_km_cents': (0, 5000),
+        'pricing.fair_per_min_cents': (0, 1000),
+        'pricing.fair_spread_pct': (0, 50),
+        'pricing.fair_car_pct': (50, 300),
+        'pricing.fair_courier_pct': (50, 300),
+        'pricing.fair_movers_pct': (50, 300),
+        'pricing.fair_airport_pct': (50, 300),
+        'pricing.fair_special_car_pct': (50, 300),
+    }
+    if key in pricing_limits:
+        low, high = pricing_limits[key]
+        if not low <= coerced <= high:
+            raise ValueError(f'{key} must be between {low} and {high}')
     before = get(key)
     row = AppSetting.query.filter_by(key=key).first()
     stored = json.dumps(coerced) if typ == 'json' else (

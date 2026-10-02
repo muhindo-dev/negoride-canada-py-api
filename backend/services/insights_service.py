@@ -19,7 +19,13 @@ from backend.models.platform import AnalyticsEvent
 from backend.services import geo_routes as G
 from backend.services import settings_service as S
 
-CAR_GROUP = ('car', 'special car', 'special car hire', 'carhire')
+FAIR_SERVICE_RATE_KEYS = {
+    'car': 'pricing.fair_car_pct', 'special car': 'pricing.fair_special_car_pct',
+    'special car hire': 'pricing.fair_special_car_pct', 'carhire': 'pricing.fair_car_pct',
+    'car hire': 'pricing.fair_car_pct', 'courier': 'pricing.fair_courier_pct',
+    'movers': 'pricing.fair_movers_pct', 'airport': 'pricing.fair_airport_pct',
+    'airport pickup': 'pricing.fair_airport_pct',
+}
 
 
 class InsightError(Exception):
@@ -49,8 +55,12 @@ def _pct(sorted_vals, p):
 
 def _service_filter(st, col='n.service_type'):
     st = (st or 'car').strip().lower().replace('_', ' ')
-    if st in CAR_GROUP:
-        return f"({col} IS NULL OR {col} IN ('car','special car','special car hire','carhire','Car','Special Car'))", {}
+    if st in ('car', 'car hire', 'carhire'):
+        # Null service_type is a legacy car-hire record. Premium cars should
+        # use their own history so standard-car fares do not flatten the uplift.
+        return f"({col} IS NULL OR {col} IN ('car','carhire','Car'))", {}
+    if st in ('special car', 'special car hire'):
+        return f"{col} IN ('special car','special car hire','Special Car')", {}
     return f"{col} = :st", {'st': st}
 
 
@@ -96,8 +106,13 @@ def fair_range(origin, destination, service_type='car'):
             jobs.enqueue('backend.services.geo_routes.warm_route_job', origin[0], origin[1],
                          destination[0], destination[1])
     km, minutes = route['distance_m'] / 1000.0, route['seconds'] / 60.0
-    model = (S.get_int('pricing.fair_base_cents', 350) + S.get_int('pricing.fair_per_km_cents', 135) * km
-             + S.get_int('pricing.fair_per_min_cents', 30) * minutes)
+    base = S.get_int('pricing.fair_base_cents', 425)
+    distance_rate = S.get_int('pricing.fair_per_km_cents', 175)
+    time_rate = S.get_int('pricing.fair_per_min_cents', 15)
+    normalized_service = (service_type or 'car').strip().lower().replace('_', ' ')
+    rate_key = FAIR_SERVICE_RATE_KEYS.get(normalized_service, 'pricing.fair_car_pct')
+    service_pct = max(50, min(300, S.get_int(rate_key, 100)))
+    model = round((base + distance_rate * km + time_rate * minutes) * service_pct / 100)
     model = max(model, S.get_int('pricing.min_fare_cents', 500))
     spread = S.get_int('pricing.fair_spread_pct', 13) / 100.0
     low_m, high_m = model * (1 - spread), model * (1 + spread)
@@ -120,7 +135,8 @@ def fair_range(origin, destination, service_type='car'):
         'low_cents': low, 'high_cents': high, 'typical_cents': typical, 'currency': 'cad',
         'distance_m': int(route['distance_m']), 'duration_s': int(route['seconds']),
         'basis': {'distance_source': route.get('source', 'estimate'), 'history_count': n,
-                  'history_weight': round(w, 2), 'service_type': service_type},
+                  'history_weight': round(w, 2), 'service_type': service_type,
+                  'service_multiplier_pct': service_pct, 'time_minutes': round(minutes, 1)},
         'text': f"Typical fare for this route: ${low // 100}–${high // 100}",
     }
 

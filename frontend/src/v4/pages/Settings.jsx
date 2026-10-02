@@ -233,6 +233,11 @@ export default function Settings() {
             <Tabs.Panel key={c} value={c} pl="md">
               <Card withBorder radius="md" padding="md">
                 <Stack gap="lg">
+                  {c === 'pricing' && (
+                    <Alert color="blue" variant="light" title="How the typical fare is estimated">
+                      Uses route distance, estimated driving time, the selected service type, and recent completed trips when enough history exists. The starting values use Toronto as a Canadian reference and should be tuned for each operating market. This is a guide for the rider’s offer, not a fixed or guaranteed fare.
+                    </Alert>
+                  )}
                   {prefixes.map((pfx) => (
                     <Stack key={pfx} gap="md">
                       {prefixes.length > 1 && <Divider label={<Text size="xs" fw={700} tt="uppercase" c="dimmed">{PREFIX_TITLES[pfx] || humanize(pfx)} · {pfx}.*</Text>} labelPosition="left" />}
